@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Policy Selector Builder - Modern-DHCP</title>
+<style>
+:root {
+    font-family: "Segoe UI", Arial, sans-serif;
+    color: #0f172a;
+    background-color: #f8fafc;
+}
+body {
+    margin: 0;
+    padding: 24px;
+    background: #f8fafc;
+}
+header {
+    margin-bottom: 16px;
+}
+section.card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+}
+.controls-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px 16px;
+}
+.controls-grid--spaced {
+    margin-top: 12px;
+}
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+label {
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+input[type="text"],
+input[type="number"],
+textarea,
+select {
+    padding: 8px;
+    border: 1px solid #cbd5f5;
+    border-radius: 4px;
+    font-size: 0.95rem;
+    font-family: inherit;
+}
+textarea {
+    resize: vertical;
+}
+.toggle-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    margin-top: 12px;
+}
+.toggle-row label {
+    font-weight: 500;
+}
+.custom-meta,
+.importer {
+    margin-top: 16px;
+    border-top: 1px solid #e2e8f0;
+    padding-top: 16px;
+}
+.custom-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+}
+.custom-row input {
+    flex: 1;
+}
+.helper-text {
+    font-size: 0.85rem;
+    color: #475569;
+    margin: 8px 0 12px;
+}
+.no-top-margin {
+    margin-top: 0;
+}
+.section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+}
+.section-title {
+    margin: 0;
+    font-size: 1.1rem;
+}
+.section-title--no-top-margin {
+    margin-top: 0;
+}
+button.primary {
+    background: #2563eb;
+    color: #ffffff;
+    border: none;
+    border-radius: 4px;
+    padding: 10px 16px;
+    font-weight: 600;
+    cursor: pointer;
+}
+button.primary:disabled {
+    opacity: 0.6;
+    cursor: progress;
+}
+button.secondary {
+    border: 1px solid #94a3b8;
+    background: #ffffff;
+    color: #0f172a;
+    border-radius: 4px;
+    padding: 6px 12px;
+    font-weight: 500;
+    cursor: pointer;
+}
+button.secondary.custom-remove {
+    padding: 6px 10px;
+}
+#jsonOutput,
+#curlPreview,
+#resolveOutput {
+    background: #0f172a;
+    color: #f8fafc;
+    border-radius: 6px;
+    padding: 12px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9rem;
+    overflow-x: auto;
+}
+pre {
+    margin: 0;
+}
+.status {
+    font-size: 0.9rem;
+    margin-top: 8px;
+}
+.status.success {
+    color: #065f46;
+}
+.status.error {
+    color: #b91c1c;
+}
+@media (max-width: 640px) {
+    body {
+        padding: 16px;
+    }
+    .toggle-row {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    .custom-row {
+        flex-direction: column;
+        align-items: stretch;
+    }
+    button.secondary.custom-remove {
+        width: 100%;
+    }
+}
+</style>
+</head>
+<body>
+<header>
+    <h1>Policy Selector Builder</h1>
+    <p>Craft pool selector snippets for policy actions or test how metadata resolves against the management API.</p>
+</header>
+
+<section class="card">
+    <form id="selectorForm">
+        <div class="controls-grid">
+            <div class="field">
+                <label for="interfaceId">Interface ID</label>
+                <input id="interfaceId" type="text" placeholder="Gi1/0/48" />
+            </div>
+            <div class="field">
+                <label for="ssid">SSID</label>
+                <input id="ssid" type="text" placeholder="Corp-WiFi" />
+            </div>
+            <div class="field">
+                <label for="location">Location</label>
+                <input id="location" type="text" placeholder="Building-A-Rack-12" />
+            </div>
+            <div class="field">
+                <label for="vlanId">VLAN ID</label>
+                <input id="vlanId" type="number" min="1" placeholder="200" />
+            </div>
+        </div>
+        <div class="toggle-row">
+            <label><input type="checkbox" id="wrapSelector" checked /> Wrap with <code>{"poolSelector": {...}}</code></label>
+            <label><input type="checkbox" id="minified" /> Minify JSON</label>
+            <button type="button" class="secondary" id="resetButton">Reset</button>
+        </div>
+        <div class="custom-meta">
+            <div class="section-header">
+                <h3 class="section-title">Custom Metadata</h3>
+                <button type="button" class="secondary" id="addMetadataButton">Add Metadata</button>
+            </div>
+            <p class="helper-text">Add optional key/value metadata pairs (for example: deviceType, circuitId, relayAgent, etc.).</p>
+            <div id="customMetadataContainer"></div>
+        </div>
+        <div class="importer">
+            <div class="section-header">
+                <h3 class="section-title">Import Selector JSON</h3>
+                <button type="button" class="secondary" id="clearImportButton">Clear</button>
+            </div>
+            <p class="helper-text">Paste either the raw selector object or a full <code>{"poolSelector": {...}}</code> payload to backfill the form.</p>
+            <textarea id="importInput" rows="4" placeholder='{"poolSelector":{"interfaceId":"Gi1/0/48"}}'></textarea>
+            <button type="button" class="primary" id="importButton">Load JSON</button>
+            <div id="importStatus" class="status"></div>
+        </div>
+    </form>
+</section>
+
+<section class="card">
+    <div class="section-header">
+        <h2 class="section-title">Generated JSON</h2>
+        <button type="button" class="secondary" id="copyButton">Copy</button>
+    </div>
+    <div id="jsonOutput">{"poolSelector": {}}</div>
+    <div id="previewStatus" class="status"></div>
+</section>
+
+<section class="card">
+    <h2 class="section-title section-title--no-top-margin">Resolve Preview</h2>
+    <p class="no-top-margin">Optionally call <code>/pools/resolve</code> to see which pool matches the selector.</p>
+    <div class="controls-grid controls-grid--spaced">
+        <div class="field">
+            <label for="tenantInput">Tenant ID *</label>
+            <input id="tenantInput" type="text" placeholder="tenant-123" />
+        </div>
+        <div class="field">
+            <label for="apiKeyInput">API Key *</label>
+            <input id="apiKeyInput" type="text" placeholder="paste admin API key" />
+        </div>
+    </div>
+    <button type="button" class="primary" id="resolveButton">Resolve Pool</button>
+    <div id="resolveStatus" class="status"></div>
+    <pre id="resolveOutput">No request made yet.</pre>
+</section>
+
+<section class="card">
+    <div class="section-header">
+        <h2 class="section-title">API Request Preview</h2>
+        <button type="button" class="secondary" id="copyCurlButton">Copy cURL</button>
+    </div>
+    <pre id="curlPreview">Fill Tenant ID, API Key, and selector metadata to generate a cURL command.</pre>
+</section>
+
+<script>
+(function () {
+    const STORAGE_KEY = "mdhcp.selector.apiKey";
+    const FORM_STORAGE_KEY = "mdhcp.selector.formState";
+    const fieldIds = ["interfaceId", "ssid", "location", "vlanId"];
+    const jsonOutput = document.getElementById("jsonOutput");
+    const previewStatus = document.getElementById("previewStatus");
+    const wrapToggle = document.getElementById("wrapSelector");
+    const minifiedToggle = document.getElementById("minified");
+    const copyButton = document.getElementById("copyButton");
+    const resetButton = document.getElementById("resetButton");
+    const resolveButton = document.getElementById("resolveButton");
+    const resolveStatus = document.getElementById("resolveStatus");
+    const resolveOutput = document.getElementById("resolveOutput");
+    const apiKeyInput = document.getElementById("apiKeyInput");
+    const tenantInput = document.getElementById("tenantInput");
+    const curlPreview = document.getElementById("curlPreview");
+    const copyCurlButton = document.getElementById("copyCurlButton");
+    const customMetadataContainer = document.getElementById("customMetadataContainer");
+    const addMetadataButton = document.getElementById("addMetadataButton");
+    const importInput = document.getElementById("importInput");
+    const importButton = document.getElementById("importButton");
+    const importStatus = document.getElementById("importStatus");
+    const clearImportButton = document.getElementById("clearImportButton");
+
+    const savedKey = sessionStorage.getItem(STORAGE_KEY);
+    if (savedKey) {
+        apiKeyInput.value = savedKey;
+    }
+
+    hydrateFormState();
+    if (!customMetadataContainer.children.length) {
+        addMetadataRow();
+    }
+
+    fieldIds.forEach(function (id) {
+        const el = document.getElementById(id);
+        if (el) {
+            el.addEventListener("input", handleFormChange);
+        }
+    });
+    wrapToggle.addEventListener("change", handleFormChange);
+    minifiedToggle.addEventListener("change", handleFormChange);
+    tenantInput.addEventListener("input", updateCurlPreview);
+    apiKeyInput.addEventListener("input", function () {
+        sessionStorage.setItem(STORAGE_KEY, apiKeyInput.value.trim());
+        updateCurlPreview();
+    });
+    addMetadataButton.addEventListener("click", function () {
+        addMetadataRow();
+        persistFormState();
+    });
+    importButton.addEventListener("click", function () {
+        handleImport(importInput.value.trim());
+    });
+    clearImportButton.addEventListener("click", function () {
+        importInput.value = "";
+        setImportStatus("", false);
+    });
+
+    copyButton.addEventListener("click", function () {
+        const payload = jsonOutput.textContent.trim();
+        if (!payload || payload === "{}"){
+            setPreviewStatus("Provide at least one metadata field before copying.", true);
+            return;
+        }
+        navigator.clipboard.writeText(payload).then(function () {
+            setPreviewStatus("Copied selector JSON to clipboard.", false, true);
+        }).catch(function (err) {
+            setPreviewStatus(err.message || String(err), true);
+        });
+    });
+
+    copyCurlButton.addEventListener("click", function () {
+        const command = curlPreview.textContent.trim();
+        if (!command || command.startsWith("Fill")) {
+            setResolveStatus("Complete selector, tenant, and API key to generate cURL.", true);
+            return;
+        }
+        navigator.clipboard.writeText(command).then(function () {
+            setResolveStatus("Copied cURL command.", false);
+        }).catch(function (err) {
+            setResolveStatus(err.message || String(err), true, true);
+        });
+    });
+
+    resetButton.addEventListener("click", function () {
+        fieldIds.forEach(function (id) {
+            const el = document.getElementById(id);
+            if (el) {
+                el.value = "";
+            }
+        });
+        wrapToggle.checked = true;
+        minifiedToggle.checked = false;
+        resolveOutput.textContent = "No request made yet.";
+        previewStatus.textContent = "";
+        previewStatus.className = "status";
+        resolveStatus.textContent = "";
+        resolveStatus.className = "status";
+        localStorage.removeItem(FORM_STORAGE_KEY);
+        customMetadataContainer.innerHTML = "";
+        addMetadataRow();
+        updatePreview();
+        updateCurlPreview();
+        persistFormState();
+    });
+
+    resolveButton.addEventListener("click", async function () {
+        const selector = buildSelector();
+        if (!selector) {
+            setPreviewStatus("Provide at least one metadata field before resolving.", true);
+            return;
+        }
+        const tenant = tenantInput.value.trim();
+        const apiKey = apiKeyInput.value.trim();
+        if (!tenant || !apiKey) {
+            setResolveStatus("Tenant ID and API key are required to call the API.", true);
+            return;
+        }
+
+        sessionStorage.setItem(STORAGE_KEY, apiKey);
+        resolveButton.disabled = true;
+        setResolveStatus("Resolving pool...", false, true);
+
+        try {
+            const endpoint = `/api/v1/tenants/${encodeURIComponent(tenant)}/pools/resolve`;
+            const payload = JSON.stringify({ poolSelector: selector });
+            const resp = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                    "X-API-Key": apiKey,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                },
+                body: payload
+            });
+
+            const text = await resp.text();
+            let parsed;
+            try {
+                parsed = JSON.parse(text);
+            } catch (parseErr) {
+                parsed = { raw: text };
+            }
+
+            if (!resp.ok) {
+                throw new Error(parsed.message || `API returned ${resp.status}`);
+            }
+
+            resolveOutput.textContent = JSON.stringify(parsed, null, 2);
+            setResolveStatus("Pool resolved successfully.", false);
+        } catch (err) {
+            setResolveStatus(err.message || String(err), true, true);
+            resolveOutput.textContent = err.stack || err.message || String(err);
+        } finally {
+            resolveButton.disabled = false;
+        }
+    });
+
+    function buildSelector() {
+        const selector = {};
+        const interfaceId = document.getElementById("interfaceId").value.trim();
+        const ssid = document.getElementById("ssid").value.trim();
+        const location = document.getElementById("location").value.trim();
+        const vlanValue = document.getElementById("vlanId").value.trim();
+
+        if (interfaceId) selector.interfaceId = interfaceId;
+        if (ssid) selector.ssid = ssid;
+        if (location) selector.location = location;
+        if (vlanValue) {
+            const vlanInt = parseInt(vlanValue, 10);
+            if (!Number.isNaN(vlanInt) && vlanInt > 0) {
+                selector.vlanId = vlanInt;
+            }
+        }
+        collectCustomMetadata().forEach(function (entry) {
+            selector[entry.key] = entry.value;
+        });
+        return Object.keys(selector).length ? selector : null;
+    }
+
+    function handleFormChange() {
+        updatePreview();
+        persistFormState();
+    }
+
+    function handleCustomChange() {
+        updatePreview();
+        persistFormState();
+    }
+
+    function handleImport(value) {
+        if (!value) {
+            setImportStatus("Paste selector JSON first.", true);
+            return;
+        }
+        try {
+            const parsed = JSON.parse(value);
+            const selectorPayload = parsed && parsed.poolSelector ? parsed.poolSelector : parsed;
+            if (!selectorPayload || typeof selectorPayload !== "object" || Array.isArray(selectorPayload)) {
+                throw new Error("Selector JSON must be an object.");
+            }
+            applySelectorToForm(selectorPayload);
+            setImportStatus("Selector imported.", false);
+            updatePreview();
+            persistFormState();
+        } catch (err) {
+            setImportStatus(err.message || "Invalid JSON payload.", true, true);
+        }
+    }
+
+    function updatePreview() {
+        const selector = buildSelector();
+        if (!selector) {
+            jsonOutput.textContent = wrapToggle.checked ? '{"poolSelector": {}}' : '{}';
+            setPreviewStatus("Enter at least one metadata field to build a selector.", true);
+            updateCurlPreview();
+            return;
+        }
+        const payload = wrapToggle.checked ? { poolSelector: selector } : selector;
+        const spacing = minifiedToggle.checked ? 0 : 2;
+        jsonOutput.textContent = JSON.stringify(payload, null, spacing);
+        setPreviewStatus("Selector ready.", false);
+        updateCurlPreview();
+    }
+
+    function setPreviewStatus(message, isError, sticky) {
+        previewStatus.textContent = message;
+        previewStatus.className = "status " + (isError ? "error" : "success");
+        if (!sticky) {
+            window.setTimeout(function () {
+                previewStatus.textContent = "";
+                previewStatus.className = "status";
+            }, 4000);
+        }
+    }
+
+    function setResolveStatus(message, isError, sticky) {
+        resolveStatus.textContent = message;
+        resolveStatus.className = "status " + (isError ? "error" : "success");
+        if (!sticky) {
+            window.setTimeout(function () {
+                resolveStatus.textContent = "";
+                resolveStatus.className = "status";
+            }, 5000);
+        }
+    }
+
+    function updateCurlPreview() {
+        const selector = buildSelector();
+        const tenant = tenantInput.value.trim();
+        const apiKey = apiKeyInput.value.trim();
+        if (!selector || !tenant || !apiKey) {
+            curlPreview.textContent = "Fill Tenant ID, API Key, and selector metadata to generate a cURL command.";
+            return;
+        }
+        const payload = JSON.stringify({ poolSelector: selector });
+        const endpoint = `${window.location.origin}/api/v1/tenants/${encodeURIComponent(tenant)}/pools/resolve`;
+        const escapedPayload = payload.replace(/"/g, '\\"');
+        const command = [
+            "curl -X POST \\",
+            `  "${endpoint}" \\\\`,
+            `  -H "X-API-Key: ${apiKey}" \\\\`,
+            '  -H "Content-Type: application/json" \\\\',
+            `  -d "${escapedPayload}"`
+        ].join("\n");
+        curlPreview.textContent = command;
+    }
+
+    function persistFormState() {
+        const state = {
+            wrap: wrapToggle.checked,
+            minified: minifiedToggle.checked,
+            fields: {},
+            custom: collectCustomMetadata()
+        };
+        fieldIds.forEach(function (id) {
+            const el = document.getElementById(id);
+            if (el) {
+                state.fields[id] = el.value;
+            }
+        });
+        localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(state));
+    }
+
+    function hydrateFormState() {
+        try {
+            const raw = localStorage.getItem(FORM_STORAGE_KEY);
+            if (!raw) {
+                return;
+            }
+            const state = JSON.parse(raw);
+            if (state.fields) {
+                Object.keys(state.fields).forEach(function (id) {
+                    const el = document.getElementById(id);
+                    if (el) {
+                        el.value = state.fields[id] || "";
+                    }
+                });
+            }
+            if (typeof state.wrap === "boolean") {
+                wrapToggle.checked = state.wrap;
+            }
+            if (typeof state.minified === "boolean") {
+                minifiedToggle.checked = state.minified;
+            }
+            if (Array.isArray(state.custom)) {
+                customMetadataContainer.innerHTML = "";
+                state.custom.forEach(function (entry) {
+                    addMetadataRow(entry.key, entry.value);
+                });
+            }
+        } catch (err) {
+            console.warn("Failed to restore selector form state", err);
+        }
+    }
+
+    function applySelectorToForm(selector) {
+        fieldIds.forEach(function (id) {
+            const el = document.getElementById(id);
+            if (!el) {
+                return;
+            }
+            if (Object.prototype.hasOwnProperty.call(selector, id)) {
+                el.value = selector[id];
+            } else {
+                el.value = "";
+            }
+        });
+
+        if (Object.prototype.hasOwnProperty.call(selector, "vlanId")) {
+            const vlanEl = document.getElementById("vlanId");
+            if (vlanEl) {
+                vlanEl.value = selector.vlanId;
+            }
+        }
+
+        const knownKeys = new Set(fieldIds);
+        const customEntries = [];
+        Object.keys(selector).forEach(function (key) {
+            if (knownKeys.has(key)) {
+                return;
+            }
+            const value = selector[key];
+            if (value === undefined || value === null) {
+                return;
+            }
+            customEntries.push({ key: key, value: String(value) });
+        });
+
+        customMetadataContainer.innerHTML = "";
+        if (customEntries.length === 0) {
+            addMetadataRow();
+        } else {
+            customEntries.forEach(function (entry) {
+                addMetadataRow(entry.key, entry.value);
+            });
+        }
+    }
+
+    function addMetadataRow(keyValue, valueValue) {
+        const row = document.createElement("div");
+        row.className = "custom-row";
+
+        const keyInput = document.createElement("input");
+        keyInput.type = "text";
+        keyInput.placeholder = "Key";
+        keyInput.className = "custom-key";
+        keyInput.value = keyValue || "";
+        keyInput.addEventListener("input", handleCustomChange);
+
+        const valueInput = document.createElement("input");
+        valueInput.type = "text";
+        valueInput.placeholder = "Value";
+        valueInput.className = "custom-value";
+        valueInput.value = valueValue || "";
+        valueInput.addEventListener("input", handleCustomChange);
+
+        const removeButton = document.createElement("button");
+        removeButton.type = "button";
+        removeButton.className = "secondary custom-remove";
+        removeButton.textContent = "Remove";
+        removeButton.addEventListener("click", function () {
+            customMetadataContainer.removeChild(row);
+            if (!customMetadataContainer.children.length) {
+                addMetadataRow();
+            }
+            handleCustomChange();
+        });
+
+        row.appendChild(keyInput);
+        row.appendChild(valueInput);
+        row.appendChild(removeButton);
+        customMetadataContainer.appendChild(row);
+    }
+
+    function collectCustomMetadata() {
+        const entries = [];
+        const rows = customMetadataContainer.querySelectorAll(".custom-row");
+        rows.forEach(function (row) {
+            const keyInput = row.querySelector(".custom-key");
+            const valueInput = row.querySelector(".custom-value");
+            const key = keyInput ? keyInput.value.trim() : "";
+            const value = valueInput ? valueInput.value.trim() : "";
+            if (key && value) {
+                entries.push({ key: key, value: value });
+            }
+        });
+        return entries;
+    }
+
+    function setImportStatus(message, isError, sticky) {
+        importStatus.textContent = message;
+        if (!message) {
+            importStatus.className = "status";
+            return;
+        }
+        importStatus.className = "status " + (isError ? "error" : "success");
+        if (!sticky && message) {
+            window.setTimeout(function () {
+                importStatus.textContent = "";
+                importStatus.className = "status";
+            }, 4000);
+        }
+    }
+
+    updatePreview();
+})();
+</script>
+</body>
+</html>

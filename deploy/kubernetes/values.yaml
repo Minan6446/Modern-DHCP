@@ -1,0 +1,85 @@
+image:
+  repository: ghcr.io/example/modern-dhcp
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  annotations: {}
+
+service:
+  type: ClusterIP
+  api:
+    port: 8080
+  metrics:
+    port: 9090
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 2000m
+    memory: 4Gi
+
+nodeSelector:
+  tier: dhcp
+
+tolerations:
+  - key: "dedicated"
+    operator: "Equal"
+    value: "dhcp"
+    effect: "NoSchedule"
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: modern-dhcp
+
+hpa:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+  customMetrics:
+    - name: lease_tps
+      targetAverageValue: 500
+
+mysql:
+  host: aurora-cluster.cluster-ro-abcdefg.us-east-1.rds.amazonaws.com
+  port: 3306
+  database: modern_dhcp
+  username: dhcp
+  secretName: modern-dhcp-mysql
+
+redis:
+  host: elasticache-modern-dhcp.xxxxxx.ng.0001.use1.cache.amazonaws.com
+  port: 6379
+
+dhcpd:
+  runtime:
+    listeners: 8
+    workers: 32
+    queueDepth: 256
+    rxBatchSize: 8
+    reusePort: true
+
+config:
+  existingSecret: modern-dhcp-config
+  extra:
+    deployment:
+      modes:
+        - kubernetes
+      scaling:
+        autoHorizontalScaling: true
+        metric: lease_tps
+        scaleOutThreshold: 70
+        scaleInThreshold: 30
+        minReplicas: 3
+        maxReplicas: 20
+        cooldown: 60s

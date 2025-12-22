@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Prefix Delegations - Modern-DHCP</title>
+<style>
+:root {
+    font-family: "Segoe UI", Arial, sans-serif;
+    color: #0f172a;
+    background-color: #f8fafc;
+}
+body {
+    margin: 0;
+    padding: 24px;
+}
+header {
+    margin-bottom: 16px;
+}
+section.card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+}
+form .field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 12px;
+}
+form label {
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+input[type="text"], input[type="number"], select {
+    padding: 8px;
+    border: 1px solid #cbd5f5;
+    border-radius: 4px;
+}
+.controls-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px 16px;
+}
+/* moved inline form action spacing into a dedicated class */
+.controls-actions {
+    margin-top: 12px;
+}
+button.primary {
+    background: #2563eb;
+    color: #ffffff;
+    border: none;
+    border-radius: 4px;
+    padding: 10px 16px;
+    font-weight: 600;
+    cursor: pointer;
+}
+button.primary:disabled {
+    opacity: 0.6;
+    cursor: progress;
+}
+.action-btn {
+    border: 1px solid #94a3b8;
+    background: #ffffff;
+    color: #0f172a;
+    border-radius: 4px;
+    padding: 4px 8px;
+    margin-right: 6px;
+    cursor: pointer;
+    font-size: 0.8rem;
+}
+.action-btn.danger {
+    border-color: #f97316;
+    color: #b45309;
+}
+.action-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+#status {
+    font-size: 0.9rem;
+    margin-bottom: 8px;
+}
+#status.error {
+    color: #b91c1c;
+}
+#status.success {
+    color: #065f46;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+thead {
+    background: #e2e8f0;
+    text-transform: uppercase;
+    font-size: 0.8rem;
+}
+th, td {
+    text-align: left;
+    padding: 10px;
+    border-bottom: 1px solid #e2e8f0;
+    font-size: 0.9rem;
+}
+tr.row-stale {
+    background: #fef2f2;
+}
+tr.row-expiring {
+    background: #fff7ed;
+}
+.badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+.badge-ok {
+    background: #dcfce7;
+    color: #166534;
+}
+.badge-expiring {
+    background: #ffedd5;
+    color: #9a3412;
+}
+.badge-stale {
+    background: #fee2e2;
+    color: #b91c1c;
+}
+.legend {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+    margin-bottom: 12px;
+}
+.legend span {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.summary {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+}
+.summary-item {
+    background: #f1f5f9;
+    border-radius: 6px;
+    padding: 8px 12px;
+}
+.telemetry-card h2 {
+    margin: 0 0 4px;
+    font-size: 1.1rem;
+}
+.telemetry-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+.telemetry-caption {
+    margin: 0;
+    color: #475569;
+    font-size: 0.9rem;
+}
+.telemetry-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+}
+.op-status {
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 0.8rem;
+}
+.op-status.success {
+    background: #dcfce7;
+    color: #166534;
+}
+.op-status.noop {
+    background: #fef9c3;
+    color: #92400e;
+}
+.op-status.error {
+    background: #fee2e2;
+    color: #b91c1c;
+}
+.op-status.info {
+    background: #dbeafe;
+    color: #1d4ed8;
+}
+.trace-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    color: #334155;
+}
+#operationTraceId {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.85rem;
+}
+.telemetry-time {
+    font-size: 0.85rem;
+    color: #475569;
+}
+.telemetry-grid {
+    margin-top: 16px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+}
+.telemetry-block {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 10px 12px;
+    min-height: 72px;
+}
+.step-list {
+    margin: 0;
+    padding-left: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.step-list li {
+    border-left: 3px solid #cbd5f5;
+    padding-left: 8px;
+    font-size: 0.9rem;
+}
+.step-list li strong {
+    display: inline-block;
+    margin-right: 4px;
+}
+.chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 6px;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    margin-left: 8px;
+}
+.chip.success {
+    background: #dcfce7;
+    color: #166534;
+}
+.chip.warning {
+    background: #fef9c3;
+    color: #92400e;
+}
+.chip.error {
+    background: #fee2e2;
+    color: #b91c1c;
+}
+.chip.neutral {
+    background: #e2e8f0;
+    color: #475569;
+}
+.telemetry-card[hidden] {
+    display: none;
+}
+.telemetry-card button {
+    font-size: 0.8rem;
+}
+.telemetry-block ul {
+    margin: 0;
+    padding-left: 16px;
+}
+.telemetry-block ul li {
+    font-size: 0.85rem;
+    margin-bottom: 4px;
+}
+@media (max-width: 640px) {
+    body {
+        padding: 16px;
+    }
+}
+</style>
+</head>
+<body>
+<header>
+    <h1>Prefix Delegations</h1>
+    <p>Inspect delegated IPv6 prefixes for any tenant, highlight stale or soon-to-expire entries, and page through the inventory.</p>
+</header>
+<section class="card">
+    <form id="controls">
+        <div class="controls-grid">
+            <div class="field">
+                <label for="tenantId">Tenant ID *</label>
+                <input id="tenantId" name="tenantId" type="text" placeholder="tenant-123" required />
+            </div>
+            <div class="field">
+                <label for="apiKey">API Key *</label>
+                <input id="apiKey" name="apiKey" type="text" placeholder="paste admin API key" required />
+            </div>
+            <div class="field">
+                <label for="state">State Filter</label>
+                <select id="state" name="state">
+                    <option value="">All</option>
+                    <option value="ACTIVE">ACTIVE</option>
+                    <option value="RELEASED">RELEASED</option>
+                    <option value="DECLINED">DECLINED</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="limit">Limit</label>
+                <input id="limit" name="limit" type="number" min="1" max="500" value="50" />
+            </div>
+            <div class="field">
+                <label for="offset">Offset</label>
+                <input id="offset" name="offset" type="number" min="0" value="0" />
+            </div>
+        </div>
+        <div class="controls-actions">
+            <button class="primary" type="submit" id="loadButton">Load Prefixes</button>
+        </div>
+    </form>
+</section>
+<section class="card">
+    <div class="legend">
+        <span><span class="badge badge-ok">OK</span> Active &gt; 30m remaining</span>
+        <span><span class="badge badge-expiring">Expiring</span> Active but &lt; 30m remaining</span>
+        <span><span class="badge badge-stale">Stale</span> State != ACTIVE</span>
+    </div>
+    <div class="summary">
+        <div class="summary-item">Total: <strong id="summaryTotal">0</strong></div>
+        <div class="summary-item">Expiring &lt;30m: <strong id="summaryExpiring">0</strong></div>
+        <div class="summary-item">Stale state: <strong id="summaryStale">0</strong></div>
+    </div>
+    <div id="status"></div>
+    <div class="table-wrapper">
+        <table>
+            <thead>
+                <tr>
+                    <th>Prefix</th>
+                    <th>Len</th>
+                    <th>IAPD</th>
+                    <th>Pool</th>
+                    <th>Client</th>
+                    <th>State</th>
+                    <th>Status</th>
+                    <th>Expires (UTC)</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="prefixTableBody">
+                <tr><td colspan="9">No data loaded.</td></tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+<section class="card telemetry-card" id="operationTelemetry" hidden>
+    <div class="telemetry-header">
+        <div>
+            <h2>Last Operation</h2>
+            <p class="telemetry-caption">Validation, sync, and downstream events returned by the management API.</p>
+        </div>
+        <div class="telemetry-meta">
+            <span id="operationStatusBadge" class="op-status info">PENDING</span>
+            <span id="operationTimestamp" class="telemetry-time"></span>
+            <div class="trace-meta">
+                <span>traceId:</span>
+                <span id="operationTraceId"></span>
+                <button type="button" class="action-btn" id="copyTraceButton" disabled>Copy trace</button>
+            </div>
+        </div>
+    </div>
+    <div class="telemetry-grid">
+        <div>
+            <h3>Steps</h3>
+            <div class="telemetry-block">
+                <ol id="operationSteps" class="step-list"></ol>
+            </div>
+        </div>
+        <div>
+            <h3>Validation</h3>
+            <div id="operationValidation" class="telemetry-block"></div>
+        </div>
+        <div>
+            <h3>Sync</h3>
+            <div id="operationSync" class="telemetry-block"></div>
+        </div>
+        <div>
+            <h3>Events</h3>
+            <div class="telemetry-block">
+                <ul id="operationEvents" class="step-list"></ul>
+            </div>
+        </div>
+        <div>
+            <h3>Cleanup</h3>
+            <div id="operationCleanup" class="telemetry-block"></div>
+        </div>
+        <div>
+            <h3>Stats</h3>
+            <div id="operationStats" class="telemetry-block"></div>
+        </div>
+    </div>
+</section>
+<script>
+(function () {
+    const STALENESS_MS = 30 * 60 * 1000;
+    const API_KEY_STORAGE = "mdhcp.console.apiKey";
+
+    const form = document.getElementById("controls");
+    const loadButton = document.getElementById("loadButton");
+    const statusEl = document.getElementById("status");
+    const tableBody = document.getElementById("prefixTableBody");
+    const summaryTotal = document.getElementById("summaryTotal");
+    const summaryExpiring = document.getElementById("summaryExpiring");
+    const summaryStale = document.getElementById("summaryStale");
+    const telemetryCard = document.getElementById("operationTelemetry");
+    const telemetryStatus = document.getElementById("operationStatusBadge");
+    const telemetryTimestamp = document.getElementById("operationTimestamp");
+    const telemetryTraceId = document.getElementById("operationTraceId");
+    const telemetrySteps = document.getElementById("operationSteps");
+    const telemetryValidation = document.getElementById("operationValidation");
+    const telemetrySync = document.getElementById("operationSync");
+    const telemetryEvents = document.getElementById("operationEvents");
+    const telemetryCleanup = document.getElementById("operationCleanup");
+    const telemetryStats = document.getElementById("operationStats");
+    const copyTraceButton = document.getElementById("copyTraceButton");
+
+    const savedKey = sessionStorage.getItem(API_KEY_STORAGE);
+    if (savedKey) {
+        document.getElementById("apiKey").value = savedKey;
+    }
+
+    form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        loadPrefixes();
+    });
+
+    if (copyTraceButton) {
+        copyTraceButton.addEventListener("click", function () {
+            const traceId = copyTraceButton.dataset.traceId || (telemetryTraceId ? telemetryTraceId.textContent : "");
+            if (!traceId) {
+                setStatus("Trace ID not available yet.", true);
+                return;
+            }
+            if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+                setStatus("Clipboard API is unavailable in this browser.", true);
+                return;
+            }
+            navigator.clipboard.writeText(traceId).then(function () {
+                setStatus(`Copied trace ID ${traceId}.`, false, true);
+            }).catch(function (err) {
+                setStatus(err.message || String(err), true);
+            });
+        });
+    }
+
+    async function loadPrefixes() {
+        const tenantId = document.getElementById("tenantId").value.trim();
+        const apiKey = document.getElementById("apiKey").value.trim();
+        const state = document.getElementById("state").value;
+        const limit = document.getElementById("limit").value || "50";
+        const offset = document.getElementById("offset").value || "0";
+
+        if (!tenantId) {
+            setStatus("Tenant ID is required.", true);
+            return;
+        }
+        if (!apiKey) {
+            setStatus("API key is required to query the management API.", true);
+            return;
+        }
+
+        sessionStorage.setItem(API_KEY_STORAGE, apiKey);
+        loadButton.disabled = true;
+        setStatus("Loading prefixes...", false);
+
+        const params = new URLSearchParams();
+        params.set("limit", limit);
+        params.set("offset", offset);
+        if (state) {
+            params.set("state", state);
+        }
+
+        try {
+            const resp = await fetch(`/api/v1/tenants/${encodeURIComponent(tenantId)}/prefix-leases?${params.toString()}`, {
+                headers: {
+                    "X-API-Key": apiKey,
+                    "Accept": "application/json"
+                }
+            });
+            if (!resp.ok) {
+                const text = await resp.text();
+                throw new Error(`${resp.status} ${resp.statusText}: ${text}`);
+            }
+            const data = await resp.json();
+            if (!Array.isArray(data)) {
+                throw new Error("Unexpected payload format");
+            }
+            renderTable(data);
+            setStatus(`Loaded ${data.length} prefix leases.`, false, true);
+        } catch (err) {
+            renderTable([]);
+            setStatus(err.message || String(err), true);
+        } finally {
+            loadButton.disabled = false;
+        }
+    }
+
+    function renderTable(leases) {
+        tableBody.innerHTML = "";
+        if (!leases.length) {
+            const row = document.createElement("tr");
+            const cell = document.createElement("td");
+            cell.colSpan = 9;
+            cell.textContent = "No prefix leases to display.";
+            row.appendChild(cell);
+            tableBody.appendChild(row);
+            summaryTotal.textContent = "0";
+            summaryExpiring.textContent = "0";
+            summaryStale.textContent = "0";
+            return;
+        }
+
+        let expiringCount = 0;
+        let staleCount = 0;
+        leases.forEach(function (lease) {
+            const row = document.createElement("tr");
+            const { badge, badgeClass, rowClass, statusLabel } = classifyLease(lease);
+            if (rowClass) {
+                row.classList.add(rowClass);
+            }
+            if (badge === "Expiring") {
+                expiringCount += 1;
+            }
+            if (badge === "Stale") {
+                staleCount += 1;
+            }
+            const leaseId = lease.id ?? lease.ID ?? "";
+
+            row.innerHTML = `
+                <td>${lease.prefix}</td>
+                <td>/${lease.prefixLength ?? lease.prefix_length ?? ""}</td>
+                <td>${lease.iapdId ?? lease.iapd_id ?? ""}</td>
+                <td>${lease.poolId ?? lease.pool_id ?? ""}</td>
+                <td>${lease.clientId ?? lease.client_id ?? ""}</td>
+                <td>${lease.state}</td>
+                <td><span class="badge ${badgeClass}">${statusLabel}</span></td>
+                <td>${formatDate(lease.expiresAt ?? lease.expires_at)}</td>
+                <td>
+                    <button class="action-btn" data-id="${leaseId}" data-action="release">Release</button>
+                    <button class="action-btn danger" data-id="${leaseId}" data-action="decline">Decline</button>
+                </td>`;
+            tableBody.appendChild(row);
+        });
+
+        tableBody.querySelectorAll("button.action-btn").forEach(function (btn) {
+            btn.addEventListener("click", function (event) {
+                const leaseId = event.currentTarget.getAttribute("data-id");
+                const action = event.currentTarget.getAttribute("data-action");
+                performAction(action, leaseId);
+            });
+        });
+
+        summaryTotal.textContent = String(leases.length);
+        summaryExpiring.textContent = String(expiringCount);
+        summaryStale.textContent = String(staleCount);
+    }
+
+    function classifyLease(lease) {
+        const upperState = String(lease.state || "").toUpperCase();
+        const expiresAt = Date.parse(lease.expiresAt || lease.expires_at || "");
+        const now = Date.now();
+        if (upperState !== "ACTIVE") {
+            return {
+                badge: "Stale",
+                badgeClass: "badge badge-stale",
+                rowClass: "row-stale",
+                statusLabel: upperState || "STALE"
+            };
+        }
+        if (!Number.isNaN(expiresAt) && expiresAt - now <= STALENESS_MS) {
+            return {
+                badge: "Expiring",
+                badgeClass: "badge badge-expiring",
+                rowClass: "row-expiring",
+                statusLabel: "Expiring"
+            };
+        }
+        return {
+            badge: "OK",
+            badgeClass: "badge badge-ok",
+            rowClass: "",
+            statusLabel: "OK"
+        };
+    }
+
+    function formatDate(value) {
+        if (!value) {
+            return "";
+        }
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+            return value;
+        }
+        return date.toISOString().replace("T", " ").replace("Z", "Z");
+    }
+
+    function setStatus(message, isError, sticky) {
+        statusEl.textContent = message;
+        statusEl.className = isError ? "error" : "success";
+        if (!sticky) {
+            window.setTimeout(function () {
+                statusEl.textContent = "";
+                statusEl.className = "";
+            }, 4000);
+        }
+    }
+
+    async function performAction(action, leaseId) {
+        const tenantId = document.getElementById("tenantId").value.trim();
+        const apiKey = document.getElementById("apiKey").value.trim();
+        if (!tenantId || !apiKey) {
+            setStatus("Provide tenant ID and API key before running actions.", true);
+            return;
+        }
+        if (!leaseId) {
+            setStatus("Missing prefix lease identifier.", true);
+            return;
+        }
+        const confirmation = window.confirm(`Are you sure you want to ${action} prefix lease ${leaseId}?`);
+        if (!confirmation) {
+            return;
+        }
+        const reasonInput = window.prompt("Optional reason to record (leave blank to skip)", "");
+        const reason = reasonInput ? reasonInput.trim() : "";
+        setStatus(`${formatActionLabel(action)} in progress...`, false);
+        try {
+            const bodyPayload = reason ? JSON.stringify({ reason }) : null;
+            const resp = await fetch(`/api/v1/tenants/${encodeURIComponent(tenantId)}/prefix-leases/${encodeURIComponent(leaseId)}/${action}`, {
+                method: "POST",
+                headers: {
+                    "X-API-Key": apiKey,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                },
+                body: bodyPayload
+            });
+            if (!resp.ok) {
+                const text = await resp.text();
+                throw new Error(`${resp.status} ${resp.statusText}: ${text}`);
+            }
+            const warningHeader = resp.headers.get("Warning");
+            let envelope = null;
+            try {
+                envelope = await resp.json();
+            } catch (parseErr) {
+                // ignore parse errors so we can surface generic status text
+            }
+            if (envelope) {
+                renderOperationTelemetry(envelope);
+            }
+            const leaseData = envelope && envelope.data ? envelope.data : null;
+            const message = warningHeader || buildOperationMessage(action, leaseData, envelope);
+            const statusValue = envelope && typeof envelope.status === "string" ? envelope.status.toLowerCase() : "";
+            const isError = Boolean(warningHeader) || statusValue === "error";
+            setStatus(message, isError, true);
+            await loadPrefixes();
+        } catch (err) {
+            setStatus(err.message || String(err), true);
+        }
+    }
+
+    function renderOperationTelemetry(envelope) {
+        if (!telemetryCard) {
+            return;
+        }
+        if (!envelope || typeof envelope !== "object") {
+            telemetryCard.hidden = true;
+            return;
+        }
+        telemetryCard.hidden = false;
+        const statusValue = typeof envelope.status === "string" ? envelope.status : "info";
+        const statusClass = mapOperationStatusClass(statusValue);
+        telemetryStatus.textContent = statusValue.toUpperCase();
+        telemetryStatus.className = `op-status ${statusClass}`;
+        telemetryTimestamp.textContent = envelope.timestamp ? formatDate(envelope.timestamp) : "";
+        if (telemetryTraceId) {
+            telemetryTraceId.textContent = envelope.traceId || "(none)";
+        }
+        if (copyTraceButton) {
+            const traceId = envelope.traceId || "";
+            copyTraceButton.dataset.traceId = traceId;
+            copyTraceButton.disabled = !traceId || !navigator.clipboard;
+        }
+        renderOperationSteps(envelope.steps);
+        renderValidationBlock(envelope.validation);
+        renderSyncBlock(envelope.sync);
+        renderEventsBlock(envelope.events);
+        renderCleanupBlock(envelope.cleanup);
+        renderStatsBlock(envelope.stats);
+    }
+
+    function renderOperationSteps(steps) {
+        if (!telemetrySteps) {
+            return;
+        }
+        telemetrySteps.innerHTML = "";
+        if (!Array.isArray(steps) || !steps.length) {
+            const li = document.createElement("li");
+            li.textContent = "No lifecycle steps reported.";
+            telemetrySteps.appendChild(li);
+            return;
+        }
+        steps.forEach(function (step) {
+            const li = document.createElement("li");
+            const label = document.createElement("strong");
+            label.textContent = step.label || "Step";
+            li.appendChild(label);
+            if (step.detail) {
+                const detail = document.createElement("span");
+                detail.textContent = ` – ${step.detail}`;
+                li.appendChild(detail);
+            }
+            if (step.status) {
+                const chip = document.createElement("span");
+                chip.className = `chip ${mapChipClass(step.status)}`;
+                chip.textContent = (step.status || "").toUpperCase();
+                li.appendChild(chip);
+            }
+            telemetrySteps.appendChild(li);
+        });
+    }
+
+    function renderValidationBlock(report) {
+        if (!telemetryValidation) {
+            return;
+        }
+        telemetryValidation.innerHTML = "";
+        if (!report) {
+            telemetryValidation.textContent = "Validation skipped – monitoring snapshot unavailable.";
+            return;
+        }
+        const statusRow = document.createElement("div");
+        const statusChip = document.createElement("span");
+        statusChip.className = `chip ${mapChipClass(report.status)}`;
+        statusChip.textContent = (report.status || "UNKNOWN").toUpperCase();
+        statusRow.appendChild(statusChip);
+        if (report.checkedAt) {
+            const checked = document.createElement("span");
+            checked.className = "telemetry-time";
+            checked.textContent = ` checked ${formatDate(report.checkedAt)}`;
+            statusRow.appendChild(checked);
+        }
+        telemetryValidation.appendChild(statusRow);
+        if (Array.isArray(report.messages) && report.messages.length) {
+            const list = document.createElement("ul");
+            report.messages.forEach(function (message) {
+                const li = document.createElement("li");
+                li.textContent = message;
+                list.appendChild(li);
+            });
+            telemetryValidation.appendChild(list);
+        } else {
+            const note = document.createElement("p");
+            note.textContent = "All validators returned OK.";
+            telemetryValidation.appendChild(note);
+        }
+    }
+
+    function renderSyncBlock(sync) {
+        if (!telemetrySync) {
+            return;
+        }
+        telemetrySync.innerHTML = "";
+        if (!sync) {
+            telemetrySync.textContent = "Failover coordinator telemetry unavailable.";
+            return;
+        }
+        const fields = [
+            { key: "Role", value: sync.role || "n/a" },
+            { key: "State", value: sync.state || "n/a" },
+            { key: "Lag", value: typeof sync.lagSeconds === "number" ? `${sync.lagSeconds.toFixed(1)}s` : "n/a" },
+            { key: "Peer last seen", value: sync.peerLastSeen ? formatDate(sync.peerLastSeen) : "unknown" }
+        ];
+        fields.forEach(function (field) {
+            const p = document.createElement("p");
+            const strong = document.createElement("strong");
+            strong.textContent = `${field.key}: `;
+            p.appendChild(strong);
+            p.appendChild(document.createTextNode(field.value));
+            telemetrySync.appendChild(p);
+        });
+        if (sync.manualFailback) {
+            const note = document.createElement("p");
+            note.textContent = "Manual failback window is active.";
+            telemetrySync.appendChild(note);
+        }
+    }
+
+    function renderEventsBlock(events) {
+        if (!telemetryEvents) {
+            return;
+        }
+        telemetryEvents.innerHTML = "";
+        if (!Array.isArray(events) || !events.length) {
+            const li = document.createElement("li");
+            li.textContent = "No downstream events reported.";
+            telemetryEvents.appendChild(li);
+            return;
+        }
+        events.forEach(function (event) {
+            const li = document.createElement("li");
+            const label = document.createElement("strong");
+            label.textContent = event.channel || "event";
+            li.appendChild(label);
+            if (event.detail) {
+                const detail = document.createElement("span");
+                detail.textContent = ` – ${event.detail}`;
+                li.appendChild(detail);
+            }
+            if (event.status) {
+                const chip = document.createElement("span");
+                chip.className = `chip ${mapChipClass(event.status)}`;
+                chip.textContent = (event.status || "").toUpperCase();
+                li.appendChild(chip);
+            }
+            if (event.emittedAt) {
+                const meta = document.createElement("div");
+                meta.className = "telemetry-time";
+                const emitted = formatDate(event.emittedAt);
+                const extra = event.correlationId ? ` · corr ${event.correlationId}` : "";
+                meta.textContent = `${emitted}${extra}`;
+                li.appendChild(meta);
+            }
+            telemetryEvents.appendChild(li);
+        });
+    }
+
+    function renderCleanupBlock(cleanup) {
+        if (!telemetryCleanup) {
+            return;
+        }
+        telemetryCleanup.innerHTML = "";
+        if (!cleanup) {
+            telemetryCleanup.textContent = "Cleanup tasks were not reported.";
+            return;
+        }
+        const row = document.createElement("div");
+        const chip = document.createElement("span");
+        chip.className = `chip ${mapChipClass(cleanup.status)}`;
+        chip.textContent = (cleanup.status || "").toUpperCase();
+        row.appendChild(chip);
+        if (cleanup.completedAt) {
+            const completed = document.createElement("span");
+            completed.className = "telemetry-time";
+            completed.textContent = ` finished ${formatDate(cleanup.completedAt)}`;
+            row.appendChild(completed);
+        }
+        telemetryCleanup.appendChild(row);
+        if (Array.isArray(cleanup.tasks) && cleanup.tasks.length) {
+            const list = document.createElement("ul");
+            cleanup.tasks.forEach(function (task) {
+                const li = document.createElement("li");
+                li.textContent = task;
+                list.appendChild(li);
+            });
+            telemetryCleanup.appendChild(list);
+        } else {
+            const note = document.createElement("p");
+            note.textContent = "No follow-up tasks queued.";
+            telemetryCleanup.appendChild(note);
+        }
+    }
+
+    function renderStatsBlock(stats) {
+        if (!telemetryStats) {
+            return;
+        }
+        telemetryStats.innerHTML = "";
+        if (!stats || typeof stats !== "object") {
+            telemetryStats.textContent = "Stats snapshot unavailable.";
+            return;
+        }
+        if (typeof stats.error === "string" && stats.error) {
+            const err = document.createElement("p");
+            err.textContent = stats.error;
+            telemetryStats.appendChild(err);
+        }
+        const overview = stats.overview || stats.Overview || {};
+        const generatedAt = overview.generatedAt || overview.GeneratedAt;
+        if (generatedAt) {
+            const generated = document.createElement("p");
+            generated.textContent = `Overview generated ${formatDate(generatedAt)}`;
+            telemetryStats.appendChild(generated);
+        }
+        const systemHealth = overview.systemHealth || overview.SystemHealth;
+        if (systemHealth) {
+            const cpuPercent = Number(systemHealth.cpuPercent ?? systemHealth.CPUPercent ?? 0).toFixed(1);
+            const memPercent = Number(systemHealth.memoryPercent ?? systemHealth.MemoryPercent ?? 0).toFixed(1);
+            const cpu = document.createElement("p");
+            cpu.textContent = `CPU ${cpuPercent}% · Mem ${memPercent}%`;
+            telemetryStats.appendChild(cpu);
+        }
+        const poolUsage = overview.poolUsage || overview.PoolUsage || [];
+        if (Array.isArray(poolUsage) && poolUsage.length) {
+            const pool = poolUsage[0];
+            const poolName = pool.name || pool.Name || pool.poolId || pool.PoolID || "pool";
+            const allocated = pool.allocated ?? pool.Allocated ?? 0;
+            const capacity = pool.capacity ?? pool.Capacity ?? 0;
+            const utilization = Number(pool.utilization ?? pool.Utilization ?? 0).toFixed(1);
+            const usage = document.createElement("p");
+            usage.textContent = `Pool ${poolName}: ${allocated}/${capacity} leases (${utilization}%)`;
+            telemetryStats.appendChild(usage);
+        }
+        if (!telemetryStats.children.length) {
+            telemetryStats.textContent = "Awaiting monitoring overview.";
+        }
+    }
+
+    function buildOperationMessage(action, leaseData, envelope) {
+        const actionLabel = formatActionLabel(action);
+        if (envelope && Array.isArray(envelope.steps) && envelope.steps.length) {
+            const finalStep = envelope.steps[envelope.steps.length - 1];
+            if (finalStep && finalStep.detail) {
+                return `${actionLabel}: ${finalStep.detail}`;
+            }
+        }
+        if (leaseData) {
+            const prefix = leaseData.prefix || leaseData.Prefix || "";
+            const length = leaseData.prefixLength ?? leaseData.prefix_length ?? "";
+            if (prefix) {
+                const suffix = length ? `/${length}` : "";
+                return `${actionLabel} complete for ${prefix}${suffix}.`;
+            }
+        }
+        if (envelope && typeof envelope.status === "string") {
+            return `${actionLabel} reported status ${envelope.status}.`;
+        }
+        return `${actionLabel} request completed.`;
+    }
+
+    function formatActionLabel(action) {
+        if (!action) {
+            return "Action";
+        }
+        return action.charAt(0).toUpperCase() + action.slice(1);
+    }
+
+    function mapOperationStatusClass(status) {
+        const normalized = String(status || "").toLowerCase();
+        if (normalized === "success") {
+            return "success";
+        }
+        if (normalized === "noop" || normalized === "skipped") {
+            return "noop";
+        }
+        if (normalized === "error" || normalized === "failed") {
+            return "error";
+        }
+        return "info";
+    }
+
+    function mapChipClass(status) {
+        const normalized = String(status || "").toLowerCase();
+        if (normalized === "success" || normalized === "passed" || normalized === "done") {
+            return "success";
+        }
+        if (normalized === "warning" || normalized === "noop" || normalized === "skipped" || normalized === "degraded") {
+            return "warning";
+        }
+        if (normalized === "error" || normalized === "failed") {
+            return "error";
+        }
+        return "neutral";
+    }
+})();
+</script>
+</body>
+</html>

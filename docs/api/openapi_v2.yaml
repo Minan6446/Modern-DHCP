@@ -1,0 +1,126 @@
+openapi: 3.0.3
+info:
+  title: Modern-DHCP API
+  version: 2.0.0
+  description: Experimental v2 surface that mirrors v1 resources while enabling future-breaking changes under header negotiation.
+servers:
+  - url: https://{host}/api/v2
+    variables:
+      host:
+        default: manager.example.com
+security:
+  - OAuth2: [dhcp.read]
+  - ApiKeyAuth: []
+paths:
+  /tenants/{tenantId}/pools:
+    get:
+      summary: List address pools (v2)
+      parameters:
+        - $ref: './openapi_v1.yaml#/components/parameters/TenantID'
+      responses:
+        '200':
+          description: Pool list
+  /monitoring/overview:
+    get:
+      summary: Tenant monitoring overview snapshot
+      parameters:
+        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
+        - $ref: './openapi_v1.yaml#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Combined pool, request, system, and security insight
+          content:
+            application/json:
+              schema:
+                $ref: './openapi_v1.yaml#/components/schemas/OverviewSnapshot'
+  /monitoring/pools:
+    get:
+      summary: Pool utilization snapshot
+      parameters:
+        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
+        - $ref: './openapi_v1.yaml#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Current utilization for monitored pools
+          content:
+            application/json:
+              schema:
+                $ref: './openapi_v1.yaml#/components/schemas/MonitoringPoolsResponse'
+  /monitoring/requests:
+    get:
+      summary: DHCP lifecycle request metrics
+      parameters:
+        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
+      responses:
+        '200':
+          description: Latency and error-rate observations per DHCP phase
+          content:
+            application/json:
+              schema:
+                $ref: './openapi_v1.yaml#/components/schemas/MonitoringRequestsResponse'
+  /monitoring/health:
+    get:
+      summary: Runtime system health snapshot
+      responses:
+        '200':
+          description: Host metrics with optional HA status
+          content:
+            application/json:
+              schema:
+                $ref: './openapi_v1.yaml#/components/schemas/MonitoringHealthResponse'
+  /monitoring/security:
+    get:
+      summary: Guard and snooping telemetry
+      parameters:
+        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
+      responses:
+        '200':
+          description: Rate-limit and snooping windows for the tenant
+          content:
+            application/json:
+              schema:
+                $ref: './openapi_v1.yaml#/components/schemas/MonitoringSecurityResponse'
+  /monitoring/alerts:
+    get:
+      summary: Alert lifecycle feed for the active tenant
+      parameters:
+        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
+        - $ref: './openapi_v1.yaml#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Alert feed snapshot
+          content:
+            application/json:
+              schema:
+                $ref: './openapi_v1.yaml#/components/schemas/AlertFeedSnapshot'
+  /monitoring/alerts/feed:
+    get:
+      summary: Alert lifecycle feed (alias)
+      parameters:
+        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
+        - $ref: './openapi_v1.yaml#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Alert feed snapshot
+          content:
+            application/json:
+              schema:
+                $ref: './openapi_v1.yaml#/components/schemas/AlertFeedSnapshot'
+  /monitoring/alerts/rules:
+    get:
+      summary: Compiled alert rule catalog
+      responses:
+        '200':
+          description: Alert rule descriptors evaluated by the controller
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: './openapi_v1.yaml#/components/schemas/AlertRuleDescriptor'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      $ref: './openapi_v1.yaml#/components/securitySchemes/ApiKeyAuth'
+    OAuth2:
+      $ref: './openapi_v1.yaml#/components/securitySchemes/OAuth2'

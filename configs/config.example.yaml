@@ -1,0 +1,924 @@
+service:
+  name: modern-dhcp
+  env: dev
+  nodeID: node-a
+  bindAddress: 0.0.0.0
+  dhcpv4Port: 67
+  dhcpv6Port: 547
+  apiPort: 8080
+  metricsPort: 9090
+  enableIPv6: true
+  enableBOOTP: true
+  cors:
+    enabled: true
+    allowedOrigins:
+      - "https://console.example.com"
+      - "https://ops-tools.internal.example.com"
+  dhcpv4:
+    workerCount: 0
+    queueDepth: 0
+    listenerFanout: 0
+    rxBatchSize: 4
+    reusePort: true
+
+deployment:
+  modes:
+    - bareMetal
+    - vm
+    - docker
+    - kubernetes
+    - publicCloud
+  bareMetal:
+    provisioningTool: ipxe
+    osImage: rocky-9.3
+    kernelArgs:
+      - console=ttyS0
+      - intel_iommu=on
+    raidLayout: raid10
+    nicBonding: lacp
+    outOfBand: redfish
+  virtualMachine:
+    hypervisors:
+      - vmware
+      - kvm
+      - hyper-v
+    template: s3://images/modern-dhcp/gold-master.ova
+    cpu: 8
+    memoryGB: 32
+    diskGB: 200
+    drivers:
+      - vmware-tools
+      - virtio
+  containers:
+    runtime: docker
+    image: ghcr.io/example/modern-dhcp
+    tag: latest
+    composeFile: deploy/docker/docker-compose.yaml
+    publishedPorts:
+      - "67:67/udp"
+      - "547:547/udp"
+      - "8080:8080/tcp"
+    storageClass: local
+  kubernetes:
+    distribution: eks
+    namespace: modern-dhcp
+    helmChart: charts/modern-dhcp
+    valuesFile: deploy/kubernetes/values.yaml
+    nodeSelector:
+      tier: dhcp
+    tolerations:
+      - "dedicated=dhcp:NoSchedule"
+    hpa:
+      enabled: true
+      minReplicas: 3
+      maxReplicas: 20
+      scaleUpThreshold: 70
+      scaleDownThreshold: 30
+      cooldown: 60s
+      metrics:
+        - cpu
+        - lease_tps
+  cloud:
+    providers:
+      - aws
+      - azure
+      - alicloud
+    loadBalancer: nlb
+    database: aurora-mysql
+    cache: elasticache
+    infraAsCode:
+      - terraform
+      - ansible
+    regions:
+      - us-east-1
+      - eu-central-1
+      - cn-hangzhou
+  scaling:
+    autoHorizontalScaling: true
+    metric: lease_tps
+    scaleOutThreshold: 75
+    scaleInThreshold: 35
+    minReplicas: 2
+    maxReplicas: 40
+    cooldown: 90s
+  resource:
+    enabled: true
+    cpu:
+      min: 4
+      max: 32
+      step: 4
+    memoryGB:
+      min: 16
+      max: 256
+      step: 16
+    triggerPolicies:
+      - "cpu>70"
+      - "memory>75"
+  geo:
+    enabled: true
+    edgeSupport: true
+    regions:
+      - name: apac
+        role: active
+        provider: aws
+        clusters: 4
+        latencyBudget: 120ms
+        edgeSites:
+          - tokyo-edge
+          - seoul-edge
+      - name: emea
+        role: standby
+        provider: azure
+        clusters: 2
+        latencyBudget: 180ms
+        edgeSites:
+          - frankfurt-edge
+  hybrid:
+    enabled: true
+    vpnMesh: true
+    transitType: direct-connect
+    cloudProviders:
+      - aws
+      - azure
+    onPremRegions:
+      - primary-dc
+      - dr-dc
+    policy: prefer-onprem
+
+storage:
+  relational:
+    primary: mysql
+    failover: postgres
+    mysql:
+      enabled: true
+      dsn: "user:password@tcp(mysql-primary:3306)/modern_dhcp?parseTime=true&loc=Local"
+      maxConnections: 200
+      connMaxLifetime: 300s
+      migrationTool: goose
+      tls:
+        caFile: /etc/modern-dhcp/pki/mysql-ca.pem
+        certFile: /etc/modern-dhcp/pki/mysql-client.pem
+        keyFile: /etc/modern-dhcp/pki/mysql-client-key.pem
+    postgres:
+      enabled: true
+      dsn: "postgresql://dhcp:password@pgsql-primary:5432/modern_dhcp?sslmode=verify-full"
+      maxConnections: 150
+      connMaxLifetime: 300s
+      sslMode: verify-full
+      migrationTool: goose
+    rds:
+      provider: aws
+      instance: aurora-mysql-cluster
+      endpoints:
+        - aurora-cluster.cluster-abcdefghijkl.us-east-1.rds.amazonaws.com
+        - aurora-cluster.cluster-ro-abcdefghijkl.us-east-1.rds.amazonaws.com
+      failoverPolicy: multi-az
+  nosql:
+    redis:
+      mode: cluster
+      addresses:
+        - redis-node-1:6379
+        - redis-node-2:6379
+        - redis-node-3:6379
+      username: ""
+      password: ""
+      useTls: false
+    mongo:
+      enabled: false
+      uri: "mongodb://mongo-1:27017,mongo-2:27017/?replicaSet=dhcp"
+      database: dhcp_events
+      replicaSet: dhcp
+      tls:
+        caFile: /etc/modern-dhcp/pki/mongo-ca.pem
+        certFile: /etc/modern-dhcp/pki/mongo.pem
+        keyFile: /etc/modern-dhcp/pki/mongo-key.pem
+  distributed:
+    etcd:
+      enabled: true
+      endpoints:
+        - https://etcd-1:2379
+        - https://etcd-2:2379
+        - https://etcd-3:2379
+      namespace: modern-dhcp
+      tls:
+        caFile: /etc/modern-dhcp/pki/etcd-ca.pem
+        certFile: /etc/modern-dhcp/pki/etcd.pem
+        keyFile: /etc/modern-dhcp/pki/etcd-key.pem
+    consul:
+      enabled: false
+      endpoints: []
+      namespace: dhcp
+      tls:
+        caFile: ""
+        certFile: ""
+        keyFile: ""
+    zookeeper:
+      enabled: false
+      endpoints: []
+      namespace: dhcp
+      tls:
+        caFile: ""
+        certFile: ""
+        keyFile: ""
+  cloud:
+    objectStores:
+      - provider: aws
+        bucket: modern-dhcp-backups
+        region: us-east-1
+        prefix: prod/
+        kmsKey: arn:aws:kms:us-east-1:123456789012:key/abcd-1234
+    secrets:
+      - aws/modern-dhcp/rds
+      - azure/keyvault/modern-dhcp
+
+backup:
+  enabled: true
+  schedule: "0 */4 * * *"
+  fullInterval: 24h
+  incrementalInterval: 4h
+  retentionDays: 30
+  locations:
+    - local-nas
+    - s3://modern-dhcp-backups/prod
+  crossRegion:
+    enabled: true
+    regions:
+      - us-west-2
+      - eu-central-1
+    transport: s3-bucket-replication
+    lagTarget: 2h
+  verification:
+    enabled: true
+    schedule: "30 2 * * 0"
+    sandboxEnv: restore-lab
+    retention: 4
+    alertChannel: ops-chat
+  restoreUi:
+    enabled: true
+    url: https://recovery.console.example.com
+    authProvider: okta
+    auditSink: kafka://dhcp.audit.backups
+
+ui:
+  themes:
+    default: light
+    supported:
+      - light
+      - dark
+      - high-contrast
+    allowTenantOverride: true
+  localization:
+    defaultLocale: zh-CN
+    supported:
+      - zh-CN
+      - en-US
+      - ja-JP
+    fallback: en-US
+    detectBrowser: true
+  accessibility:
+    highContrastEnabled: true
+    fontScaleMin: 0.9
+    fontScaleMax: 1.3
+    reducedMotion: true
+    screenReaderHints: true
+    focusOutline: true
+    announceLiveRegions: true
+    validationStrategy: inline
+    liveRegionDebounce: 750ms
+  collaboration:
+    enabled: true
+    optimisticLockTtl: 2m
+    presenceHeartbeat: 15s
+    maxConcurrentLocks: 4
+    commentLengthLimit: 2048
+    approvalLevels: 3
+    taskQueueEnabled: true
+  visualization:
+    enable3d: true
+    mapProvider: mapbox
+    leaseHeatmapResolution: city
+    topologyAutoDiscovery: true
+    maxCanvasNodes: 2000
+    snapshotInterval: 30s
+
+api:
+  versions:
+    - v1
+    - v2
+  defaultVersion: v1
+  openapi:
+    enabled: true
+    servePath: /openapi
+  rateLimit:
+    enabled: true
+    fallbackToIp: true
+    default:
+      requestsPerMinute: 600
+      burst: 120
+    perApiKey:
+      admin-token:
+        requestsPerMinute: 1200
+        burst: 200
+    perRole:
+      admin:
+        requestsPerMinute: 900
+        burst: 150
+  quota:
+    enabled: true
+    defaultDaily: 20000
+    perApiKey:
+      read-token: 5000
+    perRole:
+      admin: 40000
+    resetHourUTC: 0
+    includeWriteOnly: true
+
+rbac:
+  enforceCapabilities: false
+  shadowMode: true
+  cacheTtl: 60s
+
+mysql:
+  dsn: "dhcp_web:deGdZtfckN4zcCdW@tcp(10.0.11.24:3306)/dhcp_db?parseTime=true&loc=Local"
+  maxOpenConns: 50
+  maxIdleConns: 10
+  connMaxLifetime: 300s
+  connMaxIdleTime: 60s
+
+postgres:
+  dsn: "postgresql://dhcp:password@pgsql-primary:5432/modern_dhcp?sslmode=verify-full"
+  maxOpenConns: 40
+  maxIdleConns: 10
+  connMaxLifetime: 300s
+  connMaxIdleTime: 60s
+
+redis:
+  addresses:
+    - 10.0.11.24:6379
+  username: "dhcpredis"
+  password: "dhcp123"
+  database: 0
+
+kafka:
+  brokers:
+    - 127.0.0.1:9092
+  clientID: modern-dhcp
+  topics:
+    leaseEvents: dhcp.lease.events
+    securityEvents: dhcp.security.events
+    policyEvents: dhcp.policy.events
+
+ha:
+  mode: active-active
+  heartbeatInterval: 125ms
+  failoverTimeout: 450ms
+  coordinators:
+    - backend: etcd
+      endpoints:
+        - https://etcd-1:2379
+        - https://etcd-2:2379
+        - https://etcd-3:2379
+      key: /modern-dhcp/locks/ha
+      leaseTTL: 5s
+      interval: 200ms
+    - backend: consul
+      endpoints:
+        - http://consul.service:8500
+      key: modern-dhcp/ha/leader
+      token: consul-access-token
+      interval: 250ms
+  partner:
+    enabled: true
+    address: node-b.ha.local
+    port: 6470
+    mclt: 120s
+  coordinator:
+    backend: etcd
+    endpoints:
+      - https://etcd-1:2379
+      - https://etcd-2:2379
+      - https://etcd-3:2379
+    interval: 200ms
+    tls:
+      caFile: /etc/modern-dhcp/pki/ca.pem
+      certFile: /etc/modern-dhcp/pki/node.pem
+      keyFile: /etc/modern-dhcp/pki/node-key.pem
+  probe:
+    backend: udp
+    target: node-b.ha.local
+    port: 19090
+    interval: 500ms
+    timeout: 200ms
+    failureThreshold: 3
+    payload: "PING"
+  failback:
+    mode: manual
+    stablePeriod: 60s
+  runbooks:
+    - /etc/modern-dhcp/runbooks/manual-failover.md
+    - /etc/modern-dhcp/runbooks/ingress-reset.md
+  replication:
+    cdcEnabled: true
+    brokers:
+      - kafka-1:9092
+      - kafka-2:9092
+    topic: dhcp.replication.journal
+    ackTimeout: 2s
+    snapshotInterval: 5m
+    binlogSource: mysql-primary:3306
+  ingress:
+    mode: vip
+    vipInterface: eth0
+    vipAddress: 10.0.0.10
+    dnsEntry: dhcp-core.example.com
+    dns:
+      provider: http
+      endpoint: https://dns-api.internal.example.com/v1/records
+      token: ${DNS_API_TOKEN}
+      ttl: 30s
+
+policy:
+  cacheTTL: 30s
+  maxRulesPerTenant: 1000
+  defaultLeaseProfile:
+    default: 3600s
+    min: 300s
+    max: 86400s
+    notificationLead: 300s
+    sleepyCapable: true
+    sleepyOfflineWindow: 6h
+    sleepyHoldDuration: 45m
+    mobilityGracePeriod: 60s
+  lifecycle:
+    autoReclaim:
+      enabled: true
+      interval: 2m
+      gracePeriod: 30s
+      batchSize: 100
+    cooldownDuration: 2m
+    maxCooldowns: 5
+    conflictBackoff: 5s
+    mobilityAffinityTTL: 30s # TTL for the mobility-affinity cache that biases pool selection
+  mobileProfiles:
+    enabled: true
+    profiles:
+      - name: ios-default
+        platform: ios
+        persona: BYOD
+        tags: ["ios", "mobile", "mdm-capable"]
+        vendorClassContains: ["iphone", "ios", "apple"]
+        userClassContains: ["apple" ]
+        relayKeywords: ["ios", "iphone"]
+        option55Contains: [1,3,6,15,119]
+      - name: android-enterprise
+        platform: android
+        persona: corporate
+        tags: ["android", "mobile", "enterprise"]
+        vendorClassContains: ["android", "samsung", "pixel"]
+        relayKeywords: ["android"]
+        option55Contains: [1,3,6,15,123]
+
+iot:
+  registry:
+    enabled: true
+    defaultSleepInterval: 10m
+    defaultOfflineWindow: 4h
+
+security:
+  enabled: true
+  snooping:
+    enabled: true
+    grpcEndpoint: collector:7443
+    refreshInterval: 30s
+    cacheTTL: 120s
+    trustedPorts:
+      - gi1/0/1
+      - gi1/0/2
+    redis:
+      addr: redis:6379
+      db: 3
+      username: ""
+      password: ""
+  rateLimit:
+    default:
+      perMacPPS: 50
+      perPortPPS: 200
+      perIPPPS: 100
+      burst: 20
+    overrides:
+      tenant-acme:
+        perMacPPS: 100
+        perPortPPS: 400
+        perIPPPS: 200
+        burst: 40
+  detection:
+    declineSpikeThreshold: 5
+    starvationWindow: 30s
+    option82MismatchTolerance: 2
+    discoverBurstThreshold: 40
+    discoverToRequestRatio: 0.25
+    blockDuration: 2m
+    macDriftThreshold: 3
+    rogueServerAllowlist:
+      - 10.99.0.1
+      - 10.99.0.2
+  conflictPrevention:
+    enabled: true
+    probeTimeout: 1s
+    holdDuration: 5s
+    maxAttempts: 3
+    reclaimScanLimit: 1
+  macAcl:
+    enforceWhitelist: false
+    whitelist:
+      - "00:11:22:33:44:55"
+    blacklist:
+      - "de:ad:be:ef:00:01"
+    graylist:
+      - "00:aa:bb:cc:dd:ee"
+    graylistAction: monitor
+  exhaustion:
+    maxLeasesPerMac: 4
+    maxLeasesPerUser: 8
+    poolWarnPercent: 80
+    poolProtectPercent: 95
+    isolation:
+      temporaryDuration: 10m
+      permanentAfter: 3
+  ipsgdai:
+    publishURL: https://controller.example.com/api/ipsg
+    secret: "<hmac-secret>"
+    retry: 5
+  radius:
+    servers:
+      - addr: 10.1.0.10:1812
+        sharedSecret: radius-secret
+        timeout: 3s
+    coa:
+      listen: ":3799"
+  policy:
+    enabled: true
+    cacheTtl: 45s
+  mdm:
+    enabled: true
+    pollInterval: 2m
+    cacheTTL: 15m
+    tags:
+      compliant: compliance.compliant
+      nonCompliant: compliance.non_compliant
+    intune:
+      enabled: true
+      tenantId: 11111111-2222-3333-4444-555555555555
+      clientId: 77777777-8888-9999-aaaa-bbbbbbbbbbbb
+      clientSecret: "<intune-client-secret>"
+      authority: https://login.microsoftonline.com/
+      scopes:
+        - https://graph.microsoft.com/.default
+      syncWindow: 30m
+      deviceFilter:
+        - ios
+        - android
+    jamf:
+      enabled: false
+      baseUrl: https://jamf-instance.example.com
+      clientId: jamf-client
+      clientSecret: "<jamf-secret>"
+      site: enterprise
+      syncWindow: 1h
+    airwatch:
+      enabled: false
+      host: https://cn.awmdm.example.com
+      apiKey: "<aw-api-key>"
+      username: dhcp-mdm
+      password: "<aw-password>"
+      tenantCode: CN01
+      syncWindow: 45m
+
+relay:
+  enabled: true
+  option82:
+    preserveRaw: true
+    subOptionMappings:
+      "150":
+        key: vlan-id
+        format: int
+        aliases:
+          - agent.vlan-id
+  authentication:
+    required: false
+    replayWindow: 30s
+    allowedAgents: []
+    sharedSecrets: {}
+  poolSelection:
+    defaultPool: ""
+    giaddrRules: []
+    rules: []
+  loadBalancing:
+    mode: consistent-hash
+    hashKeys:
+      - relayId
+      - giaddr
+    servers: []
+  crossDomain:
+    regionFallbacks: {}
+    vrfRules: []
+    mplsVpnRules: []
+    multiVlanPools: []
+
+monitoring:
+  prometheus:
+    enabled: true
+    endpoint: /metrics
+  tracing:
+    exporter: otlp
+    endpoint: http://localhost:4317
+  alerting:
+    enabled: true
+    evaluateInterval: 30s
+    dedupeWindow: 2m
+    escalationWindow: 10m
+    routes:
+      - name: critical-default
+        severities:
+          - CRITICAL
+          - MAJOR
+        channels:
+          - noc-email
+          - ops-chat
+      - name: warnings
+        severities:
+          - WARNING
+          - INFO
+        channels:
+          - ops-chat
+          - syslog-core
+    notifiers:
+      email:
+        - name: noc-email
+          from: dhcp-alerts@example.com
+          recipients:
+            - noc@example.com
+            - dhcp-oncall@example.com
+      chat:
+        - name: ops-chat
+          channel: "#dhcp-alerts"
+          webhook: https://hooks.slack.example.com/services/T000/B000/KEY
+      syslog:
+        - name: syslog-core
+          address: 10.10.10.10:514
+          network: udp
+    defaultPolicy:
+      enabled: true
+      silenceWindow: 5m
+      poolSampleSize: 50
+      poolThresholds:
+        warning: 80
+        major: 90
+        critical: 95
+      latency:
+        major: 200
+        critical: 500
+      errorRate:
+        warning: 2
+        major: 5
+        critical: 10
+      rateLimit:
+        window: 1m
+        warning: 25
+        major: 60
+        critical: 120
+    policies:
+      tenant-acme:
+        enabled: true
+        silenceWindow: 2m
+        poolSampleSize: 25
+        poolThresholds:
+          warning: 70
+          major: 85
+          critical: 92
+        latency:
+          major: 150
+          critical: 400
+        errorRate:
+          warning: 5
+          major: 10
+          critical: 15
+        rateLimit:
+          window: 45s
+          warning: 15
+          major: 40
+          critical: 80
+
+auth:
+  enabled: true
+  apiKeys:
+    admin-token:
+      displayName: super-admin
+      role: admin
+      principalId: user:admin-token
+    read-token:
+      displayName: readonly
+      role: reader
+      principalId: user:readonly-token
+  oauth:
+    enabled: true
+    issuer: https://auth.example.com/
+    audience: modern-dhcp
+    jwksURL: https://auth.example.com/.well-known/jwks.json
+    jwksCacheTTL: 5m
+    requiredScopes:
+      - dhcp.read
+    scopeRoles:
+      "dhcp.admin": admin
+      "dhcp.reader": reader
+    defaultRole: reader
+    clockSkew: 30s
+  providers:
+    local:
+      disabled: false
+      default: true
+    ldap:
+      enabled: false
+      default: false
+      url: ldaps://ldap.example.com:636
+      bindDN: cn=svc,ou=Service,dc=example,dc=com
+      bindPassword: change-me
+      userBaseDN: ou=Users,dc=example,dc=com
+      userFilter: "(uid={username})"
+      usernameAttribute: uid
+      displayNameAttribute: cn
+      emailAttribute: mail
+      useStartTLS: false
+      skipTLSVerify: false
+      timeout: 5s
+  superAdmin:
+    enabled: true
+    username: admin
+    apiKeyRef: admin-token
+    stateFile: data/super_admin.json
+
+events:
+  policyWebhooks:
+    - https://controller.example.com/hooks/policy
+
+automation:
+  enabled: true
+  scheduler:
+    queueSize: 256
+    workerCount: 8
+    maxAttempts: 5
+    defaultTimeout: 45s
+  jobs:
+    inventory:
+      enabled: true
+      interval: 30m
+      initialDelay: 2m
+      tenantId: core-services
+      labels:
+        source: cmdb
+        scope: full-scan
+      payload:
+        syncDepth: delta
+        includeHardware: true
+      channels:
+        - cmdb-webhook
+    policyAudit:
+      enabled: true
+      interval: 1h
+      tenantId: global
+      labels:
+        playbook: guardrails
+      payload:
+        includeDriftReport: true
+      channels:
+        - ops-chat
+        - grafana-webhook
+    securityScan:
+      enabled: true
+      interval: 15m
+      tenantId: global
+      labels:
+        class: dhcp-snooping
+      payload:
+        severityThreshold: major
+      channels:
+        - secops-webhook
+    analytics:
+      enabled: true
+      interval: 12h
+      tenantId: reporting
+      payload:
+        exports:
+          - lease_trends
+          - pool_capacity
+      channels:
+        - data-lake-webhook
+    notificationFanout:
+      enabled: true
+      interval: 1m
+      tenantId: global
+      payload:
+        batchSize: 200
+      channels:
+        - ops-chat
+
+notifications:
+  enabled: true
+  defaultTimeout: 10s
+  channels:
+    - name: cmdb-webhook
+      type: webhook
+      endpoint: https://cmdb.example.com/api/v1/hooks/automation
+      method: POST
+      secret: ${CMDB_TOKEN}
+      headers:
+        X-System: modern-dhcp
+    - name: grafana-webhook
+      type: webhook
+      endpoint: https://grafana.example.com/api/webhook/dhcp
+      method: POST
+      secret: ${GRAFANA_TOKEN}
+      headers:
+        X-Workspace: net-ops
+    - name: ops-chat
+      type: chat
+      endpoint: https://hooks.slack.example.com/services/T000/B000/KEY
+      method: POST
+      secret: ""
+    - name: secops-webhook
+      type: webhook
+      endpoint: https://secops.example.com/api/v2/ingest
+      method: POST
+      secret: ${SECOPS_TOKEN}
+      headers:
+        X-Incident-Source: modern-dhcp
+    - name: data-lake-webhook
+      type: webhook
+      endpoint: https://lake.example.com/hooks/dhcp-automation
+      method: PUT
+      secret: ${DATALAKE_TOKEN}
+  integrations:
+    cmdb:
+      enabled: true
+      channel: cmdb-webhook
+    monitoring:
+      enabled: true
+      channel: grafana-webhook
+
+opsSupport:
+  system:
+    enabled: true
+    allowConfigExport: true
+    allowConfigImport: false
+    backupLocation: s3://modern-dhcp-ops/config-backups
+    maintenanceWindow: "Sun 02:00-04:00 UTC"
+  importExport:
+    enabled: true
+    storagePath: data/imports
+    objectStore: s3://modern-dhcp-ops/import-export
+    formats:
+      - csv
+      - json
+      - parquet
+    maxFileSize: 134217728
+  helpCenter:
+    enabled: true
+    baseUrl: https://kb.example.com/modern-dhcp
+    articlesPath: docs/help-center
+    faqPath: docs/help-center/faq.yaml
+    releaseNotesPath: docs/help-center/releases.yaml
+    featuredTopics:
+      - onboarding
+      - automation
+      - troubleshooting
+    externalSearchUrl: https://kb.example.com/search?q=
+    cacheTtl: 5m
+  support:
+    enabled: true
+    ticketUrl: https://support.example.com/tickets/new
+    chatUrl: https://chat.example.com/rooms/net-ops
+    phone: "+1-800-NET-OPS"
+    escalationPolicy: pagerduty://modern-dhcp
+    contacts:
+      - primary.oncall@example.com
+      - sdn.escalation@example.com
+  scripts:
+    enabled: true
+    defaultTimeout: 2m
+    maxConcurrent: 2
+    sandboxImage: registry.example.com/ops/script-runner:latest
+    catalog:
+      - name: refresh-cache
+        description: Flush metadata caches and warm aggregations
+        command: /app/scripts/refresh_cache.sh
+        args: []
+        allowedRoles:
+          - admin
+          - ops
+      - name: export-tenant
+        description: Export pools and leases for a tenant
+        command: /app/scripts/export_tenant.sh
+        args:
+          - "--tenant"
+        allowedRoles:
+          - admin

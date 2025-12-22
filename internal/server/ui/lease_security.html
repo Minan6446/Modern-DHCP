@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lease Security Console - Modern-DHCP</title>
+<link rel="stylesheet" href="lease_security.css" />
+</head>
+<body>
+<header>
+    <h1>Lease Security Console</h1>
+    <p>Audit DHCP leases, visualize security states, and send unblock/block actions through the management API.</p>
+</header>
+<section class="card">
+    <form id="controls">
+        <div class="controls-grid">
+            <div class="field">
+                <label for="tenantId">Tenant ID *</label>
+                <input id="tenantId" type="text" placeholder="tenant-123" required />
+            </div>
+            <div class="field">
+                <label for="apiKey">API Key *</label>
+                <input id="apiKey" type="text" placeholder="paste admin API key" required />
+            </div>
+            <div class="field">
+                <label for="dhcpState">DHCP State Filter</label>
+                <select id="dhcpState">
+                    <option value="">All</option>
+                    <option value="ACTIVE">ACTIVE</option>
+                    <option value="RELEASED">RELEASED</option>
+                    <option value="DECLINED">DECLINED</option>
+                    <option value="COOLDOWN">COOLDOWN</option>
+                    <option value="QUARANTINED">QUARANTINED</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="securityState">Security State Filter</label>
+                <select id="securityState">
+                    <option value="">All</option>
+                    <option value="OK">OK</option>
+                    <option value="SUSPECT">SUSPECT</option>
+                    <option value="BLOCKED">BLOCKED</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="searchText">Identifier Filter</label>
+                <input id="searchText" type="text" placeholder="mac, client id, IP" />
+            </div>
+            <div class="field">
+                <label for="limit">Limit</label>
+                <input id="limit" type="number" min="1" max="500" value="50" />
+            </div>
+            <div class="field">
+                <label for="offset">Offset</label>
+                <input id="offset" type="number" min="0" value="0" />
+            </div>
+        </div>
+        <div style="margin-top: 12px;">
+            <button class="primary" type="submit" id="loadButton">Load Leases</button>
+        </div>
+    </form>
+</section>
+<section class="card">
+    <div class="legend">
+        <span><span class="badge badge-ok">OK</span> Detector cleared</span>
+        <span><span class="badge badge-suspect">Suspect</span> Under observation</span>
+        <span><span class="badge badge-blocked">Blocked</span> Requests denied</span>
+    </div>
+    <div class="summary">
+        <div class="summary-item">Showing: <strong id="summaryTotal">0</strong></div>
+        <div class="summary-item">Suspect: <strong id="summarySuspect">0</strong></div>
+        <div class="summary-item">Blocked: <strong id="summaryBlocked">0</strong></div>
+    </div>
+    <div id="status" class="status"></div>
+    <div class="table-wrapper">
+        <table>
+            <thead>
+                <tr>
+                    <th>Lease ID</th>
+                    <th>Identifier</th>
+                    <th>IP</th>
+                    <th>Pool</th>
+                    <th>DHCP State</th>
+                    <th>Security State</th>
+                    <th>Expires (UTC)</th>
+                    <th>Updated At</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="leaseTableBody">
+                <tr><td colspan="9">No data loaded.</td></tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+<script>
+(function () {
+    const API_KEY_STORAGE = "mdhcp.securityconsole.apiKey";
+    const form = document.getElementById("controls");
+    const statusEl = document.getElementById("status");
+    const loadButton = document.getElementById("loadButton");
+    const tableBody = document.getElementById("leaseTableBody");
+    const summaryTotal = document.getElementById("summaryTotal");
+    const summarySuspect = document.getElementById("summarySuspect");
+    const summaryBlocked = document.getElementById("summaryBlocked");
+    const securityFilter = document.getElementById("securityState");
+    const searchInput = document.getElementById("searchText");
+
+    let currentLeases = [];
+
+    const savedKey = sessionStorage.getItem(API_KEY_STORAGE);
+    if (savedKey) {
+        document.getElementById("apiKey").value = savedKey;
+    }
+
+    form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        loadLeases();
+    });
+
+    securityFilter.addEventListener("change", renderTable);
+    searchInput.addEventListener("input", function () {
+        window.clearTimeout(searchInput._debounce);
+        searchInput._debounce = window.setTimeout(renderTable, 250);
+    });
+
+    async function loadLeases() {
+        const tenantId = document.getElementById("tenantId").value.trim();
+        const apiKey = document.getElementById("apiKey").value.trim();
+        const dhcpState = document.getElementById("dhcpState").value;
+        const limit = document.getElementById("limit").value || "50";
+        const offset = document.getElementById("offset").value || "0";
+
+        if (!tenantId) {
+            setStatus("Tenant ID is required.", true);
+            return;
+        }
+        if (!apiKey) {
+            setStatus("API key is required.", true);
+            return;
+        }
+
+        sessionStorage.setItem(API_KEY_STORAGE, apiKey);
+        loadButton.disabled = true;
+        setStatus("Loading leases...", false);
+
+        const params = new URLSearchParams();
+        params.set("limit", limit);
+        params.set("offset", offset);
+        if (dhcpState) {
+            params.set("state", dhcpState);
+        }
+
+        try {
+            const resp = await fetch(`/api/v1/tenants/${encodeURIComponent(tenantId)}/leases?${params.toString()}`, {
+                headers: {
+                    "X-API-Key": apiKey,
+                    "Accept": "application/json"
+                }
+            });
+            if (!resp.ok) {
+                const text = await resp.text();
+                throw new Error(`${resp.status} ${resp.statusText}: ${text}`);
+            }
+            const data = await resp.json();
+            if (!Array.isArray(data)) {
+                throw new Error("Unexpected payload format");
+            }
+            currentLeases = data;
+            renderTable();
+            setStatus(`Loaded ${data.length} leases.`, false, true);
+        } catch (err) {
+            currentLeases = [];
+            renderTable();
+            setStatus(err.message || String(err), true);
+        } finally {
+            loadButton.disabled = false;
+        }
+    }
+
+    function renderTable() {
+        tableBody.innerHTML = "";
+        if (!currentLeases.length) {
+            const row = document.createElement("tr");
+            const cell = document.createElement("td");
+            cell.colSpan = 9;
+            cell.textContent = "No leases to display.";
+            row.appendChild(cell);
+            tableBody.appendChild(row);
+            summaryTotal.textContent = "0";
+            summarySuspect.textContent = "0";
+            summaryBlocked.textContent = "0";
+            return;
+        }
+        const filterState = (securityFilter.value || "").toUpperCase();
+        const searchText = searchInput.value.trim().toLowerCase();
+        const filtered = currentLeases.filter(function (lease) {
+            const sec = (lease.securityState || lease.security_state || "").toUpperCase();
+            const matchesState = !filterState || sec === filterState;
+            if (!matchesState) {
+                return false;
+            }
+            if (!searchText) {
+                return true;
+            }
+            const haystack = [lease.hardwareAddr, lease.clientId, lease.ipAddress, lease.id]
+                .map(function (value) { return String(value || "").toLowerCase(); })
+                .join(" ");
+            return haystack.includes(searchText);
+        });
+
+        if (!filtered.length) {
+            const row = document.createElement("tr");
+            const cell = document.createElement("td");
+        <div class="mt-12">
+            <button class="primary" type="submit" id="loadButton">Load Leases</button>
+        </div>
+            tableBody.appendChild(row);
+        } else {
+            filtered.forEach(function (lease) {
+                const row = document.createElement("tr");
+                const state = formatState(lease.securityState || lease.security_state);
+                row.classList.add(state.rowClass);
+                row.innerHTML = `
+                    <td>${lease.id || ""}</td>
+                    <td>
+                        <div>${lease.hardwareAddr || ""}</div>
+                        <div style="font-size:0.8rem;color:#475569;">${lease.clientId || ""}</div>
+                    </td>
+                    <td>${lease.ipAddress || ""}</td>
+                    <td>${lease.poolId || ""}</td>
+                    <td>${lease.state || ""}</td>
+                    <td><span class="badge ${state.badgeClass}">${state.label}</span></td>
+                    <td>${formatDate(lease.expiresAt)}</td>
+                    <td>${formatDate(lease.updatedAt)}</td>
+                    <td>
+                        ${renderActions(lease, state.label)}
+                    </td>`;
+                tableBody.appendChild(row);
+            });
+        }
+
+        const suspectCount = filtered.filter(function (lease) {
+            const sec = (lease.securityState || lease.security_state || "").toUpperCase();
+            return sec === "SUSPECT";
+        }).length;
+        const blockedCount = filtered.filter(function (lease) {
+            const sec = (lease.securityState || lease.security_state || "").toUpperCase();
+            return sec === "BLOCKED";
+        }).length;
+        summaryTotal.textContent = String(filtered.length);
+        summarySuspect.textContent = String(suspectCount);
+        summaryBlocked.textContent = String(blockedCount);
+
+        tableBody.querySelectorAll("button[data-action]").forEach(function (btn) {
+            btn.addEventListener("click", function (event) {
+                const leaseId = event.currentTarget.getAttribute("data-id");
+                const state = event.currentTarget.getAttribute("data-action");
+                performSecurityAction(leaseId, state);
+            });
+        });
+    }
+
+    function renderActions(lease, currentState) {
+        const leaseId = lease.id || "";
+        if (!leaseId) {
+            return "";
+        }
+        return ["OK", "SUSPECT", "BLOCKED"].map(function (state) {
+            const disabled = state === (lease.securityState || lease.security_state || "OK").toUpperCase();
+            const danger = state === "BLOCKED" ? "danger" : "";
+            const label = state === "OK" ? "Mark OK" : state === "SUSPECT" ? "Mark Suspect" : "Block";
+            return `<button class="action ${danger}" data-action="${state}" data-id="${leaseId}" ${disabled ? "disabled" : ""}>${label}</button>`;
+        }).join(" ");
+    }
+
+    async function performSecurityAction(leaseId, targetState) {
+        const tenantId = document.getElementById("tenantId").value.trim();
+        const apiKey = document.getElementById("apiKey").value.trim();
+        if (!tenantId || !apiKey) {
+            setStatus("Provide tenant ID and API key first.", true);
+            return;
+        }
+        setStatus(`Applying ${targetState}...`, false);
+        try {
+            const resp = await fetch(`/api/v1/tenants/${encodeURIComponent(tenantId)}/leases/${encodeURIComponent(leaseId)}/security-state`, {
+                method: "POST",
+                headers: {
+                    "X-API-Key": apiKey,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ state: targetState })
+            });
+            const warningHeader = resp.headers ? resp.headers.get("Warning") : "";
+            if (!resp.ok) {
+                const text = await resp.text();
+                throw new Error(`${resp.status} ${resp.statusText}: ${text}`);
+            }
+            const updated = await resp.json();
+            const idx = currentLeases.findIndex(function (lease) { return lease.id === updated.id; });
+            if (idx >= 0) {
+                currentLeases[idx] = updated;
+            }
+            renderTable();
+            setStatus(warningHeader || `Lease ${leaseId} set to ${targetState}.`, Boolean(warningHeader));
+        } catch (err) {
+            setStatus(err.message || String(err), true);
+        }
+    }
+
+    function formatState(state) {
+        const value = (state || "OK").toUpperCase();
+        switch (value) {
+            case "BLOCKED":
+                return { label: "BLOCKED", badgeClass: "badge badge-blocked", rowClass: "security-blocked" };
+            case "SUSPECT":
+                return { label: "SUSPECT", badgeClass: "badge badge-suspect", rowClass: "security-suspect" };
+            default:
+                return { label: "OK", badgeClass: "badge badge-ok", rowClass: "" };
+        }
+    }
+
+    function formatDate(value) {
+        if (!value) {
+            return "";
+        }
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+            return value;
+        }
+        return date.toISOString().replace("T", " ").replace("Z", "Z");
+    }
+
+    function setStatus(message, isError, sticky) {
+        statusEl.textContent = message;
+        if (!message) {
+            statusEl.className = "status";
+            return;
+        }
+        statusEl.className = "status " + (isError ? "error" : "success");
+        if (!sticky) {
+            window.setTimeout(function () {
+                statusEl.textContent = "";
+                statusEl.className = "status";
+            }, 4000);
+        }
+    }
+})();
+</script>
+</body>
+</html>
+                row.innerHTML = `
+                    <td>${lease.id || ""}</td>
+                    <td>
+                        <div>${lease.hardwareAddr || ""}</div>
+                        <div class="muted-small">${lease.clientId || ""}</div>
+                    </td>
+                    <td>${lease.ipAddress || ""}</td>
+                    <td>${lease.poolId || ""}</td>
+                    <td>${lease.state || ""}</td>
+                    <td><span class="badge ${state.badgeClass}">${state.label}</span></td>
+                    <td>${formatDate(lease.expiresAt)}</td>
+                    <td>${formatDate(lease.updatedAt)}</td>
+                    <td>
+                        ${renderActions(lease, state.label)}
+                    </td>`;

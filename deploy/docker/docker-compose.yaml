@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+  dhcp:
+    image: ghcr.io/example/modern-dhcp:latest
+    container_name: modern-dhcp
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      MODERN_DHCP_CONFIG: /etc/modern-dhcp/config.yaml
+      SERVICE_MODE: full-stack
+    volumes:
+      - ../..:/opt/modern-dhcp-src:ro
+      - ./config:/etc/modern-dhcp
+      - dhcp-data:/var/lib/modern-dhcp
+      - dhcp-logs:/var/log/modern-dhcp
+    command:
+      - /app/dhcpd
+      - --config
+      - /etc/modern-dhcp/config.yaml
+      - --listeners
+      - "${DHCPD_LISTENERS:-8}"
+      - --dhcpv4-workers
+      - "${DHCPD_WORKERS:-0}"
+      - --dhcpv4-queue
+      - "${DHCPD_QUEUE:-0}"
+      - --rx-batch
+      - "${DHCPD_RX_BATCH:-8}"
+      - --reuseport
+      - "${DHCPD_REUSEPORT:-true}"
+    depends_on:
+      - mysql
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: modern-dhcp
+      MYSQL_DATABASE: modern_dhcp
+      MYSQL_USER: dhcp
+      MYSQL_PASSWORD: dhcp
+    volumes:
+      - mysql-data:/var/lib/mysql
+    command: ["--default-authentication-plugin=mysql_native_password"]
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    volumes:
+      - redis-data:/data
+
+volumes:
+  dhcp-data:
+  dhcp-logs:
+  mysql-data:
+  redis-data:
