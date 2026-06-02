@@ -15,7 +15,11 @@ import (
 // AlertRuleDescriptor exposes normalized rule metadata for APIs/UI.
 type AlertRuleDescriptor struct {
 	ID              string   `json:"id"`
+	Name            string   `json:"name,omitempty"`
 	Expression      string   `json:"expression"`
+	Operator        string   `json:"operator,omitempty"`
+	Threshold       float64  `json:"threshold,omitempty"`
+	DurationSeconds int      `json:"durationSeconds,omitempty"`
 	Severity        string   `json:"severity"`
 	SummaryTemplate string   `json:"summaryTemplate"`
 	DetailTemplate  string   `json:"detailTemplate"`

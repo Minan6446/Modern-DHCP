@@ -1,126 +1,955 @@
 openapi: 3.0.3
 info:
-  title: Modern-DHCP API
-  version: 2.0.0
-  description: Experimental v2 surface that mirrors v1 resources while enabling future-breaking changes under header negotiation.
+  title: Modern-DHCP Control Plane API
+  version: "1.0.0"
+  description: |
+    后端 API 概览，聚焦常用读写接口。实际实现以运行中的服务为准，后续字段可能扩展但保持向后兼容。
 servers:
-  - url: https://{host}/api/v2
-    variables:
-      host:
-        default: manager.example.com
-security:
-  - OAuth2: [dhcp.read]
-  - ApiKeyAuth: []
+  - url: /api/v1
 paths:
-  /tenants/{tenantId}/pools:
+  /cluster/overview:
     get:
-      summary: List address pools (v2)
-      parameters:
-        - $ref: './openapi_v1.yaml#/components/parameters/TenantID'
+      summary: 获取集群角色与复制状态
       responses:
         '200':
-          description: Pool list
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterOverview'
+        default:
+          $ref: '#/components/responses/Error'
+  /cluster/control:
+    get:
+      summary: 获取第一阶段集群控制面状态
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterControl'
+        default:
+          $ref: '#/components/responses/Error'
+  /cluster/initialize:
+    post:
+      summary: 初始化集群控制面并生成启动凭据
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClusterInitializeRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  clusterToken:
+                    type: string
+                  tlsMaterialGenerated:
+                    type: boolean
+                  restartRequired:
+                    type: boolean
+                  cluster:
+                    $ref: '#/components/schemas/ClusterControl'
+        default:
+          $ref: '#/components/responses/Error'
+  /cluster/join:
+    post:
+      summary: 受控节点加入集群
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClusterJoinRequest'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterJoinResponse'
+        default:
+          $ref: '#/components/responses/Error'
+  /cluster/join-jobs:
+    get:
+      summary: 获取节点接入编排任务列表
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterJoinJobListResponse'
+        default:
+          $ref: '#/components/responses/Error'
+    post:
+      summary: 创建节点接入编排任务
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                nodeId:
+                  type: string
+                peerAddress:
+                  type: string
+              required: [nodeId]
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterJoinJob'
+        default:
+          $ref: '#/components/responses/Error'
+  /cluster/join-jobs/{jobId}:
+    get:
+      summary: 获取节点接入编排任务详情
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterJoinJob'
+        default:
+          $ref: '#/components/responses/Error'
+  /cluster/join-jobs/{jobId}/cancel:
+    post:
+      summary: 取消节点接入编排任务
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterJoinJob'
+        default:
+          $ref: '#/components/responses/Error'
+  /cluster/join-jobs/{jobId}/retry:
+    post:
+      summary: 重试节点接入编排任务
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema:
+            type: string
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterJoinJob'
+        default:
+          $ref: '#/components/responses/Error'
+  /cluster/state:
+    get:
+      summary: 节点心跳拉取集群控制面状态
+      parameters:
+        - in: header
+          name: X-Cluster-Node-ID
+          required: true
+          schema:
+            type: string
+        - in: header
+          name: X-Cluster-Node-Token
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterControl'
+        default:
+          $ref: '#/components/responses/Error'
+  /cluster/delete:
+    post:
+      summary: 删除集群控制面配置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClusterDeleteRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: boolean
+                  nodes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ClusterControlNode'
+        default:
+          $ref: '#/components/responses/Error'
   /monitoring/overview:
     get:
-      summary: Tenant monitoring overview snapshot
-      parameters:
-        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
-        - $ref: './openapi_v1.yaml#/components/parameters/Limit'
+      summary: 获取监控聚合数据
       responses:
         '200':
-          description: Combined pool, request, system, and security insight
+          description: OK
           content:
             application/json:
               schema:
-                $ref: './openapi_v1.yaml#/components/schemas/OverviewSnapshot'
-  /monitoring/pools:
+                $ref: '#/components/schemas/MonitoringOverview'
+        default:
+          $ref: '#/components/responses/Error'
+  /core/pools:
     get:
-      summary: Pool utilization snapshot
-      parameters:
-        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
-        - $ref: './openapi_v1.yaml#/components/parameters/Limit'
+      summary: 列出地址池（核心路由）
       responses:
         '200':
-          description: Current utilization for monitored pools
-          content:
-            application/json:
-              schema:
-                $ref: './openapi_v1.yaml#/components/schemas/MonitoringPoolsResponse'
-  /monitoring/requests:
-    get:
-      summary: DHCP lifecycle request metrics
-      parameters:
-        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
-      responses:
-        '200':
-          description: Latency and error-rate observations per DHCP phase
-          content:
-            application/json:
-              schema:
-                $ref: './openapi_v1.yaml#/components/schemas/MonitoringRequestsResponse'
-  /monitoring/health:
-    get:
-      summary: Runtime system health snapshot
-      responses:
-        '200':
-          description: Host metrics with optional HA status
-          content:
-            application/json:
-              schema:
-                $ref: './openapi_v1.yaml#/components/schemas/MonitoringHealthResponse'
-  /monitoring/security:
-    get:
-      summary: Guard and snooping telemetry
-      parameters:
-        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
-      responses:
-        '200':
-          description: Rate-limit and snooping windows for the tenant
-          content:
-            application/json:
-              schema:
-                $ref: './openapi_v1.yaml#/components/schemas/MonitoringSecurityResponse'
-  /monitoring/alerts:
-    get:
-      summary: Alert lifecycle feed for the active tenant
-      parameters:
-        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
-        - $ref: './openapi_v1.yaml#/components/parameters/Limit'
-      responses:
-        '200':
-          description: Alert feed snapshot
-          content:
-            application/json:
-              schema:
-                $ref: './openapi_v1.yaml#/components/schemas/AlertFeedSnapshot'
-  /monitoring/alerts/feed:
-    get:
-      summary: Alert lifecycle feed (alias)
-      parameters:
-        - $ref: './openapi_v1.yaml#/components/parameters/TenantQuery'
-        - $ref: './openapi_v1.yaml#/components/parameters/Limit'
-      responses:
-        '200':
-          description: Alert feed snapshot
-          content:
-            application/json:
-              schema:
-                $ref: './openapi_v1.yaml#/components/schemas/AlertFeedSnapshot'
-  /monitoring/alerts/rules:
-    get:
-      summary: Compiled alert rule catalog
-      responses:
-        '200':
-          description: Alert rule descriptors evaluated by the controller
+          description: OK
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: './openapi_v1.yaml#/components/schemas/AlertRuleDescriptor'
+                  $ref: '#/components/schemas/Pool'
+        default:
+          $ref: '#/components/responses/Error'
+    post:
+      summary: 创建地址池（核心路由）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubnetDraft'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pool'
+        default:
+          $ref: '#/components/responses/Error'
+  /core/pools/{poolId}:
+    get:
+      summary: 获取地址池详情（核心路由）
+      parameters:
+        - in: path
+          name: poolId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pool'
+        '404':
+          $ref: '#/components/responses/Error'
+        default:
+          $ref: '#/components/responses/Error'
+    patch:
+      summary: 更新地址池（核心路由）
+      parameters:
+        - in: path
+          name: poolId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubnetDraft'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pool'
+        default:
+          $ref: '#/components/responses/Error'
+    delete:
+      summary: 删除地址池（核心路由）
+      parameters:
+        - in: path
+          name: poolId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  poolId:
+                    type: string
+        '404':
+          $ref: '#/components/responses/Error'
+        default:
+          $ref: '#/components/responses/Error'
+  /core/pools/{poolId}/reconcile:
+    post:
+      summary: 触发地址池重计算（核心路由）
+      parameters:
+        - in: path
+          name: poolId
+          required: true
+          schema:
+            type: string
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: accepted
+        default:
+          $ref: '#/components/responses/Error'
+  /tenants/{tenant}/pools:
+    get:
+      summary: 列出地址池
+      parameters:
+        - in: path
+          name: tenant
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: scope
+          schema:
+            type: string
+            enum: [global, subnet, vlan, port, ssid, location]
+        - in: query
+          name: vlan
+          schema:
+            type: integer
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+        - in: query
+          name: pageSize
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Pool'
+        default:
+          $ref: '#/components/responses/Error'
+  /tenants/{tenant}/pools/resolve:
+    post:
+      summary: 按元数据解析最优池
+      parameters:
+        - in: path
+          name: tenant
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                vlan:
+                  type: integer
+                interface:
+                  type: string
+                ssid:
+                  type: string
+                location:
+                  type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PoolResolution'
+        default:
+          $ref: '#/components/responses/Error'
+  /tenants/{tenant}/leases:
+    get:
+      summary: 查询租约
+      parameters:
+        - in: path
+          name: tenant
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: state
+          schema:
+            type: string
+            enum: [ACTIVE, EXPIRED, RELEASED]
+        - in: query
+          name: mac
+          schema:
+            type: string
+        - in: query
+          name: ip
+          schema:
+            type: string
+        - in: query
+          name: pool
+          schema:
+            type: string
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+        - in: query
+          name: pageSize
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Lease'
+        default:
+          $ref: '#/components/responses/Error'
 components:
-  securitySchemes:
-    ApiKeyAuth:
-      $ref: './openapi_v1.yaml#/components/securitySchemes/ApiKeyAuth'
-    OAuth2:
-      $ref: './openapi_v1.yaml#/components/securitySchemes/OAuth2'
+  responses:
+    Error:
+      description: 错误响应
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Error:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+      required: [code, message]
+    Pool:
+      type: object
+      properties:
+        id:
+          type: string
+        scope:
+          type: string
+          enum: [global, subnet, vlan, port, ssid, location]
+        cidr:
+          type: string
+        gateway:
+          type: string
+        weight:
+          type: integer
+        metadata:
+          type: object
+      required: [id, scope, cidr]
+    SubnetDraft:
+      type: object
+      properties:
+        name:
+          type: string
+        cidr:
+          type: string
+        gateway:
+          type: string
+        dns:
+          type: array
+          items:
+            type: string
+        leaseProfileId:
+          type: string
+          description: 地址池/子网绑定的租约策略 ID（映射到 lease_profiles.id）。
+        exclude:
+          type: array
+          items:
+            type: string
+        reserved:
+          type: array
+          items:
+            type: string
+        strategy:
+          type: object
+          properties:
+            mode:
+              type: string
+              enum: [round-robin, sequential, random]
+            preferReserved:
+              type: boolean
+        vlanId:
+          type: integer
+        location:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        tenantId:
+          type: string
+        version:
+          type: integer
+          enum: [4, 6]
+      required: [name, cidr, leaseProfileId]
+    PoolResolution:
+      type: object
+      properties:
+        poolId:
+          type: string
+        cidr:
+          type: string
+        gateway:
+          type: string
+        weight:
+          type: integer
+        auditId:
+          type: string
+      required: [poolId, cidr]
+    Lease:
+      type: object
+      properties:
+        id:
+          type: string
+        ip:
+          type: string
+        mac:
+          type: string
+        state:
+          type: string
+        poolId:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+      required: [id, ip, mac, state]
+    ClusterOverview:
+      type: object
+      properties:
+        mode:
+          type: string
+        dhcpRole:
+          type: string
+        dhcpHealth:
+          type: string
+        failoverReady:
+          type: boolean
+        replicationLagMs:
+          type: integer
+        replicationHealth:
+          type: string
+        replicationError:
+          type: string
+        replicationTx:
+          type: string
+        replicationMode:
+          type: string
+        replicationSource:
+          type: string
+        replicationState:
+          type: string
+        replicationUpdatedAt:
+          type: string
+          format: date-time
+        storageRoleAligned:
+          type: boolean
+        mysqlRole:
+          type: string
+        mysqlHealth:
+          type: string
+        mysqlLagMs:
+          type: integer
+        redisRole:
+          type: string
+        redisHealth:
+          type: string
+        redisOffsetLag:
+          type: integer
+          format: int64
+        fencingEpoch:
+          type: string
+        writeGateOpen:
+          type: boolean
+        pendingActions:
+          type: integer
+        joinPending:
+          type: integer
+        joinFailed:
+          type: integer
+        joinCompleted:
+          type: integer
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterOverviewNode'
+      required: [mode, failoverReady, replicationLagMs, pendingActions, nodes]
+    ClusterOverviewNode:
+      type: object
+      properties:
+        id:
+          type: string
+        nodeType:
+          type: string
+        nodeState:
+          type: string
+        role:
+          type: string
+        address:
+          type: string
+        self:
+          type: boolean
+        hasAuth:
+          type: boolean
+        version:
+          type: string
+        health:
+          type: string
+        disabled:
+          type: boolean
+        cpuPercent:
+          type: number
+        memoryPercent:
+          type: number
+        activeLeasesRedis:
+          type: integer
+        totalLeasesMySQL:
+          type: integer
+        syncLagMs:
+          type: integer
+        lastHeartbeat:
+          type: string
+          format: date-time
+      required: [id, role, address, version, health]
+    ClusterControl:
+      type: object
+      properties:
+        initialized:
+          type: boolean
+        clusterDomain:
+          type: string
+        primaryNodeId:
+          type: string
+        primaryNodeUrl:
+          type: string
+        primaryNodeIpAddresses:
+          type: array
+          items:
+            type: string
+        heartbeatIntervalSeconds:
+          type: integer
+        heartbeatRetryIntervalSeconds:
+          type: integer
+        configRefreshIntervalSeconds:
+          type: integer
+        configRetryIntervalSeconds:
+          type: integer
+        configVersion:
+          type: integer
+          format: int64
+        requireTls:
+          type: boolean
+        apiTlsEnabled:
+          type: boolean
+        apiTlsActive:
+          type: boolean
+        apiTlsCertFile:
+          type: string
+        apiTlsClientCaFile:
+          type: string
+        restartRequired:
+          type: boolean
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterControlNode'
+      required: [initialized, heartbeatIntervalSeconds, heartbeatRetryIntervalSeconds, configRefreshIntervalSeconds, configRetryIntervalSeconds, configVersion, requireTls, apiTlsEnabled, apiTlsActive, restartRequired, nodes]
+    ClusterControlNode:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+        ipAddresses:
+          type: array
+          items:
+            type: string
+        type:
+          type: string
+          enum: [primary, secondary]
+        state:
+          type: string
+          enum: [self, connected, unreachable, unknown]
+        version:
+          type: integer
+          format: int64
+        upSince:
+          type: string
+          format: date-time
+        lastSeen:
+          type: string
+          format: date-time
+        joinedAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required: [id, type, state]
+    ClusterInitializeRequest:
+      type: object
+      properties:
+        clusterDomain:
+          type: string
+        primaryNodeId:
+          type: string
+        primaryNodeUrl:
+          type: string
+        primaryNodeIpAddresses:
+          type: array
+          items:
+            type: string
+        heartbeatIntervalSeconds:
+          type: integer
+        heartbeatRetryIntervalSeconds:
+          type: integer
+        configRefreshIntervalSeconds:
+          type: integer
+        configRetryIntervalSeconds:
+          type: integer
+        forceReinitialize:
+          type: boolean
+      required: [clusterDomain, primaryNodeIpAddresses]
+    ClusterJoinRequest:
+      type: object
+      properties:
+        secondaryNodeId:
+          type: string
+        secondaryNodeName:
+          type: string
+        secondaryNodeUrl:
+          type: string
+        secondaryNodeIpAddresses:
+          type: array
+          items:
+            type: string
+        secondaryNodeCertificate:
+          type: string
+        clusterToken:
+          type: string
+      required: [secondaryNodeId, secondaryNodeUrl, secondaryNodeIpAddresses]
+    ClusterJoinResponse:
+      type: object
+      properties:
+        nodeId:
+          type: string
+        nodeToken:
+          type: string
+        joinJobId:
+          type: string
+        cluster:
+          $ref: '#/components/schemas/ClusterControl'
+      required: [nodeId, nodeToken, cluster]
+    ClusterJoinPhase:
+      type: object
+      properties:
+        phase:
+          type: string
+        status:
+          type: string
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+        durationMs:
+          type: integer
+          format: int64
+        error:
+          type: string
+      required: [phase, status, startedAt]
+    ClusterJoinVerification:
+      type: object
+      properties:
+        status:
+          type: string
+        checkedAt:
+          type: string
+          format: date-time
+        poolCount:
+          type: integer
+        bindingCount:
+          type: integer
+        activeLeaseCount:
+          type: integer
+        conflictLeaseCount24h:
+          type: integer
+        createdLeaseCount24h:
+          type: integer
+        fencingEpoch:
+          type: string
+        replicationHealthy:
+          type: boolean
+        replicationLagMs:
+          type: integer
+        replicationMode:
+          type: string
+        replicationSource:
+          type: string
+        replicationState:
+          type: string
+        replicationOffset:
+          type: string
+        lastSyncTxId:
+          type: string
+        lastSyncType:
+          type: string
+        lastSyncCommitAt:
+          type: string
+        consistencyChecksum:
+          type: string
+        warning:
+          type: string
+        failureReason:
+          type: string
+      required: [status, replicationHealthy]
+    ClusterJoinJob:
+      type: object
+      properties:
+        jobId:
+          type: string
+        nodeId:
+          type: string
+        peerAddress:
+          type: string
+        status:
+          type: string
+        progress:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+        error:
+          type: string
+        createdBy:
+          type: string
+        phases:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterJoinPhase'
+        verification:
+          $ref: '#/components/schemas/ClusterJoinVerification'
+      required: [jobId, nodeId, status, progress, createdAt, updatedAt]
+    ClusterJoinJobListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterJoinJob'
+        count:
+          type: integer
+      required: [items, count]
+    ClusterDeleteRequest:
+      type: object
+      properties:
+        forceDelete:
+          type: boolean
+    MonitoringOverview:
+      type: object
+      properties:
+        poolUsage:
+          type: array
+          items:
+            type: object
+            properties:
+              poolId:
+                type: string
+              utilization:
+                type: number
+        requestPhases:
+          type: object
+          additionalProperties:
+            type: integer
+        securityEvents:
+          type: object
+          properties:
+            rateLimit:
+              type: integer
+            snooping:
+              type: integer
+      required: [poolUsage]

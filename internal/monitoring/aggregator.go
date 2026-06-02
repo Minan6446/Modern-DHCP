@@ -17,6 +17,7 @@ import (
 	"github.com/shirou/gopsutil/v3/net"
 	"go.uber.org/zap"
 
+	"modern-dhcp/internal/lease"
 	"modern-dhcp/internal/pool"
 	"modern-dhcp/pkg/models"
 )
@@ -32,10 +33,18 @@ type Aggregator struct {
 	logger         *zap.Logger
 }
 
+func poolScopeFromLease(scope lease.ResourceScope) pool.ResourceScope {
+	return pool.ResourceScopeFromAccess(scope.AccessScope())
+}
+
+func scopeTenant(scope lease.ResourceScope) string {
+	return strings.TrimSpace(scope.TenantOrDefault())
+}
+
 // LeaseStatsReader exposes aggregate lease counters for monitoring snapshots.
 type LeaseStatsReader interface {
-	CountActiveLeasesByPool(ctx context.Context, tenantID string, poolIDs []string) (map[string]int64, error)
-	CountActiveLeasesByDeviceType(ctx context.Context, tenantID string) (map[string]int64, error)
+	CountActiveLeasesByPool(ctx context.Context, scope lease.ResourceScope, poolIDs []string) (map[string]int64, error)
+	CountActiveLeasesByDeviceType(ctx context.Context, scope lease.ResourceScope) (map[string]int64, error)
 }
 
 // Options configures Aggregator dependencies.
@@ -67,13 +76,13 @@ func NewAggregator(opts Options) *Aggregator {
 }
 
 // Overview returns the combined dashboard snapshot.
-func (a *Aggregator) Overview(ctx context.Context, tenantID string, limit int) (OverviewSnapshot, error) {
-	usage, counts, err := a.poolUsage(ctx, tenantID, limit)
+func (a *Aggregator) Overview(ctx context.Context, scope lease.ResourceScope, limit int) (OverviewSnapshot, error) {
+	usage, counts, err := a.poolUsage(ctx, scope, limit)
 	if err != nil {
 		return OverviewSnapshot{}, err
 	}
-	requests := a.requestSnapshots(tenantID)
-	distribution, err := a.clientDistribution(ctx, tenantID, usage, counts)
+	requests := a.requestSnapshots(scope)
+	distribution, err := a.clientDistribution(ctx, scope, usage, counts)
 	if err != nil {
 		return OverviewSnapshot{}, err
 	}
@@ -84,16 +93,17 @@ func (a *Aggregator) Overview(ctx context.Context, tenantID string, limit int) (
 		RequestPhases:      requests,
 		ClientDistribution: distribution,
 		SystemHealth:       health,
-		Security:           a.securitySnapshot(tenantID),
+		Security:           a.securitySnapshot(scope),
 	}, nil
 }
 
-func (a *Aggregator) securitySnapshot(tenantID string) SecuritySnapshot {
+func (a *Aggregator) securitySnapshot(scope lease.ResourceScope) SecuritySnapshot {
 	snapshot := SecuritySnapshot{}
 	window := a.securityWindow
 	if window <= 0 {
 		return snapshot
 	}
+	tenantID := scopeTenant(scope)
 	if a.rateTracker != nil {
 		snapshot.RateLimit = a.rateTracker.Snapshot(tenantID, window)
 	}
@@ -104,14 +114,25 @@ func (a *Aggregator) securitySnapshot(tenantID string) SecuritySnapshot {
 }
 
 // Pools returns pool utilization snapshots.
-func (a *Aggregator) Pools(ctx context.Context, tenantID string, limit int) ([]PoolUsageSummary, error) {
-	usage, _, err := a.poolUsage(ctx, tenantID, limit)
+func (a *Aggregator) Pools(ctx context.Context, scope lease.ResourceScope, limit int) ([]PoolUsageSummary, error) {
+	usage, _, err := a.poolUsage(ctx, scope, limit)
 	return usage, err
 }
 
 // Requests returns DHCP lifecycle stats for the tenant.
-func (a *Aggregator) Requests(tenantID string) []RequestPhaseSnapshot {
-	return a.requestSnapshots(tenantID)
+func (a *Aggregator) Requests(scope lease.ResourceScope) []RequestPhaseSnapshot {
+	return a.requestSnapshots(scope)
+}
+
+// RequestWindow returns the elapsed observation window of the request tracker.
+func (a *Aggregator) RequestWindow() time.Duration {
+	if a == nil || a.tracker == nil {
+		return 0
+	}
+	if w, ok := a.tracker.(interface{ Window() time.Duration }); ok {
+		return w.Window()
+	}
+	return 0
 }
 
 // Health returns the latest system metrics.
@@ -120,21 +141,51 @@ func (a *Aggregator) Health(ctx context.Context) SystemHealthSnapshot {
 }
 
 // Security returns guard-level telemetry for a tenant.
-func (a *Aggregator) Security(tenantID string) SecuritySnapshot {
+func (a *Aggregator) Security(scope lease.ResourceScope) SecuritySnapshot {
 	if a == nil {
 		return SecuritySnapshot{}
 	}
-	return a.securitySnapshot(tenantID)
+	return a.securitySnapshot(scope)
 }
 
-func (a *Aggregator) poolUsage(ctx context.Context, tenantID string, limit int) ([]PoolUsageSummary, map[string]int64, error) {
+// SecurityEvents returns recent guard events for a tenant.
+func (a *Aggregator) SecurityEvents(scope lease.ResourceScope, window time.Duration, limit int) SecurityEventsSnapshot {
+	if a == nil {
+		return SecurityEventsSnapshot{}
+	}
+	canonical := normalizeTenant(scopeTenant(scope))
+	if window <= 0 {
+		window = a.securityWindow
+	}
+	if window <= 0 {
+		window = 5 * time.Minute
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	snapshot := SecurityEventsSnapshot{
+		TenantID:    canonical,
+		GeneratedAt: time.Now().UTC(),
+		Window:      window,
+	}
+	if a.rateTracker != nil {
+		snapshot.RateLimit = a.rateTracker.Events(canonical, window, limit)
+	}
+	if a.snoopTracker != nil {
+		snapshot.Snooping = a.snoopTracker.Events(canonical, window, limit)
+	}
+	return snapshot
+}
+
+func (a *Aggregator) poolUsage(ctx context.Context, scope lease.ResourceScope, limit int) ([]PoolUsageSummary, map[string]int64, error) {
 	if a.pools == nil || a.leases == nil {
 		return nil, nil, errors.New("monitoring: pool service unavailable")
 	}
 	if limit <= 0 {
 		limit = 50
 	}
-	pools, err := a.pools.ListPools(ctx, tenantID, limit, 0)
+	poolScope := poolScopeFromLease(scope)
+	pools, err := a.pools.ListPools(ctx, poolScope, limit, 0)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -142,7 +193,7 @@ func (a *Aggregator) poolUsage(ctx context.Context, tenantID string, limit int) 
 	for _, p := range pools {
 		poolIDs = append(poolIDs, p.ID)
 	}
-	counts, err := a.leases.CountActiveLeasesByPool(ctx, tenantID, poolIDs)
+	counts, err := a.leases.CountActiveLeasesByPool(ctx, scope, poolIDs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -171,7 +222,7 @@ func (a *Aggregator) poolUsage(ctx context.Context, tenantID string, limit int) 
 	return usage, counts, nil
 }
 
-func (a *Aggregator) clientDistribution(ctx context.Context, tenantID string, pools []PoolUsageSummary, poolCounts map[string]int64) (ClientDistributionSnapshot, error) {
+func (a *Aggregator) clientDistribution(ctx context.Context, scope lease.ResourceScope, pools []PoolUsageSummary, poolCounts map[string]int64) (ClientDistributionSnapshot, error) {
 	var snapshot ClientDistributionSnapshot
 	if len(pools) > 0 {
 		byVLAN := map[string]int64{}
@@ -194,7 +245,7 @@ func (a *Aggregator) clientDistribution(ctx context.Context, tenantID string, po
 	if a.leases == nil {
 		return snapshot, nil
 	}
-	types, err := a.leases.CountActiveLeasesByDeviceType(ctx, tenantID)
+	types, err := a.leases.CountActiveLeasesByDeviceType(ctx, scope)
 	if err != nil {
 		return snapshot, err
 	}
@@ -202,24 +253,27 @@ func (a *Aggregator) clientDistribution(ctx context.Context, tenantID string, po
 	return snapshot, nil
 }
 
-func (a *Aggregator) requestSnapshots(tenantID string) []RequestPhaseSnapshot {
+func (a *Aggregator) requestSnapshots(scope lease.ResourceScope) []RequestPhaseSnapshot {
 	if a.tracker == nil {
 		return nil
 	}
-	return a.tracker.Snapshot(tenantID)
+	return a.tracker.Snapshot(scopeTenant(scope))
 }
 
 func (a *Aggregator) systemHealth(ctx context.Context) SystemHealthSnapshot {
-	health := SystemHealthSnapshot{Timestamp: time.Now().UTC(), Goroutines: runtime.NumGoroutine()}
+	health := SystemHealthSnapshot{Timestamp: time.Now().UTC(), Goroutines: runtime.NumGoroutine(), CPUCores: runtime.NumCPU()}
 	if percentages, err := cpu.PercentWithContext(ctx, 100*time.Millisecond, false); err == nil && len(percentages) > 0 {
 		health.CPUPercent = percentages[0]
 	}
 	if memStats, err := mem.VirtualMemoryWithContext(ctx); err == nil {
 		health.MemoryPercent = memStats.UsedPercent
 		health.MemoryUsedBytes = memStats.Used
+		health.MemoryTotalBytes = memStats.Total
 	}
 	if diskStats, err := disk.UsageWithContext(ctx, systemRoot()); err == nil {
 		health.DiskPercent = diskStats.UsedPercent
+		health.DiskUsedBytes = diskStats.Used
+		health.DiskTotalBytes = diskStats.Total
 	}
 	if netStats, err := net.IOCountersWithContext(ctx, false); err == nil && len(netStats) > 0 {
 		health.NetworkRxBytes = netStats[0].BytesRecv

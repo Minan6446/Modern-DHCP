@@ -15,4 +15,5 @@ type SecurityEvent struct {
 	Action      string            `json:"action,omitempty"`
 	Details     map[string]any    `json:"details,omitempty"`
 	Tags        map[string]string `json:"tags,omitempty"`
+	Scope       ScopeMetadata     `json:"scope,omitempty"`
 }

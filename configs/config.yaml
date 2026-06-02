@@ -14,6 +14,7 @@ service:
     allowedOrigins:
       - "https://console.example.com"
       - "https://ops-tools.internal.example.com"
+      - "http://localhost:5173"
   dhcpv4:
     workerCount: 0
     queueDepth: 0
@@ -151,7 +152,7 @@ storage:
     failover: postgres
     mysql:
       enabled: true
-      dsn: "dhcp_web:deGdZtfckN4zcCdW@tcp(10.0.11.24:3306)/dhcp_db?parseTime=true&loc=Local"
+      dsn: "dhcp:Gtyt5zB5kKbD3TWn@tcp(10.0.11.24:3306)/dhcp?parseTime=true&loc=Local"
       maxConnections: 200
       connMaxLifetime: 300s
       migrationTool: goose
@@ -335,8 +336,7 @@ rbac:
   cacheTtl: 60s
 
 mysql:
-  dsn: "dhcp_web:deGdZtfckN4zcCdW@tcp(10.0.11.24:3306)/dhcp_db?parseTime=true&loc=Local"
-  maxOpenConns: 50
+  dsn: "dhcp:Gtyt5zB5kKbD3TWn@tcp(10.0.11.24:3306)/dhcp?parseTime=true&loc=Local"
   maxIdleConns: 10
   connMaxLifetime: 300s
   connMaxIdleTime: 60s
@@ -352,8 +352,17 @@ redis:
   addresses:
     - 10.0.11.24:6379
   username: "dhcpredis"
-  password: "dhcp123"
+  password: ""
   database: 0
+  useTls: false
+  tlsSkipVerify: false
+  connectTimeout: 2s
+  dialTimeout: 2s
+  readTimeout: 2s
+  writeTimeout: 2s
+  poolSize: 64
+  minIdleConns: 8
+  maxRetries: 2
 
 kafka:
   brokers:
@@ -401,6 +410,13 @@ ha:
     topic: dhcp.replication.journal
     ackTimeout: 2s
     snapshotInterval: 5m
+    syncTxnReconcileInterval: 30s
+    syncTxnReconcileBackoffMax: 5m
+    syncTxnReconcileFailureAlertThreshold: 3
+    syncTxnReconcileAlertCooldown: 5m
+    syncTxnMaxEntries: 100
+    syncTxnRetention: 168h
+    syncTxnArchiveLimit: 500
     binlogSource: mysql-primary:3306
   ingress:
     mode: disabled
@@ -462,6 +478,13 @@ iot:
 
 security:
   enabled: true
+  dhcpv4:
+    macRateLimitPPS: 10
+    relayWhitelist: []
+    rogueDetector:
+      enabled: false
+      interface: ""
+      clusterNodes: []
   snooping:
     enabled: true
     grpcEndpoint: collector:7443
@@ -504,8 +527,23 @@ security:
     holdDuration: 5s
     maxAttempts: 3
     reclaimScanLimit: 1
+    arpTimeout: 1s
+    arpRetries: 2
+    icmpRetries: 2
+    cacheTTL: 30s
+    conflictTTL: 120s
+    pools:
+      default:
+        enabled: true
+        arpTimeout: 1s
+        arpRetries: 2
+        icmpRetries: 2
   macAcl:
     enforceWhitelist: false
+    bindingExemptAcl: false
+    renewExemptBlocked: false
+    cacheTtl: 5m
+    defaultAction: allow
     whitelist:
       - "00:11:22:33:44:55"
     blacklist:
@@ -571,6 +609,12 @@ relay:
   enabled: true
   option82:
     preserveRaw: true
+    whitelist:
+      enabled: false
+      circuitIdAllow: []
+      circuitIdDeny: []
+      remoteIdAllow: []
+      remoteIdDeny: []
     subOptionMappings:
       "150":
         key: vlan-id
@@ -604,7 +648,9 @@ monitoring:
     endpoint: /metrics
   tracing:
     exporter: otlp
-    endpoint: http://localhost:4317
+    endpoint: localhost:4317
+    insecure: true
+    samplerRatio: 0.1
   alerting:
     enabled: true
     evaluateInterval: 30s
@@ -723,3 +769,407 @@ auth:
 events:
   policyWebhooks:
     - https://controller.example.com/hooks/policy
+
+automation:
+  enabled: true
+  scheduler:
+    queueSize: 256
+    workerCount: 8
+    maxAttempts: 5
+    defaultTimeout: 45s
+  schedules:
+    inventory.sync:
+      enabled: true
+      interval: 30m
+      tenantId: core-services
+      labels:
+        source: cmdb
+      payload:
+        syncDepth: delta
+        includeHardware: true
+      channels:
+        - cmdb-webhook
+    policy.audit:
+      enabled: true
+      interval: 1h
+      tenantId: global
+      payload:
+        includeDriftReport: true
+      channels:
+        - ops-chat
+    security.scan:
+      enabled: true
+      interval: 15m
+      tenantId: global
+      payload:
+        severityThreshold: major
+      channels:
+        - secops-webhook
+    analytics.snapshot:
+      enabled: true
+      interval: 12h
+      tenantId: reporting
+      payload:
+        exports:
+          - lease_trends
+          - pool_capacity
+      channels:
+        - data-lake-webhook
+    notification.fanout:
+      enabled: true
+      interval: 5m
+      tenantId: global
+      channels:
+        - ops-chat
+  approvals:
+    enabled: true
+    requireFor:
+      - schedule.toggle
+      - schedule.update
+    autoApplyOnApprove: true
+
+opsSupport:
+  system:
+    enabled: true
+    allowConfigExport: true
+    allowConfigImport: true
+    backupLocation: s3://modern-dhcp-dev/config
+    maintenanceWindow: "Sat 01:00-03:00 UTC"
+    theme: modern-dark
+    locale: en-US
+    maintenanceMode: false
+    announcement: ""
+  importExport:
+    enabled: true
+    storagePath: data/import-export
+    objectStore: s3://modern-dhcp-dev/imports
+    formats:
+      - csv
+      - json
+      - parquet
+    maxFileSize: 67108864
+  helpCenter:
+    enabled: true
+    baseUrl: https://docs.dev.example.com/modern-dhcp
+    articlesPath: docs/help-center
+    faqPath: docs/help-center/faq.yaml
+    releaseNotesPath: docs/help-center/releases.yaml
+    featuredTopics:
+      - automation
+      - troubleshooting
+    externalSearchUrl: https://docs.dev.example.com/search?q=
+    cacheTtl: 2m
+  support:
+    enabled: true
+    ticketUrl: https://support.dev.example.com/tickets/new
+    chatUrl: https://chat.dev.example.com/rooms/dhcp
+    phone: "+1-555-0100"
+    escalationPolicy: pagerduty://modern-dhcp-dev
+    contacts:
+      - dhcp-oncall@dev.example.com
+      - platform-duty@dev.example.com
+  scripts:
+    enabled: true
+    defaultTimeout: 90s
+    maxConcurrent: 1
+    sandboxImage: registry.dev.example.com/ops/script-runner:stable
+    catalog:
+      - name: clear-failover-state
+        description: Clear failover state on standby pair
+        command: /app/scripts/clear_failover_state.sh
+        args: []
+        allowedRoles:
+          - admin
+          - ops
+        requiresApproval: true
+      - name: refresh-dashboard
+        description: Refresh monitoring dashboards
+        command: /app/scripts/refresh_dashboard.sh
+        args: []
+        allowedRoles:
+          - admin
+  maintenance:
+    enabled: true
+    playbooks:
+      - id: rolling-upgrade
+        title: Rolling Upgrade
+        description: Sequentially upgrade DHCP nodes without downtime
+        tags:
+          - upgrade
+          - zero-downtime
+        steps:
+          - id: notify
+            title: Notify Stakeholders
+            summary: Send maintenance notification to stakeholders
+            duration: 10m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.notificationFanout
+          - id: drain-primary
+            title: Drain Primary Nodes
+            summary: Drain active DHCP nodes before upgrade
+            duration: 20m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - notify
+            automationJobType: automation.workflowExecution
+          - id: upgrade-binaries
+            title: Upgrade Binaries
+            summary: Apply new release binaries to drained nodes
+            duration: 30m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - drain-primary
+            automationJobType: automation.workflowExecution
+      - id: emergency-fix
+        title: Emergency Hotfix
+        description: Accelerated patch process for critical issues
+        tags:
+          - hotfix
+          - emergency
+        steps:
+          - id: declare-incident
+            title: Declare Incident
+            summary: Trigger incident response workflow and notify teams
+            duration: 5m
+            responsible: incident
+            requiresApproval: false
+            automationJobType: automation.notificationFanout
+          - id: isolate-traffic
+            title: Isolate Traffic
+            summary: Shift traffic to standby cluster before patching
+            duration: 15m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - declare-incident
+            automationJobType: automation.workflowExecution
+          - id: apply-fix
+            title: Apply Patch
+            summary: Deploy critical fix to impacted nodes
+            duration: 20m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - isolate-traffic
+            automationJobType: automation.workflowExecution
+    windows:
+      - id: weekly-window
+        name: Weekly Ops Window
+        cron: "0 2 * * SAT"
+        duration: 2h
+        timezone: UTC
+      - id: dr-window
+        name: Disaster Recovery Test
+        cron: "0 6 15 * *"
+        duration: 4h
+        timezone: UTC
+    upgradePlans:
+      - id: 24q4-core
+        version: 24.4.0
+        summary: Q4 core upgrade rollout
+        scheduledFor: "2024-11-09T02:00:00Z"
+        prerequisites:
+          - backup-nightly-config
+          - change-approved
+        steps:
+          - id: plan-approval
+            title: Confirm Change Approval
+            summary: Validate CAB approval and freeze exceptions
+            duration: 15m
+            responsible: ops
+            requiresApproval: true
+            automationJobType: automation.workflowExecution
+          - id: execute-upgrade
+            title: Run Upgrade Playbook
+            summary: Execute rolling upgrade automation across clusters
+            duration: 45m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - plan-approval
+            automationJobType: automation.workflowExecution
+        rollbackPlan:
+          - id: rollback-packages
+            title: Revert Packages
+            summary: Reinstall previous package versions on impacted nodes
+            duration: 30m
+            responsible: ops
+            requiresApproval: true
+            automationJobType: automation.workflowExecution
+        releaseNotes: https://docs.dev.example.com/releases/24.4.0
+  backups:
+    enabled: true
+    schedules:
+      - id: nightly-config
+        name: Nightly Config Backup
+        cron: "0 1 * * *"
+        retention: 168h
+        window: 45m
+        type: config
+        enabled: true
+        destinations:
+          - s3-primary
+      - id: hourly-leases
+        name: Hourly Lease Snapshot
+        cron: "0 * * * *"
+        retention: 48h
+        window: 15m
+        type: data
+        enabled: true
+        destinations:
+          - s3-primary
+          - nfs-dr
+    destinations:
+      - id: s3-primary
+        name: Primary Object Store
+        kind: s3
+        endpoint: https://s3.dev.example.com/modern-dhcp/backups
+        credentials: ${S3_BACKUP_CREDENTIALS}
+        metadata:
+          region: us-east-1
+          bucket: modern-dhcp-dev
+      - id: nfs-dr
+        name: DR NFS Share
+        kind: nfs
+        endpoint: nfs://dr-netapp/export/dhcp
+        credentials: /etc/creds/nfs-dr.secret
+        metadata:
+          site: dr-site
+          retention: 7d
+    restoreWorkflows:
+      - id: config-restore
+        name: Restore Config Snapshot
+        description: Guide operators through restoring configuration archives
+        steps:
+          - id: select-backup
+            title: Select Backup Artifact
+            summary: Choose backup artifact from verified list
+            duration: 10m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.workflowExecution
+          - id: import-config
+            title: Import Configuration
+            summary: Apply selected configuration archive to target cluster
+            duration: 20m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - select-backup
+            automationJobType: automation.workflowExecution
+        checks:
+          - backup-verified
+          - maintenance-window
+        approvals:
+          - ops-duty-manager
+          - platform-lead
+    verification:
+      enabled: true
+      schedule: "30 3 * * MON"
+      retention: 30
+      sandboxEnv: staging-restores
+      alertChannel: ops-chat
+  performance:
+    enabled: true
+    probes:
+      - id: lease-latency
+        name: Lease Allocation Latency
+        description: Measures time to allocate new leases through API
+        command: /app/probes/lease_latency.sh
+        interval: 5m
+        slo: 250
+        units: ms
+        thresholds:
+          warning: 220
+          major: 300
+          critical: 400
+      - id: failover-sync
+        name: Failover Sync Lag
+        description: Tracks replication lag across failover pairs
+        command: /app/probes/failover_sync.sh
+        interval: 2m
+        slo: 5
+        units: s
+        thresholds:
+          warning: 4
+          major: 6
+          critical: 8
+      - id: utilization-drift
+        name: Utilization Forecast Drift
+        description: Evaluates difference between forecasted and actual pool utilization
+        command: /app/probes/utilization_drift.sh
+        interval: 15m
+        slo: 5
+        units: percent
+        thresholds:
+          warning: 4
+          major: 5
+          critical: 7
+    indicators:
+      - id: ip-utilization
+        name: IP Utilization
+        description: Percentage of assigned addresses across core pools
+        target: 80
+        units: percent
+      - id: renew-success
+        name: DHCP Renew Success
+        description: Successful renew responses over last hour
+        target: 99.5
+        units: percent
+      - id: failover-lag
+        name: Failover Lag
+        description: Acceptable failover sync delay
+        target: 3
+        units: s
+    recommendations:
+      - id: cache-tuning
+        title: Tune Cache Layer
+        summary: Increase cache capacity and adjust eviction to reduce latency
+        impact: high
+        steps:
+          - id: check-cache
+            title: Check Cache Saturation
+            summary: Review cache usage metrics and eviction trends
+            duration: 10m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.metricsReview
+          - id: adjust-cache
+            title: Adjust Cache Settings
+            summary: Apply new cache sizing via automation workflow
+            duration: 15m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - check-cache
+            automationJobType: automation.workflowExecution
+        signals:
+          - lease-latency
+          - ip-utilization
+      - id: optimize-failover
+        title: Optimize Failover Traffic
+        summary: Balance failover sync intervals to prevent drift
+        impact: medium
+        steps:
+          - id: review-sync
+            title: Review Sync Metrics
+            summary: Analyze failover sync lag and throughput
+            duration: 10m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.metricsReview
+          - id: tune-thresholds
+            title: Tune Thresholds
+            summary: Update failover watchdog thresholds and retry cadence
+            duration: 12m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - review-sync
+            automationJobType: automation.workflowExecution
+        signals:
+          - failover-sync
+          - renew-success

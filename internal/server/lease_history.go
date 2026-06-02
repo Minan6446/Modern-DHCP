@@ -68,20 +68,22 @@ func (s *HTTPServer) handleLeaseHistoryList(leaseSvc *lease.Service) echo.Handle
 		if err != nil {
 			return err
 		}
-		tenantID := c.Param("tenantId")
+		tenantID := strings.TrimSpace(c.Param("tenantId"))
 		filter, err := buildLeaseHistoryFilter(queryFilterInput{
 			state:      c.QueryParam("state"),
 			identifier: c.QueryParam("identifier"),
 			ip:         c.QueryParam("ip"),
 			from:       c.QueryParam("from"),
 			to:         c.QueryParam("to"),
+			poolId:     c.QueryParam("poolId"),
 			limit:      page.Limit,
 			offset:     page.Offset,
 		})
 		if err != nil {
 			return err
 		}
-		records, total, err := leaseSvc.History(c.Request().Context(), tenantID, filter)
+		scopeRef := s.leaseScopeRef(c).WithTenantOverride(tenantID)
+		records, total, err := leaseSvc.History(c.Request().Context(), scopeRef, filter)
 		if err != nil {
 			if errors.Is(err, lease.ErrTenantRequired) {
 				return echo.NewHTTPError(http.StatusBadRequest, err.Error())
@@ -108,7 +110,7 @@ func (s *HTTPServer) handleLeaseHistoryExport() echo.HandlerFunc {
 		if s.reportSvc == nil {
 			return echo.NewHTTPError(http.StatusServiceUnavailable, "reporting disabled")
 		}
-		tenantID := c.Param("tenantId")
+		tenantID := strings.TrimSpace(c.Param("tenantId"))
 		var payload leaseHistoryExportPayload
 		if err := c.Bind(&payload); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
@@ -119,14 +121,17 @@ func (s *HTTPServer) handleLeaseHistoryExport() echo.HandlerFunc {
 			ip:         payload.IPAddress,
 			from:       payload.From,
 			to:         payload.To,
+			poolId:     "",
 			limit:      payload.Limit,
 			offset:     0,
 		})
 		if err != nil {
 			return err
 		}
+		scope := s.leaseScopeRef(c).WithTenantOverride(tenantID)
 		artifact, err := s.reportSvc.ExportLeaseHistory(c.Request().Context(), reporting.LeaseHistoryExportRequest{
 			TenantID:    tenantID,
+			Scope:       scope,
 			Format:      reporting.ParseFormat(payload.Format),
 			Destination: payload.Destination,
 			Filter:      filter,
@@ -153,7 +158,7 @@ func (s *HTTPServer) handleLeaseDailySchedule() echo.HandlerFunc {
 		}
 		tenantID := strings.TrimSpace(payload.TenantID)
 		if tenantID == "" {
-			return echo.NewHTTPError(http.StatusBadRequest, "tenantId is required")
+			tenantID = systemTenantID
 		}
 		filter, err := buildLeaseHistoryFilter(queryFilterInput{
 			state:      payload.State,
@@ -161,15 +166,18 @@ func (s *HTTPServer) handleLeaseDailySchedule() echo.HandlerFunc {
 			ip:         payload.IPAddress,
 			from:       payload.From,
 			to:         payload.To,
+			poolId:     "",
 			limit:      payload.Limit,
 			offset:     0,
 		})
 		if err != nil {
 			return err
 		}
+		scope := s.leaseScopeRef(c).WithTenantOverride(tenantID)
 		interval := time.Duration(payload.IntervalHours) * time.Hour
 		job, err := s.reportSvc.ScheduleLeaseHistoryExport(reporting.LeaseHistoryScheduleRequest{
 			TenantID:    tenantID,
+			Scope:       scope,
 			Format:      reporting.ParseFormat(payload.Format),
 			Destination: payload.Destination,
 			Filter:      filter,
@@ -188,6 +196,7 @@ type queryFilterInput struct {
 	ip         string
 	from       string
 	to         string
+	poolId     string
 	limit      int
 	offset     int
 }
@@ -197,6 +206,7 @@ func buildLeaseHistoryFilter(input queryFilterInput) (models.LeaseHistoryFilter,
 		State:      strings.ToUpper(strings.TrimSpace(input.state)),
 		Identifier: strings.TrimSpace(input.identifier),
 		IPAddress:  strings.TrimSpace(input.ip),
+		PoolID:     strings.TrimSpace(input.poolId),
 		Limit:      input.limit,
 		Offset:     input.offset,
 	}

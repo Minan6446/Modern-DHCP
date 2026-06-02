@@ -1,0 +1,158 @@
+:root {
+  /* DNS brand palette */
+  --dns-color-primary: #1677FF;
+  --dns-color-success: #00B42A;
+  --dns-color-warning: #FF7D00;
+  --dns-color-danger: #F53F3F;
+  --dns-color-disabled: #C9CDD4;
+
+  /* Typography */
+  --dns-text-title-size: 16px;
+  --dns-text-title-weight: 600;
+  --dns-text-body-size: 14px;
+  --dns-text-body-weight: 400;
+  --dns-text-assist-size: 12px;
+  --dns-text-assist-weight: 400;
+
+  --dns-text-title-color: #1D2129;
+  --dns-text-body-color: #4E5969;
+  --dns-text-assist-color: #86909C;
+
+  /* Global shape and spacing */
+  --dns-radius-base: 8px;
+  --dns-shadow-card: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --dns-table-row-height: 48px;
+
+  /* Common surface tokens */
+  --dns-bg-page: #F5F7FA;
+  --dns-bg-card: #FFFFFF;
+  --dns-border-color: #E5E6EB;
+
+  /* Element Plus variable mapping */
+  --el-color-primary: var(--dns-color-primary);
+  --el-color-success: var(--dns-color-success);
+  --el-color-warning: var(--dns-color-warning);
+  --el-color-danger: var(--dns-color-danger);
+  --el-color-info: var(--dns-text-assist-color);
+
+  --el-text-color-primary: var(--dns-text-title-color);
+  --el-text-color-regular: var(--dns-text-body-color);
+  --el-text-color-secondary: var(--dns-text-assist-color);
+  --el-text-color-placeholder: var(--dns-text-assist-color);
+
+  --el-border-color: var(--dns-border-color);
+  --el-border-color-light: var(--dns-border-color);
+  --el-border-color-lighter: var(--dns-border-color);
+
+  --el-bg-color: var(--dns-bg-card);
+  --el-bg-color-page: var(--dns-bg-page);
+  --el-bg-color-overlay: var(--dns-bg-card);
+
+  --el-border-radius-base: var(--dns-radius-base);
+  --el-border-radius-small: var(--dns-radius-base);
+  --el-border-radius-round: var(--dns-radius-base);
+
+  --el-disabled-bg-color: var(--dns-color-disabled);
+  --el-disabled-text-color: var(--dns-text-assist-color);
+  --el-disabled-border-color: var(--dns-color-disabled);
+
+  --el-card-border-color: var(--dns-border-color);
+  --el-table-border-color: var(--dns-border-color);
+}
+
+html,
+body,
+#app {
+  color: var(--dns-text-body-color);
+  font-size: var(--dns-text-body-size);
+  font-weight: var(--dns-text-body-weight);
+}
+
+body {
+  background: var(--dns-bg-page);
+}
+
+/* Typography helpers */
+.dns-text-title {
+  color: var(--dns-text-title-color);
+  font-size: var(--dns-text-title-size);
+  font-weight: var(--dns-text-title-weight);
+}
+
+.dns-text-body {
+  color: var(--dns-text-body-color);
+  font-size: var(--dns-text-body-size);
+  font-weight: var(--dns-text-body-weight);
+}
+
+.dns-text-assist {
+  color: var(--dns-text-assist-color);
+  font-size: var(--dns-text-assist-size);
+  font-weight: var(--dns-text-assist-weight);
+}
+
+/* Element Plus global refinement */
+.el-button,
+.el-input__wrapper,
+.el-select__wrapper,
+.el-textarea__inner,
+.el-card,
+.el-dialog,
+.el-drawer,
+.el-tag {
+  border-radius: var(--dns-radius-base);
+}
+
+.el-card {
+  background: var(--dns-bg-card);
+  box-shadow: var(--dns-shadow-card);
+  border: 1px solid var(--dns-border-color);
+}
+
+.el-card__header {
+  color: var(--dns-text-title-color);
+  font-size: var(--dns-text-title-size);
+  font-weight: var(--dns-text-title-weight);
+}
+
+.el-table {
+  --el-table-header-bg-color: var(--dns-bg-page);
+  --el-table-row-hover-bg-color: #E8F3FF;
+}
+
+.el-table th.el-table__cell,
+.el-table td.el-table__cell {
+  height: var(--dns-table-row-height);
+}
+
+.el-table th.el-table__cell {
+  color: var(--dns-text-title-color);
+  font-size: var(--dns-text-body-size);
+  font-weight: var(--dns-text-title-weight);
+}
+
+.el-table td.el-table__cell {
+  color: var(--dns-text-body-color);
+  font-size: var(--dns-text-body-size);
+  font-weight: var(--dns-text-body-weight);
+}
+
+.el-form-item__label {
+  color: var(--dns-text-body-color);
+  font-size: var(--dns-text-body-size);
+  font-weight: var(--dns-text-body-weight);
+}
+
+.el-form-item.is-required .el-form-item__label::before {
+  color: var(--dns-color-danger);
+}
+
+.el-form-item__error {
+  color: var(--dns-color-danger);
+  font-size: var(--dns-text-assist-size);
+  font-weight: var(--dns-text-assist-weight);
+}
+
+.el-pagination {
+  color: var(--dns-text-body-color);
+}

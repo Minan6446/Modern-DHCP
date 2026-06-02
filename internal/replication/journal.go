@@ -52,13 +52,15 @@ func (k *KafkaJournal) ConfirmLease(ctx context.Context, lease *models.Lease) er
 		return nil
 	}
 	payload := journalEnvelope{
-		LeaseID:   lease.ID,
-		TenantID:  lease.TenantID,
-		PoolID:    lease.PoolID,
-		IPAddress: lease.IPAddress,
-		State:     lease.State,
-		UpdatedAt: lease.UpdatedAt,
-		Lease:     lease,
+		LeaseID:    lease.ID,
+		TenantID:   lease.TenantID,
+		PoolID:     lease.PoolID,
+		IPAddress:  lease.IPAddress,
+		State:      lease.State,
+		UpdatedAt:  lease.UpdatedAt,
+		DedupeKey:  leaseDedupeKey(lease),
+		OccurredAt: time.Now().UTC(),
+		Lease:      lease,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -67,9 +69,22 @@ func (k *KafkaJournal) ConfirmLease(ctx context.Context, lease *models.Lease) er
 	cctx, cancel := context.WithTimeout(ctx, k.timeout)
 	defer cancel()
 	return k.writer.WriteMessages(cctx, kafka.Message{
-		Key:   []byte(lease.ID),
+		Key: []byte(payload.DedupeKey),
+		Headers: []kafka.Header{
+			{Key: "x-dedupe-key", Value: []byte(payload.DedupeKey)},
+			{Key: "x-tenant-id", Value: []byte(payload.TenantID)},
+			{Key: "x-lease-id", Value: []byte(payload.LeaseID)},
+		},
 		Value: data,
 	})
+}
+
+func leaseDedupeKey(lease *models.Lease) string {
+	if lease == nil {
+		return ""
+	}
+	updated := lease.UpdatedAt.UTC().UnixNano()
+	return lease.TenantID + "|" + lease.PoolID + "|" + lease.IPAddress + "|" + lease.State + "|" + lease.ID + "|" + time.Unix(0, updated).UTC().Format(time.RFC3339Nano)
 }
 
 // Close shuts down the underlying writer.
@@ -81,11 +96,13 @@ func (k *KafkaJournal) Close() error {
 }
 
 type journalEnvelope struct {
-	LeaseID   string        `json:"leaseId"`
-	TenantID  string        `json:"tenantId"`
-	PoolID    string        `json:"poolId"`
-	IPAddress string        `json:"ip"`
-	State     string        `json:"state"`
-	UpdatedAt time.Time     `json:"updatedAt"`
-	Lease     *models.Lease `json:"lease"`
+	LeaseID    string        `json:"leaseId"`
+	TenantID   string        `json:"tenantId"`
+	PoolID     string        `json:"poolId"`
+	IPAddress  string        `json:"ip"`
+	State      string        `json:"state"`
+	UpdatedAt  time.Time     `json:"updatedAt"`
+	OccurredAt time.Time     `json:"occurredAt"`
+	DedupeKey  string        `json:"dedupeKey"`
+	Lease      *models.Lease `json:"lease"`
 }

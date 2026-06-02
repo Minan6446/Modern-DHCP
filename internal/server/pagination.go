@@ -30,6 +30,15 @@ func parsePagination(c echo.Context) (Pagination, error) {
 			v = maxLimit
 		}
 		limit = v
+	} else if ps := c.QueryParam("pageSize"); ps != "" {
+		v, err := strconv.Atoi(ps)
+		if err != nil || v <= 0 {
+			return Pagination{}, echo.NewHTTPError(400, "pageSize must be a positive integer")
+		}
+		if v > maxLimit {
+			v = maxLimit
+		}
+		limit = v
 	}
 	if o := c.QueryParam("offset"); o != "" {
 		v, err := strconv.Atoi(o)
@@ -37,6 +46,12 @@ func parsePagination(c echo.Context) (Pagination, error) {
 			return Pagination{}, echo.NewHTTPError(400, "offset must be >= 0")
 		}
 		offset = v
+	} else if p := c.QueryParam("page"); p != "" {
+		v, err := strconv.Atoi(p)
+		if err != nil || v <= 0 {
+			return Pagination{}, echo.NewHTTPError(400, "page must be a positive integer")
+		}
+		offset = (v - 1) * limit
 	}
 	return Pagination{Limit: limit, Offset: offset}, nil
 }

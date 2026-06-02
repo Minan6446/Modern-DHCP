@@ -2,19 +2,22 @@ package dhcpv4
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
 	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"go.uber.org/zap"
 
+	"modern-dhcp/internal/dhcpv4/builder"
+	dhcpv4metrics "modern-dhcp/internal/dhcpv4/metrics"
+	dhcpv4option "modern-dhcp/internal/dhcpv4/option"
+	dhcpv4parser "modern-dhcp/internal/dhcpv4/parser"
 	"modern-dhcp/internal/lease"
+	"modern-dhcp/internal/metrics"
 	"modern-dhcp/internal/relay"
 )
 
@@ -27,7 +30,11 @@ type Options struct {
 	TenantID       string
 	ServerIP       net.IP
 	ReadTimeout    time.Duration
+	Security       SecurityOptions
+	Metrics        *metrics.Collector
+	MessageParser  dhcpv4parser.Decoder
 	RelayParser    relay.Option82Parser
+	Option82Policy Option82Policy
 	Partitioner    *relay.Partitioner
 	WorkerCount    int
 	QueueDepth     int
@@ -38,11 +45,20 @@ type Options struct {
 
 // Server wraps UDP I/O and delegates business logic to Handler.
 type Server struct {
-	opts        Options
-	relayParser relay.Option82Parser
-	partitioner *relay.Partitioner
-	handler     *Handler
-	logger      *zap.Logger
+	opts              Options
+	relayParser       relay.Option82Parser
+	option82Validator *dhcpv4Option82Validator
+	partitioner       *relay.Partitioner
+	handler           *Handler
+	logger            *zap.Logger
+	metrics           *metrics.Collector
+	packetObserver    dhcpv4metrics.Observer
+	responseBuilder   builder.ResponseBuilder
+	messageParser     dhcpv4parser.Decoder
+	macLimiter        *dhcpv4MACRateLimiter
+	relayIPWhitelist  map[string]struct{}
+	rogueClusterNodes map[string]struct{}
+	rogueConfig       RogueDetectorConfig
 
 	mu    sync.Mutex
 	conn  *net.UDPConn
@@ -80,11 +96,34 @@ func NewServer(opts Options, handler *Handler, logger *zap.Logger) *Server {
 	if opts.ServerIP == nil {
 		opts.ServerIP = net.IPv4zero
 	}
-	parser := opts.RelayParser
-	if parser == nil {
-		parser = relay.NewDefaultOption82Parser()
+	relayParser := opts.RelayParser
+	if relayParser == nil {
+		relayParser = relay.NewDefaultOption82Parser()
 	}
-	return &Server{opts: opts, relayParser: parser, partitioner: opts.Partitioner, handler: handler, logger: logger}
+	messageParser := opts.MessageParser
+	if messageParser == nil {
+		messageParser = dhcpv4parser.NewDecoder()
+	}
+	validator := dhcpv4Option82NewValidator(opts.Option82Policy)
+	macLimiter := dhcpv4NewMACRateLimiter(opts.Security.MACRateLimitPPS)
+	relayWhitelist := normalizeIPSet(opts.Security.RelayWhitelist)
+	rogueNodes := normalizeIPSet(opts.Security.RogueDetector.ClusterNodes)
+	return &Server{
+		opts:              opts,
+		relayParser:       relayParser,
+		option82Validator: validator,
+		partitioner:       opts.Partitioner,
+		handler:           handler,
+		logger:            logger,
+		metrics:           opts.Metrics,
+		packetObserver:    dhcpv4metrics.NewObserver(opts.Metrics),
+		responseBuilder:   builder.NewResponseBuilder(opts.ServerIP, encodeMobilityVendorOption),
+		messageParser:     messageParser,
+		macLimiter:        macLimiter,
+		relayIPWhitelist:  relayWhitelist,
+		rogueClusterNodes: rogueNodes,
+		rogueConfig:       opts.Security.RogueDetector,
+	}
 }
 
 // ListenAndServe starts the UDP loop until the context is done or fatal error occurs.
@@ -117,6 +156,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		zap.Int("workers", s.opts.WorkerCount),
 		zap.Int("queueDepth", s.opts.QueueDepth),
 	)
+	s.startRogueDetector(ctx)
 	jobs := make(chan datagram, s.opts.QueueDepth)
 	var workers sync.WaitGroup
 	for i := 0; i < s.opts.WorkerCount; i++ {
@@ -311,100 +351,157 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) processDatagram(ctx context.Context, data []byte, addr *net.UDPAddr) {
-	msg, err := ParseMessage(data)
+	messageParser := s.messageParser
+	if messageParser == nil {
+		messageParser = dhcpv4parser.NewDecoder()
+	}
+	msg, err := messageParser.Parse(data)
 	if err != nil {
-		s.logger.Debug("dhcpv4 parse failed", zap.Error(err))
+		dhcpv4Logger(ctx, s.logger).Debug("dhcpv4 parse failed", zap.Error(err))
 		return
 	}
 
 	typ := msg.Option(OptionDHCPMessageType)
+	if !s.dhcpv4AllowByMAC(msg, addr) {
+		return
+	}
 	if len(typ) != 1 {
 		if msg.Op == opBootRequest {
+			s.observePacketMetric("REQUEST")
 			s.handleBootRequest(ctx, msg, addr)
 			return
 		}
-		s.logger.Debug("dhcpv4 missing message type", zap.Uint32("xid", msg.XID))
+		dhcpv4Logger(ctx, s.logger).Debug("dhcpv4 missing message type", zap.Uint32("xid", msg.XID))
 		return
 	}
 
 	switch typ[0] {
 	case MessageTypeDiscover:
+		s.observePacketMetric("DISCOVER")
 		s.handleDiscover(ctx, msg, addr)
 	case MessageTypeRequest:
+		s.observePacketMetric("REQUEST")
 		s.handleRequest(ctx, msg, addr)
 	case MessageTypeDecline:
-		s.handleDecline(ctx, msg)
+		s.handleDecline(ctx, msg, addr)
+	case MessageTypeRelease:
+		s.handleRelease(ctx, msg, addr)
 	default:
-		s.logger.Debug("dhcpv4 unsupported type", zap.Uint8("type", typ[0]))
+		dhcpv4Logger(ctx, s.logger).Debug("dhcpv4 unsupported type", zap.Uint8("type", typ[0]))
 	}
 }
 
 func (s *Server) handleDiscover(ctx context.Context, msg *Message, addr *net.UDPAddr) {
+	log := dhcpv4Logger(ctx, s.logger)
 	packet := s.packetFromMessage(msg)
+	if !s.dhcpv4RelayValidateOrReject(ctx, msg, packet, addr) {
+		return
+	}
+	if !s.dhcpv4Option82ValidateOrReject(ctx, msg, packet, addr) {
+		return
+	}
 	if !s.shouldHandleRelay(packet) {
 		return
 	}
 	result, err := s.handler.HandleDiscover(ctx, s.opts.TenantID, packet)
 	if err != nil {
-		s.logger.Warn("dhcpv4 discover handling failed", zap.Error(err))
+		log.Warn("dhcpv4 discover handling failed", zap.Error(err))
 		return
 	}
 
 	resp, err := s.buildResponse(msg, result, MessageTypeOffer)
 	if err != nil {
-		s.logger.Warn("dhcpv4 offer build failed", zap.Error(err))
+		log.Warn("dhcpv4 offer build failed", zap.Error(err))
 		return
 	}
-	s.sendResponse(msg, resp, addr)
+	s.sendResponse(ctx, msg, resp, addr)
 }
 
 func (s *Server) handleRequest(ctx context.Context, msg *Message, addr *net.UDPAddr) {
+	log := dhcpv4Logger(ctx, s.logger)
 	packet := s.packetFromMessage(msg)
+	if !s.dhcpv4RelayValidateOrReject(ctx, msg, packet, addr) {
+		return
+	}
+	if !s.dhcpv4Option82ValidateOrReject(ctx, msg, packet, addr) {
+		return
+	}
 	if !s.shouldHandleRelay(packet) {
 		return
 	}
 	result, err := s.handler.HandleRequest(ctx, s.opts.TenantID, packet)
 	if err != nil {
-		s.logger.Warn("dhcpv4 request handling failed", zap.Error(err))
-		s.sendNak(msg, addr, err.Error())
+		log.Warn("dhcpv4 request handling failed", zap.Error(err))
+		s.sendNak(ctx, msg, addr, err.Error())
 		return
 	}
 
 	resp, err := s.buildResponse(msg, result, MessageTypeAck)
 	if err != nil {
-		s.logger.Warn("dhcpv4 ack build failed", zap.Error(err))
-		s.sendNak(msg, addr, err.Error())
+		log.Warn("dhcpv4 ack build failed", zap.Error(err))
+		s.sendNak(ctx, msg, addr, err.Error())
 		return
 	}
-	s.sendResponse(msg, resp, addr)
+	s.sendResponse(ctx, msg, resp, addr)
 }
 
 func (s *Server) handleBootRequest(ctx context.Context, msg *Message, addr *net.UDPAddr) {
+	log := dhcpv4Logger(ctx, s.logger)
 	packet := s.packetFromMessage(msg)
+	if !s.dhcpv4RelayValidateOrReject(ctx, msg, packet, addr) {
+		return
+	}
+	if !s.dhcpv4Option82ValidateOrReject(ctx, msg, packet, addr) {
+		return
+	}
 	if !s.shouldHandleRelay(packet) {
 		return
 	}
 	result, err := s.handler.HandleBootRequest(ctx, s.opts.TenantID, packet)
 	if err != nil {
-		s.logger.Warn("bootp handling failed", zap.Error(err))
+		log.Warn("bootp handling failed", zap.Error(err))
 		return
 	}
 
 	resp, err := s.buildResponse(msg, result, MessageTypeAck)
 	if err != nil {
-		s.logger.Warn("bootp ack build failed", zap.Error(err))
+		log.Warn("bootp ack build failed", zap.Error(err))
 		return
 	}
-	s.sendResponse(msg, resp, addr)
+	s.sendResponse(ctx, msg, resp, addr)
 }
 
-func (s *Server) handleDecline(ctx context.Context, msg *Message) {
+func (s *Server) handleDecline(ctx context.Context, msg *Message, addr *net.UDPAddr) {
+	log := dhcpv4Logger(ctx, s.logger)
 	packet := s.packetFromMessage(msg)
+	if !s.dhcpv4RelayValidateOrReject(ctx, msg, packet, addr) {
+		return
+	}
+	if !s.dhcpv4Option82ValidateOrReject(ctx, msg, packet, addr) {
+		return
+	}
 	if !s.shouldHandleRelay(packet) {
 		return
 	}
 	if err := s.handler.HandleDecline(ctx, s.opts.TenantID, packet); err != nil {
-		s.logger.Warn("dhcpv4 decline handling failed", zap.Error(err))
+		log.Warn("dhcpv4 decline handling failed", zap.Error(err))
+	}
+}
+
+func (s *Server) handleRelease(ctx context.Context, msg *Message, addr *net.UDPAddr) {
+	log := dhcpv4Logger(ctx, s.logger)
+	packet := s.packetFromMessage(msg)
+	if !s.dhcpv4RelayValidateOrReject(ctx, msg, packet, addr) {
+		return
+	}
+	if !s.dhcpv4Option82ValidateOrReject(ctx, msg, packet, addr) {
+		return
+	}
+	if !s.shouldHandleRelay(packet) {
+		return
+	}
+	if err := s.handler.HandleRelease(ctx, s.opts.TenantID, packet); err != nil {
+		log.Warn("dhcpv4 release handling failed", zap.Error(err))
 	}
 }
 
@@ -421,41 +518,16 @@ func (s *Server) shouldHandleRelay(pkt Packet) bool {
 }
 
 func (s *Server) buildResponse(req *Message, result *lease.Result, msgType byte) (*Message, error) {
-	if result == nil || result.Lease == nil {
-		return nil, errors.New("dhcpv4: missing lease result")
+	if s.responseBuilder == nil {
+		return nil, errors.New("dhcpv4: response builder is nil")
 	}
-
-	leaseIP := net.ParseIP(result.Lease.IPAddress)
-	if leaseIP == nil {
-		return nil, errors.New("dhcpv4: invalid lease ip")
-	}
-
-	resp := newReplyFromRequest(req)
-	resp.YIAddr = leaseIP.To4()
-	resp.SIAddr = padIP(s.opts.ServerIP)
-	resp.SetOption(OptionDHCPMessageType, []byte{msgType})
-	resp.SetOption(OptionServerIdentifier, padIP(s.opts.ServerIP))
-	leaseTime := result.Profile.DefaultDuration
-	if leaseTime <= 0 {
-		leaseTime = time.Hour
-	}
-	resp.SetOption(OptionIPAddressLeaseTime, encodeUint32(uint32(leaseTime.Seconds())))
-	if result.RenewalTime > 0 {
-		resp.SetOption(OptionRenewalTime, encodeUint32(uint32(result.RenewalTime.Seconds())))
-	}
-	if result.RebindingTime > 0 {
-		resp.SetOption(OptionRebindingTime, encodeUint32(uint32(result.RebindingTime.Seconds())))
-	}
-	if payload := encodeMobilityVendorOption(result); len(payload) > 0 {
-		resp.SetOption(OptionVendorVIVendorInfo, payload)
-	}
-	return resp, nil
+	return s.responseBuilder.BuildResponse(req, result, msgType)
 }
 
-func (s *Server) sendResponse(req *Message, msg *Message, addr *net.UDPAddr) {
+func (s *Server) sendResponse(ctx context.Context, req *Message, msg *Message, addr *net.UDPAddr) {
 	payload, err := msg.MarshalBinary()
 	if err != nil {
-		s.logger.Warn("dhcpv4 marshal failed", zap.Error(err))
+		dhcpv4Logger(ctx, s.logger).Warn("dhcpv4 marshal failed", zap.Error(err))
 		return
 	}
 
@@ -464,46 +536,66 @@ func (s *Server) sendResponse(req *Message, msg *Message, addr *net.UDPAddr) {
 	s.mu.Unlock()
 
 	if conn == nil {
-		s.logger.Warn("dhcpv4 connection not available")
+		dhcpv4Logger(ctx, s.logger).Warn("dhcpv4 connection not available")
 		return
 	}
 	dest := s.destinationFor(req, addr)
 	if dest == nil {
-		s.logger.Warn("dhcpv4 destination missing")
+		dhcpv4Logger(ctx, s.logger).Warn("dhcpv4 destination missing")
 		return
 	}
 
 	if _, err := conn.WriteToUDP(payload, dest); err != nil {
-		s.logger.Warn("dhcpv4 send failed", zap.Error(err))
+		dhcpv4Logger(ctx, s.logger).Warn("dhcpv4 send failed", zap.Error(err))
+		return
+	}
+	if msgType := msg.Option(OptionDHCPMessageType); len(msgType) == 1 {
+		s.observePacketMetric(dhcpv4PacketTypeName(msgType[0]))
 	}
 }
 
-func (s *Server) sendNak(req *Message, addr *net.UDPAddr, reason string) {
-	resp := newReplyFromRequest(req)
-	resp.YIAddr = net.IPv4zero
-	resp.SetOption(OptionDHCPMessageType, []byte{MessageTypeNak})
-	resp.SIAddr = padIP(s.opts.ServerIP)
-	resp.SetOption(OptionServerIdentifier, padIP(s.opts.ServerIP))
-	if reason != "" {
-		if len(reason) > 255 {
-			reason = reason[:255]
-		}
-		resp.SetOption(OptionMessage, []byte(reason))
+func (s *Server) sendNak(ctx context.Context, req *Message, addr *net.UDPAddr, reason string) {
+	b := s.responseBuilder
+	if b == nil {
+		b = builder.NewResponseBuilder(s.opts.ServerIP, encodeMobilityVendorOption)
 	}
-	s.sendResponse(req, resp, addr)
+	resp := b.BuildNAK(req, reason)
+	s.sendResponse(ctx, req, resp, addr)
+}
+
+func (s *Server) observePacketMetric(packetType string) {
+	if s.packetObserver == nil {
+		return
+	}
+	s.packetObserver.ObservePacket(packetType)
+}
+
+func dhcpv4PacketTypeName(messageType byte) string {
+	b := builder.NewResponseBuilder(net.IPv4zero, nil)
+	return b.PacketTypeName(messageType)
 }
 
 func (s *Server) packetFromMessage(msg *Message) Packet {
+	rawOption82 := msg.Option(OptionRelayAgentInfo)
 	pkt := Packet{
-		XID:       msg.XID,
-		CHAddr:    append(net.HardwareAddr{}, msg.CHAddr...),
-		CIAddr:    append(net.IP{}, msg.CIAddr...),
-		GIAddr:    append(net.IP{}, msg.GIAddr...),
-		Options:   msg.Options,
-		Broadcast: msg.Flags&flagBroadcast != 0,
+		XID:             msg.XID,
+		CHAddr:          append(net.HardwareAddr{}, msg.CHAddr...),
+		RequestPhase:    dhcpv4ClassifyRequestPhase(msg),
+		CIAddr:          append(net.IP{}, msg.CIAddr...),
+		GIAddr:          append(net.IP{}, msg.GIAddr...),
+		Options:         msg.Options,
+		Broadcast:       msg.Flags&flagBroadcast != 0,
+		Option82Present: len(rawOption82) > 0,
+	}
+	if parsed, err := dhcpv4Option82Parse(rawOption82); err != nil {
+		pkt.Option82Error = err.Error()
+	} else {
+		pkt.Option82CircuitID = parsed.CircuitID
+		pkt.Option82RemoteID = parsed.RemoteID
+		pkt.Option82SubscriberID = parsed.SubscriberID
 	}
 	if s.relayParser != nil {
-		if attrs, err := s.relayParser.Decode(msg.Option(OptionRelayAgentInfo)); err != nil {
+		if attrs, err := s.relayParser.Decode(rawOption82); err != nil {
 			s.logger.Debug("option82 decode failed", zap.Error(err))
 			if len(attrs) > 0 {
 				pkt.RelayAgentInfo = attrs
@@ -512,15 +604,31 @@ func (s *Server) packetFromMessage(msg *Message) Packet {
 			pkt.RelayAgentInfo = attrs
 		}
 	}
+	if pkt.Option82Present {
+		if pkt.RelayAgentInfo == nil {
+			pkt.RelayAgentInfo = make(map[string]string, 5)
+		}
+		if pkt.Option82CircuitID != "" {
+			pkt.RelayAgentInfo["circuit-id"] = pkt.Option82CircuitID
+			pkt.RelayAgentInfo["agent.circuit-id"] = pkt.Option82CircuitID
+		}
+		if pkt.Option82RemoteID != "" {
+			pkt.RelayAgentInfo["remote-id"] = pkt.Option82RemoteID
+			pkt.RelayAgentInfo["agent.remote-id"] = pkt.Option82RemoteID
+		}
+		if pkt.Option82SubscriberID != "" {
+			pkt.RelayAgentInfo["subscriber-id"] = pkt.Option82SubscriberID
+		}
+	}
 
 	if cid := msg.Option(OptionClientIdentifier); len(cid) > 0 {
 		pkt.ClientID = formatClientID(cid)
 	}
 	if vc := msg.Option(OptionVendorClass); len(vc) > 0 {
-		pkt.VendorClass = sanitizeString(vc)
+		pkt.VendorClass = dhcpv4option.ParseVendorClass(vc)
 	}
 	if uc := msg.Option(OptionUserClass); len(uc) > 0 {
-		pkt.UserClass = decodeUserClass(uc)
+		pkt.UserClass = dhcpv4option.DecodeUserClass(uc)
 	}
 	if rip := msg.Option(OptionRequestedIPAddress); len(rip) == 4 {
 		pkt.RequestedIP = append(net.IP{}, rip...)
@@ -533,20 +641,29 @@ func (s *Server) packetFromMessage(msg *Message) Packet {
 	return pkt
 }
 
-func newReplyFromRequest(req *Message) *Message {
-	resp := &Message{
-		Op:      opBootReply,
-		HType:   req.HType,
-		HLen:    req.HLen,
-		XID:     req.XID,
-		Secs:    req.Secs,
-		Flags:   req.Flags,
-		SIAddr:  make([]byte, len(req.SIAddr)),
-		GIAddr:  append(net.IP{}, req.GIAddr...),
-		CHAddr:  append(net.HardwareAddr{}, req.CHAddr...),
-		Options: make(map[byte][]byte),
+func dhcpv4ClassifyRequestPhase(msg *Message) string {
+	if msg == nil {
+		return dhcpv4RequestPhaseRequest
 	}
-	return resp
+	if len(msg.Option(OptionDHCPMessageType)) != 1 || msg.Option(OptionDHCPMessageType)[0] != MessageTypeRequest {
+		return dhcpv4RequestPhaseRequest
+	}
+	ciaddr := firstIPv4(msg.CIAddr)
+	if ciaddr == nil || ciaddr.Equal(net.IPv4zero) {
+		return dhcpv4RequestPhaseRequest
+	}
+	hasServerID := len(msg.Option(OptionServerIdentifier)) == 4
+	if hasServerID {
+		return dhcpv4RequestPhaseRequest
+	}
+	if msg.Flags&flagBroadcast != 0 {
+		return dhcpv4RequestPhaseRebind
+	}
+	return dhcpv4RequestPhaseRenew
+}
+
+func newReplyFromRequest(req *Message) *Message {
+	return builder.NewReplyFromRequest(req)
 }
 
 func (s *Server) destinationFor(req *Message, fallback *net.UDPAddr) *net.UDPAddr {
@@ -643,35 +760,13 @@ func firstIPv4(ip net.IP) net.IP {
 }
 
 func decodeUserClass(data []byte) string {
-	if len(data) == 0 {
-		return ""
-	}
-
-	var classes []string
-	for i := 0; i < len(data); {
-		l := int(data[i])
-		i++
-		if l == 0 || i+l > len(data) {
-			break
-		}
-		classes = append(classes, sanitizeString(data[i:i+l]))
-		i += l
-	}
-	return strings.Join(classes, ",")
+	return dhcpv4option.DecodeUserClass(data)
 }
 
 func sanitizeString(data []byte) string {
-	var b strings.Builder
-	for _, c := range data {
-		if c >= 32 && c <= 126 {
-			b.WriteByte(c)
-		}
-	}
-	return b.String()
+	return dhcpv4option.SanitizeASCII(data)
 }
 
 func encodeUint32(v uint32) []byte {
-	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, v)
-	return buf
+	return dhcpv4option.EncodeUint32(v)
 }

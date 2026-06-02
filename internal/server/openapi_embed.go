@@ -1,5 +1,9 @@
 package server
 
-import apidocs "modern-dhcp/docs/api"
+import (
+	"io/fs"
+	"os"
+)
 
-var openAPIFS = apidocs.FS
+// openAPIFS reads OpenAPI specs from the docs/api directory at runtime.
+var openAPIFS fs.FS = os.DirFS("docs/api")

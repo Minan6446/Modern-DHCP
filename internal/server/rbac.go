@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 
+	rbaccore "modern-dhcp/internal/rbac"
+
 	"github.com/labstack/echo/v4"
 )
 
@@ -11,27 +13,36 @@ const (
 	RoleReader = "reader"
 	RoleAdmin  = "admin"
 
-	CapabilityPolicyRead           = "policy.read"
-	CapabilityPolicyWrite          = "policy.write"
-	CapabilityPolicyBYODManage     = "byod.policy.manage"
-	CapabilityPoolRead             = "pool.read"
-	CapabilityPoolWrite            = "pool.write"
-	CapabilityBindingRead          = "binding.read"
-	CapabilityBindingManage        = "binding.manage"
-	CapabilityLeaseRead            = "lease.read"
-	CapabilityLeaseManage          = "lease.manage"
-	CapabilityReportRead           = "report.read"
-	CapabilityAuditRead            = "audit.read"
-	CapabilityTenantQuotaRead      = "tenant.quota.read"
-	CapabilityTenantQuotaWrite     = "tenant.quota.write"
-	CapabilityRBACAssignmentRead   = "rbac.assignment.read"
-	CapabilityRBACAssignmentWrite  = "rbac.assignment.write"
-	CapabilityIoTRegistryRead      = "iot.registry.read"
-	CapabilityIoTRegistryManage    = "iot.registry.manage"
-	CapabilitySecurityPolicyRead   = "security.policy.read"
-	CapabilitySecurityPolicyManage = "security.policy.manage"
-	CapabilityHARead               = "ha.read"
-	CapabilityHAManage             = "ha.manage"
+	CapabilityPolicyRead           = rbaccore.CapabilityPolicyRead
+	CapabilityPolicyWrite          = rbaccore.CapabilityPolicyWrite
+	CapabilityPolicyBYODManage     = rbaccore.CapabilityPolicyBYODManage
+	CapabilityPoolRead             = rbaccore.CapabilityPoolRead
+	CapabilityPoolWrite            = rbaccore.CapabilityPoolWrite
+	CapabilityBindingRead          = rbaccore.CapabilityBindingRead
+	CapabilityBindingManage        = rbaccore.CapabilityBindingManage
+	CapabilityLeaseRead            = rbaccore.CapabilityLeaseRead
+	CapabilityLeaseManage          = rbaccore.CapabilityLeaseManage
+	CapabilityReportRead           = rbaccore.CapabilityReportRead
+	CapabilityAuditRead            = rbaccore.CapabilityAuditRead
+	CapabilityUserRead             = rbaccore.CapabilityUserRead
+	CapabilityUserManage           = rbaccore.CapabilityUserManage
+	CapabilityAPIKeyManage         = rbaccore.CapabilityAPIKeyManage
+	CapabilityAuthProviderRead     = rbaccore.CapabilityAuthProviderRead
+	CapabilityAuthProviderManage   = rbaccore.CapabilityAuthProviderManage
+	CapabilityTenantQuotaRead      = rbaccore.CapabilityTenantQuotaRead
+	CapabilityTenantQuotaWrite     = rbaccore.CapabilityTenantQuotaWrite
+	CapabilityRBACAssignmentRead   = rbaccore.CapabilityRBACAssignmentRead
+	CapabilityRBACAssignmentWrite  = rbaccore.CapabilityRBACAssignmentWrite
+	CapabilityRBACRoleRead         = rbaccore.CapabilityRBACRoleRead
+	CapabilityRBACRoleManage       = rbaccore.CapabilityRBACRoleManage
+	CapabilityIoTRegistryRead      = rbaccore.CapabilityIoTRegistryRead
+	CapabilityIoTRegistryManage    = rbaccore.CapabilityIoTRegistryManage
+	CapabilitySecurityPolicyRead   = rbaccore.CapabilitySecurityPolicyRead
+	CapabilitySecurityPolicyManage = rbaccore.CapabilitySecurityPolicyManage
+	CapabilitySecurityView         = rbaccore.CapabilitySecurityView
+	CapabilitySecurityManage       = rbaccore.CapabilitySecurityManage
+	CapabilityHARead               = rbaccore.CapabilityHARead
+	CapabilityHAManage             = rbaccore.CapabilityHAManage
 )
 
 var roleWeights = map[string]int{
@@ -60,6 +71,10 @@ func hasRequiredRole(current, required string) bool {
 		reqWeight = roleWeights[RoleReader]
 	}
 	return currWeight >= reqWeight
+}
+
+func allCapabilities() []string {
+	return rbaccore.AllCapabilities()
 }
 
 // RequireRole ensures the caller has at least the specified role.

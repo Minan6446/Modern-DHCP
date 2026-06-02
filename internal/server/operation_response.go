@@ -4,15 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"modern-dhcp/internal/lease"
 	"modern-dhcp/internal/monitoring"
 	"modern-dhcp/pkg/models"
 )
 
 var errMonitoringUnavailable = errors.New("monitoring aggregator unavailable")
 
-func (s *HTTPServer) buildOperationResponse(ctx context.Context, tenantID, action, status string, data any, changed bool, steps []models.OperationStep) models.OperationResponse {
+func (s *HTTPServer) buildOperationResponse(ctx context.Context, scope lease.ResourceScope, action, status string, data any, changed bool, steps []models.OperationStep) models.OperationResponse {
+	tenantID := strings.TrimSpace(scope.TenantOrDefault())
+	if tenantID == "" {
+		tenantID = systemTenantID
+		scope = scope.WithTenantOverride(systemTenantID)
+	}
 	envelope := models.OperationResponse{
 		Status:    status,
 		Data:      data,
@@ -21,7 +28,7 @@ func (s *HTTPServer) buildOperationResponse(ctx context.Context, tenantID, actio
 		Timestamp: time.Now().UTC(),
 	}
 
-	overview, overviewErr := s.collectOverviewSnapshot(ctx, tenantID)
+	overview, overviewErr := s.collectOverviewSnapshot(ctx, scope)
 	if overviewErr == nil {
 		envelope.Stats = map[string]any{
 			"overview": overview,
@@ -35,17 +42,17 @@ func (s *HTTPServer) buildOperationResponse(ctx context.Context, tenantID, actio
 
 	envelope.Validation = s.buildValidationReport(overviewErr)
 	envelope.Sync = s.buildSyncReport()
-	envelope.Events = s.buildOperationEvents(ctx, tenantID, action, changed)
+	envelope.Events = s.buildOperationEvents(ctx, scope, action, changed)
 	envelope.Cleanup = s.buildCleanupReport(changed)
 
 	return envelope
 }
 
-func (s *HTTPServer) collectOverviewSnapshot(ctx context.Context, tenantID string) (monitoring.OverviewSnapshot, error) {
+func (s *HTTPServer) collectOverviewSnapshot(ctx context.Context, scope lease.ResourceScope) (monitoring.OverviewSnapshot, error) {
 	if s == nil || s.monitor == nil {
 		return monitoring.OverviewSnapshot{}, errMonitoringUnavailable
 	}
-	return s.monitor.Overview(ctx, tenantID, 24)
+	return s.monitor.Overview(ctx, scope, 24)
 }
 
 func (s *HTTPServer) buildValidationReport(overviewErr error) *models.ValidationReport {
@@ -85,7 +92,11 @@ func (s *HTTPServer) buildSyncReport() *models.SyncReport {
 	return report
 }
 
-func (s *HTTPServer) buildOperationEvents(ctx context.Context, tenantID, action string, changed bool) []models.OperationEvent {
+func (s *HTTPServer) buildOperationEvents(ctx context.Context, scope lease.ResourceScope, action string, changed bool) []models.OperationEvent {
+	tenantID := strings.TrimSpace(scope.TenantOrDefault())
+	if tenantID == "" {
+		tenantID = systemTenantID
+	}
 	now := time.Now().UTC()
 	if !changed {
 		return []models.OperationEvent{{

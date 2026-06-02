@@ -31,8 +31,9 @@ func (l *LeaseSink) Apply(ctx context.Context, signal guard.QuarantineSignal) {
 	if identifier == "" || signal.TenantID == "" {
 		return
 	}
+	scopeRef := lease.NewResourceScope(signal.TenantID, signal.TenantID)
 	state := mapState(signal.State)
-	if err := l.svc.UpdateSecurityState(ctx, signal.TenantID, identifier, state); err != nil {
+	if err := l.svc.UpdateSecurityState(ctx, scopeRef, identifier, state); err != nil {
 		if l.logger != nil {
 			l.logger.Warn("update security state failed", zap.Error(err), zap.String("tenantId", signal.TenantID), zap.String("identifier", identifier))
 		}

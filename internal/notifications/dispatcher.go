@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -85,4 +86,22 @@ func (d *Dispatcher) lookup(name string) Sender {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.channels[name]
+}
+
+// Channels returns the registered channel names sorted alphabetically.
+func (d *Dispatcher) Channels() []string {
+	if d == nil {
+		return []string{}
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if len(d.channels) == 0 {
+		return []string{}
+	}
+	names := make([]string, 0, len(d.channels))
+	for name := range d.channels {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

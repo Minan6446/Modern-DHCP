@@ -13,4 +13,5 @@ type AdminActivity struct {
 	DurationMillis int64             `json:"durationMillis"`
 	CorrelationID  string            `json:"correlationId,omitempty"`
 	Sensitive      bool              `json:"sensitive"`
+	Scope          ScopeMetadata     `json:"scope,omitempty"`
 }

@@ -11,6 +11,8 @@ import (
 
 	"go.uber.org/zap"
 
+	"modern-dhcp/internal/dhcpv4/leasefsm"
+	dhcpv4metrics "modern-dhcp/internal/dhcpv4/metrics"
 	"modern-dhcp/internal/lease"
 	"modern-dhcp/internal/metrics"
 	"modern-dhcp/internal/mobility"
@@ -27,20 +29,32 @@ import (
 
 // Packet abstracts the minimal DHCPv4 packet data needed for policy evaluation.
 type Packet struct {
-	XID            uint32
-	CHAddr         net.HardwareAddr
-	ClientID       string
-	CIAddr         net.IP
-	GIAddr         net.IP
-	RelayAgentInfo map[string]string
-	VendorClass    string
-	UserClass      string
-	RequestedIP    net.IP
-	Options        map[byte][]byte
-	Broadcast      bool
-	IsBOOTP        bool
-	IPClass        string
+	XID                  uint32
+	CHAddr               net.HardwareAddr
+	ClientID             string
+	RequestPhase         string
+	CIAddr               net.IP
+	GIAddr               net.IP
+	RelayAgentInfo       map[string]string
+	Option82Present      bool
+	Option82CircuitID    string
+	Option82RemoteID     string
+	Option82SubscriberID string
+	Option82Error        string
+	VendorClass          string
+	UserClass            string
+	RequestedIP          net.IP
+	Options              map[byte][]byte
+	Broadcast            bool
+	IsBOOTP              bool
+	IPClass              string
 }
+
+const (
+	dhcpv4RequestPhaseRequest = "request"
+	dhcpv4RequestPhaseRenew   = "renew"
+	dhcpv4RequestPhaseRebind  = "rebind"
+)
 
 // Handler processes DHCPv4 messages.
 type Handler struct {
@@ -48,6 +62,7 @@ type Handler struct {
 	policy        *policy.Engine
 	poolSvc       *pool.Service
 	metrics       *metrics.Collector
+	dhcpMetrics   dhcpv4metrics.Observer
 	recorder      monitoring.RequestRecorder
 	logger        *zap.Logger
 	guard         securityguard.Guard
@@ -63,17 +78,19 @@ func NewHandler(leaseSvc *lease.Service, policyEngine *policy.Engine, poolSvc *p
 	if guard == nil {
 		guard = securityguard.NewNoop()
 	}
-	return &Handler{leaseSvc: leaseSvc, policy: policyEngine, poolSvc: poolSvc, metrics: metricsCollector, recorder: recorder, guard: guard, relayAuth: authenticator, relaySel: selector, logger: logger, affinity: mobilityCache, fingerprinter: fingerprinter, mdmService: mdmSvc}
+	return &Handler{leaseSvc: leaseSvc, policy: policyEngine, poolSvc: poolSvc, metrics: metricsCollector, dhcpMetrics: dhcpv4metrics.NewObserver(metricsCollector), recorder: recorder, guard: guard, relayAuth: authenticator, relaySel: selector, logger: logger, affinity: mobilityCache, fingerprinter: fingerprinter, mdmService: mdmSvc}
 }
 
 // HandleDiscover performs policy evaluation and pre-allocates state.
 func (h *Handler) HandleDiscover(ctx context.Context, tenantID string, pkt Packet) (res *lease.Result, err error) {
+	opStarted := time.Now()
+	defer h.observeLeaseOpDuration("allocate", opStarted)
 	started := time.Now()
 	defer func() { h.observeLifecycle(tenantID, "DISCOVER", started, err) }()
 	if err := h.authorizeRelay(tenantID, pkt); err != nil {
 		return nil, err
 	}
-	if err := h.runGuard(ctx, tenantID, "discover", pkt); err != nil {
+	if err := h.runGuard(ctx, tenantID, "discover", pkt, "discover"); err != nil {
 		return nil, err
 	}
 	id := h.identity(pkt)
@@ -82,8 +99,14 @@ func (h *Handler) HandleDiscover(ctx context.Context, tenantID string, pkt Packe
 	requestedIP := h.desiredIP(pkt)
 	meta := h.allocationMetadata(pkt)
 	meta.Compliance = compliance
-	result, err := h.leaseSvc.AllocateOrReuseWithMetadata(ctx, tenantID, id, profile, poolID, requestedIP, meta)
+	scopeRef := lease.NewResourceScope(tenantID, tenantID)
+	result, err := h.leaseSvc.AllocateOrReuseWithMetadata(ctx, scopeRef, id, profile, poolID, requestedIP, meta)
 	if err == nil {
+		if result != nil && result.Lease != nil {
+			if transitionErr := h.leaseSvc.UpdateDHCPv4LeaseFSMByLeaseID(ctx, scopeRef, result.Lease.ID, leasefsm.StateOffered); transitionErr != nil {
+				return nil, transitionErr
+			}
+		}
 		h.rememberMobilityAffinity(ctx, tenantID, id, pkt, meta, result)
 	}
 	return result, err
@@ -91,12 +114,18 @@ func (h *Handler) HandleDiscover(ctx context.Context, tenantID string, pkt Packe
 
 // HandleRequest finalizes allocation for DHCPREQUEST packets.
 func (h *Handler) HandleRequest(ctx context.Context, tenantID string, pkt Packet) (res *lease.Result, err error) {
+	op := "allocate"
+	if pkt.RequestPhase == dhcpv4RequestPhaseRenew || pkt.RequestPhase == dhcpv4RequestPhaseRebind {
+		op = "renew"
+	}
+	opStarted := time.Now()
+	defer h.observeLeaseOpDuration(op, opStarted)
 	started := time.Now()
 	defer func() { h.observeLifecycle(tenantID, "REQUEST", started, err) }()
 	if err := h.authorizeRelay(tenantID, pkt); err != nil {
 		return nil, err
 	}
-	if err := h.runGuard(ctx, tenantID, "request", pkt); err != nil {
+	if err := h.runGuard(ctx, tenantID, "request", pkt, pkt.RequestPhase); err != nil {
 		return nil, err
 	}
 	id := h.identity(pkt)
@@ -105,13 +134,41 @@ func (h *Handler) HandleRequest(ctx context.Context, tenantID string, pkt Packet
 	requestedIP := h.desiredIP(pkt)
 	meta := h.allocationMetadata(pkt)
 	meta.Compliance = compliance
-	result, err := h.leaseSvc.AllocateOrReuseWithMetadata(ctx, tenantID, id, profile, poolID, requestedIP, meta)
+	scopeRef := lease.NewResourceScope(tenantID, tenantID)
+	result, err := h.leaseSvc.AllocateOrReuseWithMetadata(ctx, scopeRef, id, profile, poolID, requestedIP, meta)
 	if err != nil {
+		if isSyncAckGateError(err) && h.logger != nil {
+			h.logger.Warn("dhcpv4 request blocked by sync ack gate",
+				zap.String("tenant", tenantID),
+				zap.String("identifier", id),
+				zap.String("phase", pkt.RequestPhase),
+				zap.Error(err),
+			)
+		}
 		return nil, err
+	}
+	target := leasefsm.StateBound
+	switch pkt.RequestPhase {
+	case dhcpv4RequestPhaseRenew:
+		target = leasefsm.StateRenewing
+	case dhcpv4RequestPhaseRebind:
+		target = leasefsm.StateRebinding
+	}
+	if result != nil && result.Lease != nil {
+		if err := h.leaseSvc.UpdateDHCPv4LeaseFSMByLeaseID(ctx, scopeRef, result.Lease.ID, target); err != nil {
+			return nil, err
+		}
 	}
 	h.rememberMobilityAffinity(ctx, tenantID, id, pkt, meta, result)
 	h.emitLeaseChange(ctx, tenantID, pkt, result, securityguard.LeaseActionGranted)
 	return result, nil
+}
+
+func isSyncAckGateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "sync ack gate")
 }
 
 // HandleBootRequest responds to BOOTP clients that do not speak DHCP extensions.
@@ -121,7 +178,7 @@ func (h *Handler) HandleBootRequest(ctx context.Context, tenantID string, pkt Pa
 	if err := h.authorizeRelay(tenantID, pkt); err != nil {
 		return nil, err
 	}
-	if err := h.runGuard(ctx, tenantID, "bootp", pkt); err != nil {
+	if err := h.runGuard(ctx, tenantID, "bootp", pkt, dhcpv4RequestPhaseRequest); err != nil {
 		return nil, err
 	}
 	id := h.identity(pkt)
@@ -130,7 +187,8 @@ func (h *Handler) HandleBootRequest(ctx context.Context, tenantID string, pkt Pa
 	requestedIP := h.desiredIP(pkt)
 	meta := h.allocationMetadata(pkt)
 	meta.Compliance = compliance
-	result, err := h.leaseSvc.AllocateOrReuseWithMetadata(ctx, tenantID, id, profile, poolID, requestedIP, meta)
+	scopeRef := lease.NewResourceScope(tenantID, tenantID)
+	result, err := h.leaseSvc.AllocateOrReuseWithMetadata(ctx, scopeRef, id, profile, poolID, requestedIP, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -141,20 +199,49 @@ func (h *Handler) HandleBootRequest(ctx context.Context, tenantID string, pkt Pa
 
 // HandleDecline records lease declines from clients.
 func (h *Handler) HandleDecline(ctx context.Context, tenantID string, pkt Packet) (err error) {
+	opStarted := time.Now()
+	defer h.observeLeaseOpDuration("release", opStarted)
 	started := time.Now()
 	defer func() { h.observeLifecycle(tenantID, "DECLINE", started, err) }()
 	if err := h.authorizeRelay(tenantID, pkt); err != nil {
 		return err
 	}
-	if err := h.runGuard(ctx, tenantID, "decline", pkt); err != nil {
+	if err := h.runGuard(ctx, tenantID, "decline", pkt, dhcpv4RequestPhaseRequest); err != nil {
 		return err
 	}
-	reason := ""
-	if msg := pkt.Options[OptionMessage]; len(msg) > 0 {
-		reason = string(msg)
+	id := h.identity(pkt)
+	scopeRef := lease.NewResourceScope(tenantID, tenantID)
+	if _, _, err := h.leaseSvc.ReleaseByIdentifier(ctx, scopeRef, id); err != nil {
+		return err
+	}
+	return h.leaseSvc.UpdateDHCPv4LeaseFSMByIdentifier(ctx, scopeRef, id, leasefsm.StateReleased)
+}
+
+// HandleRelease records lease release events from clients.
+func (h *Handler) HandleRelease(ctx context.Context, tenantID string, pkt Packet) (err error) {
+	opStarted := time.Now()
+	defer h.observeLeaseOpDuration("release", opStarted)
+	started := time.Now()
+	defer func() { h.observeLifecycle(tenantID, "RELEASE", started, err) }()
+	if err := h.authorizeRelay(tenantID, pkt); err != nil {
+		return err
+	}
+	if err := h.runGuard(ctx, tenantID, "release", pkt, dhcpv4RequestPhaseRequest); err != nil {
+		return err
 	}
 	id := h.identity(pkt)
-	return h.leaseSvc.MarkDeclined(ctx, tenantID, id, reason)
+	scopeRef := lease.NewResourceScope(tenantID, tenantID)
+	if _, _, err := h.leaseSvc.ReleaseByIdentifier(ctx, scopeRef, id); err != nil {
+		return err
+	}
+	return h.leaseSvc.UpdateDHCPv4LeaseFSMByIdentifier(ctx, scopeRef, id, leasefsm.StateReleased)
+}
+
+func (h *Handler) observeLeaseOpDuration(op string, started time.Time) {
+	if h == nil || h.dhcpMetrics == nil {
+		return
+	}
+	h.dhcpMetrics.ObserveLeaseOperation(op, started)
 }
 
 func (h *Handler) leasePlan(ctx context.Context, tenantID, identifier string, pkt Packet, mdmManaged bool) (models.LeaseProfile, string) {
@@ -232,7 +319,33 @@ func (h *Handler) leasePlan(ctx context.Context, tenantID, identifier string, pk
 	if poolID == "" {
 		poolID = "default"
 	}
+	profile = h.applyPoolLeaseTimes(ctx, tenantID, poolID, profile)
 	return profile, poolID
+}
+
+func (h *Handler) applyPoolLeaseTimes(ctx context.Context, tenantID, poolID string, profile models.LeaseProfile) models.LeaseProfile {
+	if h == nil || h.poolSvc == nil {
+		return profile
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	poolID = strings.TrimSpace(poolID)
+	if tenantID == "" || poolID == "" {
+		return profile
+	}
+	poolObj, err := h.poolSvc.GetPool(ctx, pool.NewResourceScope(tenantID, tenantID), poolID)
+	if err != nil || poolObj == nil {
+		return profile
+	}
+	if poolObj.MinLeaseTime > 0 {
+		profile.DefaultDuration = time.Duration(poolObj.MinLeaseTime) * time.Second
+	}
+	if poolObj.MaxLeaseTime > 0 {
+		profile.MaxDuration = time.Duration(poolObj.MaxLeaseTime) * time.Second
+	}
+	if profile.MaxDuration > 0 && profile.DefaultDuration > profile.MaxDuration {
+		profile.DefaultDuration = profile.MaxDuration
+	}
+	return profile
 }
 
 func (h *Handler) resolvePoolSelector(ctx context.Context, tenantID string, selector *policy.PoolSelector) string {
@@ -249,7 +362,8 @@ func (h *Handler) resolvePoolSelector(ctx context.Context, tenantID string, sele
 		GeoZone:       selector.GeoZone,
 	}
 	started := time.Now()
-	poolObj, err := h.poolSvc.ResolvePool(ctx, tenantID, metadataSelector)
+	scopeRef := pool.NewResourceScope("", tenantID)
+	poolObj, err := h.poolSvc.ResolvePool(ctx, scopeRef, metadataSelector)
 	observability.ObserveSelectorMetrics(h.metrics, tenantID, metadataSelector, poolObj, err, started)
 	if err != nil {
 		if !errors.Is(err, pool.ErrPoolNotFound) {
@@ -473,23 +587,35 @@ func relayAttributes(pkt Packet) map[string]any {
 	return attrs
 }
 
-func (h *Handler) runGuard(ctx context.Context, tenantID, messageType string, pkt Packet) error {
+func (h *Handler) runGuard(ctx context.Context, tenantID, messageType string, pkt Packet, phase string) error {
 	if h.guard == nil {
 		return nil
 	}
+	normalizedPhase := phase
+	ctx = lease.WithTenantContext(ctx, tenantID)
+	ctx = securityguard.WithRequestPhaseContext(ctx, phase)
+	if normalizedPhase == "" {
+		normalizedPhase = dhcpv4RequestPhaseRequest
+	}
+	if phase == dhcpv4RequestPhaseRenew || phase == dhcpv4RequestPhaseRebind {
+		h.logger.Info("dhcpv4续约校验", zap.String("tenantId", tenantID), zap.String("phase", phase), zap.String("mac", pkt.CHAddr.String()))
+		return h.guard.CheckRenewACL(ctx, pkt.CHAddr.String())
+	}
+	h.logger.Info("dhcpv4首次分配校验", zap.String("tenantId", tenantID), zap.String("phase", phase), zap.String("mac", pkt.CHAddr.String()))
 	ctxData := &securityguard.Context{
-		TenantID:    tenantID,
-		MessageType: messageType,
-		MAC:         pkt.CHAddr.String(),
-		ClientID:    pkt.ClientID,
-		CircuitID:   relayValue(pkt, "circuit-id", "agent.circuit-id"),
-		RemoteID:    relayValue(pkt, "remote-id", "agent.remote-id"),
-		RelayAgent:  pkt.RelayAgentInfo,
-		PortID:      relayValue(pkt, "port-id", "circuit-id", "agent.circuit-id"),
-		InterfaceID: relayValue(pkt, "interface-id"),
-		RequestedIP: ipToString(pkt.RequestedIP),
-		GIAddr:      ipToString(pkt.GIAddr),
-		Timestamp:   time.Now().UTC(),
+		TenantID:     tenantID,
+		MessageType:  messageType,
+		RequestPhase: normalizedPhase,
+		MAC:          pkt.CHAddr.String(),
+		ClientID:     pkt.ClientID,
+		CircuitID:    relayValue(pkt, "circuit-id", "agent.circuit-id"),
+		RemoteID:     relayValue(pkt, "remote-id", "agent.remote-id"),
+		RelayAgent:   pkt.RelayAgentInfo,
+		PortID:       relayValue(pkt, "port-id", "circuit-id", "agent.circuit-id"),
+		InterfaceID:  relayValue(pkt, "interface-id"),
+		RequestedIP:  ipToString(pkt.RequestedIP),
+		GIAddr:       ipToString(pkt.GIAddr),
+		Timestamp:    time.Now().UTC(),
 	}
 	ctxData.VLANID = parseVLAN(relayValue(pkt, "vlan-id"))
 	return h.guard.Check(ctx, ctxData)

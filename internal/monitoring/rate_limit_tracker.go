@@ -12,6 +12,7 @@ import (
 type RateLimitTracker interface {
 	ratelimit.Observer
 	Snapshot(tenantID string, window time.Duration) RateLimitWindow
+	Events(tenantID string, window time.Duration, limit int) []RateLimitEvent
 }
 
 // RateLimitWindow summarizes guard rate-limit activity.
@@ -80,28 +81,10 @@ func (t *rateLimitTracker) Record(hit ratelimit.Hit) {
 func (t *rateLimitTracker) Snapshot(tenantID string, window time.Duration) RateLimitWindow {
 	canonical := normalizeTenant(tenantID)
 	snapshot := RateLimitWindow{TenantID: canonical, Window: window}
-	if t == nil || window <= 0 {
+	if t == nil {
 		return snapshot
 	}
-	cutoff := time.Now().UTC().Add(-window)
-	t.mu.Lock()
-	bucket := t.perTenant[strings.ToLower(canonical)]
-	if len(bucket) == 0 {
-		t.mu.Unlock()
-		return snapshot
-	}
-	prune := 0
-	for prune < len(bucket) && bucket[prune].occurredAt.Before(cutoff) {
-		prune++
-	}
-	if prune > 0 {
-		bucket = append([]rateLimitEvent(nil), bucket[prune:]...)
-		t.perTenant[strings.ToLower(canonical)] = bucket
-	}
-	copyBuf := make([]rateLimitEvent, len(bucket))
-	copy(copyBuf, bucket)
-	t.mu.Unlock()
-
+	copyBuf := t.recentEvents(canonical, window)
 	if len(copyBuf) == 0 {
 		return snapshot
 	}
@@ -129,8 +112,66 @@ func (t *rateLimitTracker) Snapshot(tenantID string, window time.Duration) RateL
 	snapshot.LastPort = last.port
 	snapshot.LastIP = last.ip
 	snapshot.LastHit = last.occurredAt
-	if snapshot.LastHit.Before(cutoff) {
-		snapshot.LastHit = time.Now().UTC()
+	if window > 0 {
+		cutoff := time.Now().UTC().Add(-window)
+		if snapshot.LastHit.Before(cutoff) {
+			snapshot.LastHit = time.Now().UTC()
+		}
 	}
 	return snapshot
+}
+
+func (t *rateLimitTracker) Events(tenantID string, window time.Duration, limit int) []RateLimitEvent {
+	canonical := normalizeTenant(tenantID)
+	if t == nil {
+		return nil
+	}
+	events := t.recentEvents(canonical, window)
+	if len(events) == 0 {
+		return nil
+	}
+	if limit <= 0 || limit > len(events) {
+		limit = len(events)
+	}
+	start := len(events) - limit
+	selected := events[start:]
+	result := make([]RateLimitEvent, len(selected))
+	for idx, evt := range selected {
+		result[idx] = RateLimitEvent{
+			TenantID:   canonical,
+			OccurredAt: evt.occurredAt,
+			MAC:        evt.mac,
+			PortID:     evt.port,
+			IP:         evt.ip,
+			RetryAfter: evt.retryAfter,
+		}
+	}
+	return result
+}
+
+func (t *rateLimitTracker) recentEvents(tenantID string, window time.Duration) []rateLimitEvent {
+	if t == nil {
+		return nil
+	}
+	key := strings.ToLower(tenantID)
+	var cutoff time.Time
+	if window > 0 {
+		cutoff = time.Now().UTC().Add(-window)
+	}
+	t.mu.Lock()
+	bucket := t.perTenant[key]
+	if len(bucket) > 0 && !cutoff.IsZero() {
+		prune := 0
+		for prune < len(bucket) && bucket[prune].occurredAt.Before(cutoff) {
+			prune++
+		}
+		if prune > 0 {
+			bucket = append([]rateLimitEvent(nil), bucket[prune:]...)
+			t.perTenant[key] = bucket
+		}
+	}
+	copyBuf := make([]rateLimitEvent, len(bucket))
+	copy(copyBuf, bucket)
+	t.mu.Unlock()
+	return copyBuf
 }

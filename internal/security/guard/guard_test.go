@@ -7,10 +7,14 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
+	"modern-dhcp/internal/lease"
+	"modern-dhcp/internal/pool"
 	securitypolicy "modern-dhcp/internal/security/policy"
 	"modern-dhcp/internal/security/ratelimit"
 	"modern-dhcp/internal/security/snooping"
+	"modern-dhcp/pkg/models"
 )
 
 func TestGuardMACACLBlacklist(t *testing.T) {
@@ -40,6 +44,35 @@ func TestGuardMACACLWhitelist(t *testing.T) {
 	}
 }
 
+func TestGuardMACACLUnmatchedAllowWhenWhitelistNotEnforced(t *testing.T) {
+	g := &guardImpl{
+		deps: Dependencies{Logger: zap.NewNop()},
+		macACL: &macACL{
+			whitelist:        map[string]struct{}{"00:aa:bb:cc:dd:ee": {}},
+			enforceWhitelist: false,
+			defaultAction:    macACLDefaultActionAllow,
+		},
+	}
+	ctxData := &Context{TenantID: "tenant-b", MAC: "00:ff:ee:dd:cc:bb"}
+	if err := g.enforceMACACL(context.Background(), ctxData, "00:ff:ee:dd:cc:bb"); err != nil {
+		t.Fatalf("expected unmatched allow when enforceWhitelist=false, got %v", err)
+	}
+}
+
+func TestGuardMACACLUnmatchedDenyWhenWhitelistEnforced(t *testing.T) {
+	g := &guardImpl{
+		deps: Dependencies{Logger: zap.NewNop()},
+		macACL: &macACL{
+			enforceWhitelist: true,
+			defaultAction:    macACLDefaultActionAllow,
+		},
+	}
+	ctxData := &Context{TenantID: "tenant-b", MAC: "00:ff:ee:dd:cc:bb"}
+	if err := g.enforceMACACL(context.Background(), ctxData, "00:ff:ee:dd:cc:bb"); !errors.Is(err, ErrMACNotAllowed) {
+		t.Fatalf("expected unmatched deny when enforceWhitelist=true, got %v", err)
+	}
+}
+
 func TestGuardMACACLGraylistBlock(t *testing.T) {
 	g := &guardImpl{
 		deps: Dependencies{Logger: zap.NewNop()},
@@ -51,6 +84,181 @@ func TestGuardMACACLGraylistBlock(t *testing.T) {
 	ctxData := &Context{TenantID: "tenant-c", MAC: "00:99:88:77:66:55"}
 	if err := g.enforceMACACL(context.Background(), ctxData, "00:99:88:77:66:55"); !errors.Is(err, ErrMACNotAllowed) {
 		t.Fatalf("expected graylist block, got %v", err)
+	}
+}
+
+func TestNormalizeMACACLForcesDefaultActionAllow(t *testing.T) {
+	acl := normalizeMACACL(&MACACL{
+		Whitelist:        []string{"00:aa:bb:cc:dd:ee"},
+		EnforceWhitelist: false,
+		DefaultAction:    "block",
+	})
+	if acl == nil {
+		t.Fatalf("expected acl to be initialized")
+	}
+	if acl.defaultAction != macACLDefaultActionAllow {
+		t.Fatalf("expected default action to be forced to allow, got %s", acl.defaultAction)
+	}
+	g := &guardImpl{deps: Dependencies{Logger: zap.NewNop()}, macACL: acl}
+	if err := g.enforceMACACL(context.Background(), &Context{TenantID: "tenant-a", MAC: "00:11:22:33:44:55"}, "00:11:22:33:44:55"); err != nil {
+		t.Fatalf("expected allow after forced default action, got %v", err)
+	}
+}
+
+func TestGuardMACACLWhitelistTakesPrecedenceOverGraylist(t *testing.T) {
+	g := &guardImpl{
+		deps: Dependencies{Logger: zap.NewNop()},
+		macACL: &macACL{
+			whitelist:        map[string]struct{}{"00:11:22:33:44:55": {}},
+			graylist:         map[string]struct{}{"00:11:22:33:44:55": {}},
+			grayAction:       GraylistActionBlock,
+			enforceWhitelist: false,
+			defaultAction:    macACLDefaultActionAllow,
+		},
+	}
+	err := g.enforceMACACL(context.Background(), &Context{TenantID: "tenant-a", MAC: "00:11:22:33:44:55"}, "00:11:22:33:44:55")
+	if err != nil {
+		t.Fatalf("expected whitelist hit to allow even when graylist also matches, got %v", err)
+	}
+}
+
+func TestGuardMACACLBlacklistTakesPrecedenceOverWhitelist(t *testing.T) {
+	g := &guardImpl{
+		deps: Dependencies{Logger: zap.NewNop()},
+		macACL: &macACL{
+			whitelist:        map[string]struct{}{"00:11:22:33:44:55": {}},
+			blacklist:        map[string]struct{}{"00:11:22:33:44:55": {}},
+			enforceWhitelist: false,
+			defaultAction:    macACLDefaultActionAllow,
+		},
+	}
+	err := g.enforceMACACL(context.Background(), &Context{TenantID: "tenant-a", MAC: "00:11:22:33:44:55"}, "00:11:22:33:44:55")
+	if !errors.Is(err, ErrMACNotAllowed) {
+		t.Fatalf("expected blacklist to deny even when whitelist also matches, got %v", err)
+	}
+}
+
+func TestGuardCheckBindingExemptACLAllowsBoundMAC(t *testing.T) {
+	g := &guardImpl{
+		deps: Dependencies{Logger: zap.NewNop()},
+		macACL: &macACL{
+			blacklist:        map[string]struct{}{"00:11:22:33:44:55": {}},
+			enforceWhitelist: true,
+			defaultAction:    macACLDefaultActionAllow,
+		},
+		bindingLookup:    &stubBindingLookup{binding: &models.StaticBinding{IPAddress: "10.0.0.55"}},
+		bindingExemptACL: true,
+	}
+	err := g.Check(context.Background(), &Context{TenantID: "tenant-a", MAC: "00:11:22:33:44:55"})
+	if err != nil {
+		t.Fatalf("expected bound mac to bypass ACL when binding exemption enabled, got %v", err)
+	}
+}
+
+func TestGuardCheckBindingExemptACLDisabledStillRunsACL(t *testing.T) {
+	g := &guardImpl{
+		deps: Dependencies{Logger: zap.NewNop()},
+		macACL: &macACL{
+			blacklist:        map[string]struct{}{"00:11:22:33:44:55": {}},
+			enforceWhitelist: false,
+			defaultAction:    macACLDefaultActionAllow,
+		},
+		bindingLookup:    &stubBindingLookup{binding: &models.StaticBinding{IPAddress: "10.0.0.55"}},
+		bindingExemptACL: false,
+	}
+	err := g.Check(context.Background(), &Context{TenantID: "tenant-a", MAC: "00:11:22:33:44:55"})
+	if !errors.Is(err, ErrMACNotAllowed) {
+		t.Fatalf("expected ACL denial when binding exemption disabled, got %v", err)
+	}
+}
+
+func TestCheckRenewACLAllowsNonBlacklistedMAC(t *testing.T) {
+	g := &guardImpl{
+		deps: Dependencies{Logger: zap.NewNop()},
+		macACL: &macACL{
+			blacklist:          map[string]struct{}{"00:aa:bb:cc:dd:ee": {}},
+			renewExemptBlocked: true,
+		},
+	}
+	ctx := lease.WithTenantContext(context.Background(), "tenant-a")
+	if err := g.CheckRenewACL(ctx, "00:11:22:33:44:55"); err != nil {
+		t.Fatalf("expected non-blacklisted mac to pass renew acl, got %v", err)
+	}
+}
+
+func TestCheckRenewACLDeniesBlacklistedWithoutExempt(t *testing.T) {
+	g := &guardImpl{
+		deps: Dependencies{Logger: zap.NewNop()},
+		macACL: &macACL{
+			blacklist:          map[string]struct{}{"00:11:22:33:44:55": {}},
+			renewExemptBlocked: false,
+		},
+	}
+	ctx := lease.WithTenantContext(context.Background(), "tenant-a")
+	if err := g.CheckRenewACL(ctx, "00:11:22:33:44:55"); !errors.Is(err, ErrMACNotAllowed) {
+		t.Fatalf("expected blacklisted mac to be denied without exemption, got %v", err)
+	}
+}
+
+func TestCheckRenewACLExemptsBlacklistedWithValidLease(t *testing.T) {
+	g := &guardImpl{
+		deps: Dependencies{Logger: zap.NewNop()},
+		macACL: &macACL{
+			blacklist:          map[string]struct{}{"00:11:22:33:44:55": {}},
+			renewExemptBlocked: true,
+		},
+		leaseSvc: &stubLeaseChecker{ok: true},
+	}
+	ctx := lease.WithTenantContext(context.Background(), "tenant-a")
+	if err := g.CheckRenewACL(ctx, "00:11:22:33:44:55"); err != nil {
+		t.Fatalf("expected renew exemption to allow blacklisted mac with valid lease, got %v", err)
+	}
+}
+
+func TestCheckRenewACLLogsExemptTriggeredTrue(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
+	logger := zap.New(core)
+	g := &guardImpl{
+		deps: Dependencies{Logger: logger},
+		macACL: &macACL{
+			blacklist:          map[string]struct{}{"00:11:22:33:44:55": {}},
+			renewExemptBlocked: true,
+		},
+		leaseSvc: &stubLeaseChecker{ok: true},
+	}
+	ctx := lease.WithTenantContext(context.Background(), "tenant-a")
+	if err := g.CheckRenewACL(ctx, "00:11:22:33:44:55"); err != nil {
+		t.Fatalf("expected exemption allow, got %v", err)
+	}
+	entries := observed.FilterMessage("续约校验触发豁免放行").All()
+	if len(entries) != 1 {
+		t.Fatalf("expected one exemption log entry, got %d", len(entries))
+	}
+	if triggered, ok := entries[0].ContextMap()["renewExemptTriggered"].(bool); !ok || !triggered {
+		t.Fatalf("expected renewExemptTriggered=true in log, got %v", entries[0].ContextMap()["renewExemptTriggered"])
+	}
+}
+
+func TestCheckRenewACLLogsExemptTriggeredFalseOnDeny(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
+	logger := zap.New(core)
+	g := &guardImpl{
+		deps: Dependencies{Logger: logger},
+		macACL: &macACL{
+			blacklist:          map[string]struct{}{"00:11:22:33:44:55": {}},
+			renewExemptBlocked: false,
+		},
+	}
+	ctx := lease.WithTenantContext(context.Background(), "tenant-a")
+	if err := g.CheckRenewACL(ctx, "00:11:22:33:44:55"); !errors.Is(err, ErrMACNotAllowed) {
+		t.Fatalf("expected blacklist deny, got %v", err)
+	}
+	entries := observed.FilterMessage("续约校验拒绝（黑名单）").All()
+	if len(entries) != 1 {
+		t.Fatalf("expected one deny log entry, got %d", len(entries))
+	}
+	if triggered, ok := entries[0].ContextMap()["renewExemptTriggered"].(bool); !ok || triggered {
+		t.Fatalf("expected renewExemptTriggered=false in log, got %v", entries[0].ContextMap()["renewExemptTriggered"])
 	}
 }
 
@@ -196,4 +404,28 @@ func (s *stubSnoopingStore) StreamChanges(ctx context.Context) (<-chan snooping.
 	ch := make(chan snooping.Binding)
 	close(ch)
 	return ch, nil
+}
+
+type stubBindingLookup struct {
+	binding *models.StaticBinding
+	err     error
+}
+
+func (s *stubBindingLookup) FindBinding(ctx context.Context, scope pool.ResourceScope, identifier, ip string) (*models.StaticBinding, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.binding, nil
+}
+
+type stubLeaseChecker struct {
+	ok  bool
+	err error
+}
+
+func (s *stubLeaseChecker) HasValidLease(ctx context.Context, mac string) (bool, error) {
+	if s.err != nil {
+		return false, s.err
+	}
+	return s.ok, nil
 }

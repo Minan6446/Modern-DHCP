@@ -26,24 +26,29 @@ const (
 	AlertLifecycleAcknowledged AlertLifecycle = "acknowledged"
 	// AlertLifecycleSuppressed indicates an alert that was muted or auto-resolved.
 	AlertLifecycleSuppressed AlertLifecycle = "suppressed"
+	// AlertLifecycleEscalated indicates the alert escalated to the next rotation.
+	AlertLifecycleEscalated AlertLifecycle = "escalated"
 )
 
 // AlertFeedEntry captures details for dashboard consumption.
 type AlertFeedEntry struct {
-	ID          string            `json:"id"`
-	Summary     string            `json:"summary"`
-	Details     string            `json:"details,omitempty"`
-	Category    string            `json:"category"`
-	Severity    alerting.Severity `json:"severity"`
-	Lifecycle   AlertLifecycle    `json:"lifecycle"`
-	Source      string            `json:"source,omitempty"`
-	TenantID    string            `json:"tenantId,omitempty"`
-	Assignee    string            `json:"assignee,omitempty"`
-	Channel     string            `json:"channel,omitempty"`
-	Tags        []string          `json:"tags,omitempty"`
-	Fingerprint string            `json:"fingerprint,omitempty"`
-	CreatedAt   time.Time         `json:"createdAt"`
-	UpdatedAt   time.Time         `json:"updatedAt,omitempty"`
+	ID               string            `json:"id"`
+	Summary          string            `json:"summary"`
+	Details          string            `json:"details,omitempty"`
+	Category         string            `json:"category"`
+	Severity         alerting.Severity `json:"severity"`
+	Lifecycle        AlertLifecycle    `json:"lifecycle"`
+	Source           string            `json:"source,omitempty"`
+	TenantID         string            `json:"tenantId,omitempty"`
+	Assignee         string            `json:"assignee,omitempty"`
+	Channel          string            `json:"channel,omitempty"`
+	Tags             []string          `json:"tags,omitempty"`
+	Fingerprint      string            `json:"fingerprint,omitempty"`
+	CreatedAt        time.Time         `json:"createdAt"`
+	UpdatedAt        time.Time         `json:"updatedAt,omitempty"`
+	EscalationLevel  int               `json:"escalationLevel,omitempty"`
+	EscalationTarget string            `json:"escalationTarget,omitempty"`
+	SilencedUntil    time.Time         `json:"silencedUntil,omitempty"`
 }
 
 // AlertFeedTotals summarizes lifecycle counts for a tenant.
@@ -51,6 +56,7 @@ type AlertFeedTotals struct {
 	Open         int `json:"open"`
 	Acknowledged int `json:"acknowledged"`
 	Suppressed   int `json:"suppressed"`
+	Escalated    int `json:"escalated"`
 }
 
 // AlertFeedSnapshot exposes alert stream payloads consumed by the UI.
@@ -131,17 +137,41 @@ func (f *AlertFeed) Acknowledge(tenantID, alertID, assignee string) (AlertFeedEn
 		if assignee != "" {
 			entry.Assignee = assignee
 		}
+		entry.SilencedUntil = time.Time{}
 	})
 }
 
-// Suppress marks an alert as suppressed and optionally records the channel used.
-func (f *AlertFeed) Suppress(tenantID, alertID, channel string) (AlertFeedEntry, error) {
+// Suppress marks an alert as suppressed and optionally records channel/operator metadata.
+func (f *AlertFeed) Suppress(tenantID, alertID, channel, assignee string, until time.Time) (AlertFeedEntry, error) {
 	channel = strings.TrimSpace(channel)
+	assignee = strings.TrimSpace(assignee)
 	return f.updateEntry(tenantID, alertID, func(entry *AlertFeedEntry) {
 		entry.Lifecycle = AlertLifecycleSuppressed
 		if channel != "" {
 			entry.Channel = channel
 		}
+		if assignee != "" {
+			entry.Assignee = assignee
+		}
+		entry.SilencedUntil = until
+	})
+}
+
+// Escalate bumps the alert to the next escalation level and optionally reassigns it.
+func (f *AlertFeed) Escalate(tenantID, alertID, assignee, channel string) (AlertFeedEntry, error) {
+	assignee = strings.TrimSpace(assignee)
+	channel = strings.TrimSpace(channel)
+	return f.updateEntry(tenantID, alertID, func(entry *AlertFeedEntry) {
+		entry.Lifecycle = AlertLifecycleEscalated
+		entry.EscalationLevel++
+		if assignee != "" {
+			entry.Assignee = assignee
+			entry.EscalationTarget = assignee
+		}
+		if channel != "" {
+			entry.Channel = channel
+		}
+		entry.SilencedUntil = time.Time{}
 	})
 }
 
@@ -275,6 +305,8 @@ func aggregateAlertTotals(entries []AlertFeedEntry) AlertFeedTotals {
 			totals.Acknowledged++
 		case AlertLifecycleSuppressed:
 			totals.Suppressed++
+		case AlertLifecycleEscalated:
+			totals.Escalated++
 		default:
 			totals.Open++
 		}
@@ -310,16 +342,18 @@ func SampleAlertEntries(tenantID string) []AlertFeedEntry {
 			CreatedAt: now.Add(-9 * time.Minute),
 		},
 		{
-			Summary:   "Automation workflow pending approval",
-			Details:   "Policy rollout blocked awaiting auditor sign-off",
-			Category:  "AUTOMATION",
-			Severity:  alerting.SeverityWarning,
-			Lifecycle: AlertLifecycleAcknowledged,
-			Source:    "automation",
-			TenantID:  tenantID,
-			Assignee:  "ops-rotation",
-			Tags:      []string{"workflow:policy-rollout"},
-			CreatedAt: now.Add(-22 * time.Minute),
+			Summary:          "Automation workflow pending approval",
+			Details:          "Policy rollout blocked awaiting auditor sign-off",
+			Category:         "AUTOMATION",
+			Severity:         alerting.SeverityWarning,
+			Lifecycle:        AlertLifecycleEscalated,
+			Source:           "automation",
+			TenantID:         tenantID,
+			Assignee:         "ops-rotation",
+			EscalationLevel:  1,
+			EscalationTarget: "ops.manager",
+			Tags:             []string{"workflow:policy-rollout"},
+			CreatedAt:        now.Add(-22 * time.Minute),
 		},
 		{
 			Summary:   "Anomaly suppressed: Discover burst",

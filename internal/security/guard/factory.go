@@ -7,9 +7,12 @@ import (
 
 	"modern-dhcp/internal/audit"
 	"modern-dhcp/internal/config"
+	"modern-dhcp/internal/lease"
 	"modern-dhcp/internal/metrics"
+	"modern-dhcp/internal/pool"
 	"modern-dhcp/internal/security/detector"
 	"modern-dhcp/internal/security/ipsgdai"
+	"modern-dhcp/internal/security/maclist"
 	"modern-dhcp/internal/security/policy"
 	"modern-dhcp/internal/security/radius"
 	"modern-dhcp/internal/security/ratelimit"
@@ -17,14 +20,17 @@ import (
 )
 
 // NewFromConfig wires a guard based on security configuration.
-func NewFromConfig(cfg config.SecurityConfig, collector *metrics.Collector, logger *zap.Logger, quarantine QuarantineSink, auditSvc *audit.Service, policyEval policy.Evaluator, rateObserver ratelimit.Observer, snoopObserver snooping.Observer) Guard {
+func NewFromConfig(cfg config.SecurityConfig, collector *metrics.Collector, logger *zap.Logger, quarantine QuarantineSink, auditSvc *audit.Service, policyEval policy.Evaluator, macList maclist.Evaluator, bindingSvc *pool.Service, leaseSvc *lease.Service, rateObserver ratelimit.Observer, snoopObserver snooping.Observer) Guard {
 	if !cfg.Enabled {
 		return NewNoop()
 	}
 
-	deps := Dependencies{Logger: logger, Metrics: collector, Quarantine: quarantine, Audit: auditSvc, RateObserver: rateObserver, SnoopingObserver: snoopObserver}
+	deps := Dependencies{Logger: logger, Metrics: collector, Quarantine: quarantine, Audit: auditSvc, BindingService: bindingSvc, LeaseService: leaseSvc, RateObserver: rateObserver, SnoopingObserver: snoopObserver}
 	if cfg.Policy.Enabled && policyEval != nil {
 		deps.Policy = policyEval
+	}
+	if macList != nil {
+		deps.MacList = macList
 	}
 
 	if cfg.Snooping.Enabled && len(cfg.Snooping.TrustedPorts) > 0 {
@@ -127,10 +133,7 @@ func buildRadiusClient(cfg config.SecurityConfig, logger *zap.Logger) radius.Cli
 
 func buildMACACL(cfg config.MACACLConfig) *MACACL {
 	enforce := cfg.EnforceWhitelist
-	if !enforce && len(cfg.Whitelist) > 0 {
-		enforce = true
-	}
-	hasRules := enforce || len(cfg.Whitelist) > 0 || len(cfg.Blacklist) > 0 || len(cfg.Graylist) > 0
+	hasRules := enforce || cfg.BindingExemptACL || len(cfg.Whitelist) > 0 || len(cfg.Blacklist) > 0 || len(cfg.Graylist) > 0
 	if !hasRules {
 		return nil
 	}
@@ -144,11 +147,14 @@ func buildMACACL(cfg config.MACACLConfig) *MACACL {
 		action = string(GraylistActionMonitor)
 	}
 	return &MACACL{
-		Whitelist:        cfg.Whitelist,
-		Blacklist:        cfg.Blacklist,
-		Graylist:         cfg.Graylist,
-		GraylistAction:   GraylistAction(action),
-		EnforceWhitelist: enforce,
+		Whitelist:          cfg.Whitelist,
+		Blacklist:          cfg.Blacklist,
+		Graylist:           cfg.Graylist,
+		GraylistAction:     GraylistAction(action),
+		EnforceWhitelist:   enforce,
+		BindingExemptACL:   cfg.BindingExemptACL,
+		RenewExemptBlocked: cfg.RenewExemptBlocked,
+		DefaultAction:      macACLDefaultActionAllow,
 	}
 }
 

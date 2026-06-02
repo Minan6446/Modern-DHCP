@@ -51,3 +51,31 @@ func TestRateLimitTrackerLimit(t *testing.T) {
 		t.Fatalf("expected last hit to represent most recent entry")
 	}
 }
+
+func TestRateLimitTrackerEvents(t *testing.T) {
+	tracker := NewRateLimitTracker(10)
+	base := time.Now().UTC()
+	for i := 0; i < 4; i++ {
+		tracker.Record(ratelimit.Hit{
+			TenantID:   "tenant-c",
+			MAC:        fmt.Sprintf("aa:bb:cc:dd:ee:%02x", i),
+			PortID:     fmt.Sprintf("gi1/0/%d", i+1),
+			IPAddress:  fmt.Sprintf("10.0.0.%d", i+1),
+			RetryAfter: time.Duration(i) * time.Second,
+			OccurredAt: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+	events := tracker.Events("tenant-c", 3*time.Second, 2)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].MAC != "aa:bb:cc:dd:ee:02" || events[1].MAC != "aa:bb:cc:dd:ee:03" {
+		t.Fatalf("unexpected event ordering: %#v", events)
+	}
+	if events[1].RetryAfter != 3*time.Second {
+		t.Fatalf("expected retry after to be preserved")
+	}
+	if events[0].IP == "" || events[1].PortID == "" {
+		t.Fatalf("expected ip and port to be populated")
+	}
+}

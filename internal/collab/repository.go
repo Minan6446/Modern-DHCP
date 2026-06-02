@@ -53,10 +53,10 @@ func (r *MySQLRepository) UpsertSession(ctx context.Context, session *Session) e
 	}
 	const query = `
 INSERT INTO collab_sessions (
-	id, tenant_id, resource_type, resource_id, user_id,
+	id, resource_type, resource_id, user_id,
 	status, lock_version, expires_at, metadata, created_at, updated_at, deleted_at, version)
 VALUES (
-	:id, :tenant_id, :resource_type, :resource_id, :user_id,
+	:id, :resource_type, :resource_id, :user_id,
 	:status, :lock_version, :expires_at, :metadata, :created_at, :updated_at, :deleted_at, :version)
 ON DUPLICATE KEY UPDATE
 	status = VALUES(status),
@@ -95,14 +95,13 @@ func (r *MySQLRepository) ListSessions(ctx context.Context, tenantID, resourceTy
 	const query = `
 SELECT *
 FROM collab_sessions
-WHERE tenant_id = ?
-	AND resource_type = ?
+WHERE resource_type = ?
 	AND resource_id = ?
 	AND deleted_at IS NULL
 ORDER BY updated_at DESC
 LIMIT ?`
 	var sessions []Session
-	if err := r.db.SelectContext(ctx, &sessions, query, tenantID, resourceType, resourceID, limitOrDefault(limit)); err != nil {
+	if err := r.db.SelectContext(ctx, &sessions, query, resourceType, resourceID, limitOrDefault(limit)); err != nil {
 		return nil, err
 	}
 	return sessions, nil
@@ -132,10 +131,10 @@ func (r *MySQLRepository) AcquireLock(ctx context.Context, lock *Lock) error {
 	}
 	const query = `
 INSERT INTO collab_locks (
-	id, tenant_id, resource_type, resource_id, session_id,
+	id, resource_type, resource_id, session_id,
 	status, acquired_at, expires_at, created_at, updated_at, deleted_at, version)
 VALUES (
-	:id, :tenant_id, :resource_type, :resource_id, :session_id,
+	:id, :resource_type, :resource_id, :session_id,
 	:status, :acquired_at, :expires_at, :created_at, :updated_at, :deleted_at, :version)`
 	if _, err := r.db.NamedExecContext(ctx, query, lock); err != nil {
 		if isDuplicateErr(err) {
@@ -162,8 +161,8 @@ func (r *MySQLRepository) ReleaseLockForResource(ctx context.Context, tenantID, 
 	_, err := r.db.ExecContext(ctx, `
 UPDATE collab_locks
 SET deleted_at = ?, status = 'released', updated_at = ?, version = version + 1
-WHERE tenant_id = ? AND resource_type = ? AND resource_id = ? AND session_id = ? AND deleted_at IS NULL`,
-		now, tenantID, resourceType, resourceID, sessionID)
+WHERE resource_type = ? AND resource_id = ? AND session_id = ? AND deleted_at IS NULL`,
+		now, resourceType, resourceID, sessionID)
 	return err
 }
 
@@ -172,12 +171,11 @@ func (r *MySQLRepository) ListLocks(ctx context.Context, tenantID, resourceType,
 	const query = `
 SELECT *
 FROM collab_locks
-WHERE tenant_id = ?
-	AND resource_type = ?
+WHERE resource_type = ?
 	AND resource_id = ?
 	AND deleted_at IS NULL`
 	var locks []Lock
-	if err := r.db.SelectContext(ctx, &locks, query, tenantID, resourceType, resourceID); err != nil {
+	if err := r.db.SelectContext(ctx, &locks, query, resourceType, resourceID); err != nil {
 		return nil, err
 	}
 	return locks, nil
@@ -190,10 +188,10 @@ func (r *MySQLRepository) CreateComment(ctx context.Context, comment *Comment) e
 	}
 	const query = `
 INSERT INTO collab_comments (
-	id, tenant_id, resource_type, resource_id, author_id,
+	id, resource_type, resource_id, author_id,
 	parent_id, body, status, created_at, updated_at, deleted_at, version)
 VALUES (
-	:id, :tenant_id, :resource_type, :resource_id, :author_id,
+	:id, :resource_type, :resource_id, :author_id,
 	:parent_id, :body, :status, :created_at, :updated_at, :deleted_at, :version)`
 	_, err := r.db.NamedExecContext(ctx, query, comment)
 	return err
@@ -204,14 +202,13 @@ func (r *MySQLRepository) ListComments(ctx context.Context, tenantID, resourceTy
 	const query = `
 SELECT *
 FROM collab_comments
-WHERE tenant_id = ?
-	AND resource_type = ?
+WHERE resource_type = ?
 	AND resource_id = ?
 	AND deleted_at IS NULL
 ORDER BY created_at ASC
 LIMIT ?`
 	var comments []Comment
-	if err := r.db.SelectContext(ctx, &comments, query, tenantID, resourceType, resourceID, limitOrDefault(limit)); err != nil {
+	if err := r.db.SelectContext(ctx, &comments, query, resourceType, resourceID, limitOrDefault(limit)); err != nil {
 		return nil, err
 	}
 	return comments, nil
@@ -224,10 +221,10 @@ func (r *MySQLRepository) CreateTask(ctx context.Context, task *Task) error {
 	}
 	const query = `
 INSERT INTO collab_tasks (
-	id, tenant_id, title, assignee_id, resource_type, resource_id,
+	id, title, assignee_id, resource_type, resource_id,
 	resource_ref, state, priority, due_at, created_at, updated_at, deleted_at, version)
 VALUES (
-	:id, :tenant_id, :title, :assignee_id, :resource_type, :resource_id,
+	:id, :title, :assignee_id, :resource_type, :resource_id,
 	:resource_ref, :state, :priority, :due_at, :created_at, :updated_at, :deleted_at, :version)`
 	_, err := r.db.NamedExecContext(ctx, query, task)
 	return err
@@ -248,14 +245,13 @@ func (r *MySQLRepository) ListTasks(ctx context.Context, tenantID, resourceType,
 	const query = `
 SELECT *
 FROM collab_tasks
-WHERE tenant_id = ?
-	AND resource_type = ?
+WHERE resource_type = ?
 	AND resource_id = ?
 	AND deleted_at IS NULL
 ORDER BY priority ASC, created_at ASC
 LIMIT ?`
 	var tasks []Task
-	if err := r.db.SelectContext(ctx, &tasks, query, tenantID, resourceType, resourceID, limitOrDefault(limit)); err != nil {
+	if err := r.db.SelectContext(ctx, &tasks, query, resourceType, resourceID, limitOrDefault(limit)); err != nil {
 		return nil, err
 	}
 	return tasks, nil
@@ -268,10 +264,10 @@ func (r *MySQLRepository) CreateApproval(ctx context.Context, approval *Approval
 	}
 	const query = `
 INSERT INTO collab_approvals (
-	id, tenant_id, workflow_id, stage, approver_id,
+	id, workflow_id, stage, approver_id,
 	decision, decided_at, comment, created_at, updated_at, deleted_at, version)
 VALUES (
-	:id, :tenant_id, :workflow_id, :stage, :approver_id,
+	:id, :workflow_id, :stage, :approver_id,
 	:decision, :decided_at, :comment, :created_at, :updated_at, :deleted_at, :version)`
 	_, err := r.db.NamedExecContext(ctx, query, approval)
 	return err
@@ -299,9 +295,9 @@ func (r *MySQLRepository) RecordEvent(ctx context.Context, event *Event) error {
 	}
 	const query = `
 INSERT INTO collab_events (
-	tenant_id, session_id, resource_type, resource_id, event_type, payload, created_at)
+	session_id, resource_type, resource_id, event_type, payload, created_at)
 VALUES (
-	:tenant_id, :session_id, :resource_type, :resource_id, :event_type, :payload, :created_at)`
+	:session_id, :resource_type, :resource_id, :event_type, :payload, :created_at)`
 	result, err := r.db.NamedExecContext(ctx, query, event)
 	if err != nil {
 		return err

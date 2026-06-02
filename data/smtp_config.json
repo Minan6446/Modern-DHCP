@@ -1,0 +1,8 @@
+{
+  "host": "smtp.qq.com",
+  "port": 587,
+  "username": "365399524@qq.com",
+  "password": "hanyynfdccfkbghc",
+  "from": "365399524@qq.com",
+  "useTLS": true
+}

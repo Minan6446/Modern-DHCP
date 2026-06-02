@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"modern-dhcp/internal/lease"
 	"modern-dhcp/pkg/models"
 )
 
@@ -31,12 +32,13 @@ var (
 
 // LeaseHistorySource exposes lease history retrieval for exports.
 type LeaseHistorySource interface {
-	History(ctx context.Context, tenantID string, filter models.LeaseHistoryFilter) ([]models.Lease, int, error)
+	History(ctx context.Context, scope lease.ResourceScope, filter models.LeaseHistoryFilter) ([]models.Lease, int, error)
 }
 
 // LeaseHistoryExportRequest describes an ad-hoc export payload.
 type LeaseHistoryExportRequest struct {
 	TenantID    string
+	Scope       lease.ResourceScope
 	Format      Format
 	Destination string
 	Filter      models.LeaseHistoryFilter
@@ -45,6 +47,7 @@ type LeaseHistoryExportRequest struct {
 // LeaseHistoryScheduleRequest configures a recurring history export.
 type LeaseHistoryScheduleRequest struct {
 	TenantID    string
+	Scope       lease.ResourceScope
 	Format      Format
 	Destination string
 	Filter      models.LeaseHistoryFilter
@@ -69,9 +72,6 @@ func (s *Service) ExportLeaseHistory(ctx context.Context, req LeaseHistoryExport
 	if s.renderer == nil {
 		return Artifact{}, ErrRendererUnavailable
 	}
-	if strings.TrimSpace(req.TenantID) == "" {
-		return Artifact{}, errors.New("reporting: tenantId required")
-	}
 	if s.exportPath == "" {
 		return Artifact{}, ErrExportPathUnavailable
 	}
@@ -79,16 +79,20 @@ func (s *Service) ExportLeaseHistory(ctx context.Context, req LeaseHistoryExport
 	if format == "" {
 		format = FormatCSV
 	}
+	normalizedScope, tenantID, err := normalizeTenantScope(req.Scope, req.TenantID)
+	if err != nil {
+		return Artifact{}, err
+	}
 	filter := normalizeHistoryFilter(req.Filter)
-	data, err := s.collectLeaseHistory(ctx, req.TenantID, filter)
+	data, err := s.collectLeaseHistory(ctx, normalizedScope, filter)
 	if err != nil {
 		return Artifact{}, err
 	}
-	artifact, err := s.renderer.RenderLeaseHistory(ctx, req.TenantID, data, format)
+	artifact, err := s.renderer.RenderLeaseHistory(ctx, tenantID, data, format)
 	if err != nil {
 		return Artifact{}, err
 	}
-	if err := s.persistArtifact(&artifact, req.TenantID, req.Destination); err != nil {
+	if err := s.persistArtifact(&artifact, tenantID, req.Destination); err != nil {
 		return Artifact{}, err
 	}
 	return artifact, nil
@@ -105,9 +109,9 @@ func (s *Service) ScheduleLeaseHistoryExport(req LeaseHistoryScheduleRequest) (E
 	if s.exportPath == "" {
 		return ExportJobSummary{}, ErrExportPathUnavailable
 	}
-	tenantID := strings.TrimSpace(req.TenantID)
-	if tenantID == "" {
-		return ExportJobSummary{}, errors.New("reporting: tenantId required")
+	normalizedScope, tenantID, err := normalizeTenantScope(req.Scope, req.TenantID)
+	if err != nil {
+		return ExportJobSummary{}, err
 	}
 	interval := req.Interval
 	if interval <= 0 {
@@ -118,8 +122,15 @@ func (s *Service) ScheduleLeaseHistoryExport(req LeaseHistoryScheduleRequest) (E
 		format = FormatCSV
 	}
 	job := &leaseHistoryJob{
-		id:      uuid.NewString(),
-		req:     LeaseHistoryScheduleRequest{TenantID: tenantID, Format: format, Destination: req.Destination, Filter: normalizeHistoryFilter(req.Filter), Interval: interval},
+		id: uuid.NewString(),
+		req: LeaseHistoryScheduleRequest{
+			TenantID:    tenantID,
+			Scope:       normalizedScope,
+			Format:      format,
+			Destination: req.Destination,
+			Filter:      normalizeHistoryFilter(req.Filter),
+			Interval:    interval,
+		},
 		service: s,
 		stopCh:  make(chan struct{}),
 		nextRun: time.Now().UTC().Add(interval),
@@ -152,8 +163,12 @@ func (s *Service) Close() {
 	}
 }
 
-func (s *Service) collectLeaseHistory(ctx context.Context, tenantID string, filter models.LeaseHistoryFilter) ([]models.Lease, error) {
-	batch, total, err := s.historySource.History(ctx, tenantID, filter)
+func (s *Service) collectLeaseHistory(ctx context.Context, scope lease.ResourceScope, filter models.LeaseHistoryFilter) ([]models.Lease, error) {
+	normalizedScope, _, err := normalizeTenantScope(scope, "")
+	if err != nil {
+		return nil, err
+	}
+	batch, total, err := s.historySource.History(ctx, normalizedScope, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +181,7 @@ func (s *Service) collectLeaseHistory(ctx context.Context, tenantID string, filt
 	for len(records) < total {
 		next := filter
 		next.Offset = offset
-		nextBatch, _, err := s.historySource.History(ctx, tenantID, next)
+		nextBatch, _, err := s.historySource.History(ctx, normalizedScope, next)
 		if err != nil {
 			return nil, err
 		}
@@ -257,6 +272,7 @@ func (s *Service) executeScheduledExport(job *leaseHistoryJob) {
 	defer cancel()
 	_, err := s.ExportLeaseHistory(ctx, LeaseHistoryExportRequest{
 		TenantID:    job.req.TenantID,
+		Scope:       job.req.Scope,
 		Format:      job.req.Format,
 		Destination: job.req.Destination,
 		Filter:      job.req.Filter,

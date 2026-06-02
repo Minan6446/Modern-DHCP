@@ -78,7 +78,7 @@ func (s *HTTPServer) handleSecurityPolicyList(svc *securitypolicy.Service) echo.
 		}
 		tenantID := strings.TrimSpace(c.Param("tenantId"))
 		if tenantID == "" {
-			return echo.NewHTTPError(http.StatusBadRequest, "tenantId is required")
+			tenantID = systemTenantID
 		}
 		rules, err := svc.List(c.Request().Context(), tenantID)
 		if err != nil {
@@ -98,7 +98,7 @@ func (s *HTTPServer) handleSecurityPolicyGet(svc *securitypolicy.Service) echo.H
 		}
 		tenantID := strings.TrimSpace(c.Param("tenantId"))
 		if tenantID == "" {
-			return echo.NewHTTPError(http.StatusBadRequest, "tenantId is required")
+			tenantID = systemTenantID
 		}
 		ruleID := strings.TrimSpace(c.Param("ruleId"))
 		if ruleID == "" {
@@ -122,7 +122,7 @@ func (s *HTTPServer) handleSecurityPolicyCreate(svc *securitypolicy.Service) ech
 		}
 		tenantID := strings.TrimSpace(c.Param("tenantId"))
 		if tenantID == "" {
-			return echo.NewHTTPError(http.StatusBadRequest, "tenantId is required")
+			tenantID = systemTenantID
 		}
 		spec, err := bindSecurityPolicySpec(c)
 		if err != nil {
@@ -158,7 +158,7 @@ func (s *HTTPServer) handleSecurityPolicyUpdate(svc *securitypolicy.Service) ech
 		}
 		tenantID := strings.TrimSpace(c.Param("tenantId"))
 		if tenantID == "" {
-			return echo.NewHTTPError(http.StatusBadRequest, "tenantId is required")
+			tenantID = systemTenantID
 		}
 		ruleID := strings.TrimSpace(c.Param("ruleId"))
 		if ruleID == "" {
@@ -198,7 +198,7 @@ func (s *HTTPServer) handleSecurityPolicyDelete(svc *securitypolicy.Service) ech
 		}
 		tenantID := strings.TrimSpace(c.Param("tenantId"))
 		if tenantID == "" {
-			return echo.NewHTTPError(http.StatusBadRequest, "tenantId is required")
+			tenantID = systemTenantID
 		}
 		ruleID := strings.TrimSpace(c.Param("ruleId"))
 		if ruleID == "" {

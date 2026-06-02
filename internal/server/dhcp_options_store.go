@@ -11,15 +11,19 @@ import (
 
 // dhcpOptionTemplate captures editable DHCP option metadata consumed by the UI.
 type dhcpOptionTemplate struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Code        int       `json:"code"`
-	Scope       string    `json:"scope"`
-	Format      string    `json:"format"`
-	Value       string    `json:"value"`
-	Description string    `json:"description"`
-	Tags        []string  `json:"tags"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Code          int       `json:"code"`
+	Scope         string    `json:"scope"`
+	Format        string    `json:"format"`
+	DataType      string    `json:"dataType,omitempty"`
+	Value         string    `json:"value"`
+	ValueExample  string    `json:"valueExample,omitempty"`
+	AllowedValues []string  `json:"allowedValues,omitempty"`
+	SampleValue   string    `json:"sampleValue,omitempty"`
+	Description   string    `json:"description"`
+	Tags          []string  `json:"tags"`
+	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
 // dhcpOptionStore keeps option templates in-memory for Phase 2 console workflows.
@@ -33,37 +37,43 @@ func newDHCPOptionStore() *dhcpOptionStore {
 	now := time.Now().UTC()
 	defaults := []dhcpOptionTemplate{
 		{
-			ID:          uuid.NewString(),
-			Name:        "Default Gateway",
-			Code:        3,
-			Scope:       "GLOBAL",
-			Format:      "ipv4",
-			Value:       "10.10.0.1",
-			Description: "Router option delivered to branch clients",
-			Tags:        []string{"core", "routing"},
-			UpdatedAt:   now,
+			ID:           uuid.NewString(),
+			Name:         "Default Gateway",
+			Code:         3,
+			Scope:        "GLOBAL",
+			Format:       "ipv4",
+			DataType:     "ip",
+			Value:        "10.10.0.1",
+			ValueExample: "10.10.0.1",
+			Description:  "Router option delivered to branch clients",
+			Tags:         []string{"core", "routing"},
+			UpdatedAt:    now,
 		},
 		{
-			ID:          uuid.NewString(),
-			Name:        "DNS Servers",
-			Code:        6,
-			Scope:       "GLOBAL",
-			Format:      "ipv4-list",
-			Value:       "10.10.0.53,10.10.0.54",
-			Description: "Primary/secondary DNS resolvers",
-			Tags:        []string{"dns", "prod"},
-			UpdatedAt:   now,
+			ID:           uuid.NewString(),
+			Name:         "DNS Servers",
+			Code:         6,
+			Scope:        "GLOBAL",
+			Format:       "ipv4-list",
+			DataType:     "ip-list",
+			Value:        "10.10.0.53,10.10.0.54",
+			ValueExample: "10.10.0.53,10.10.0.54",
+			Description:  "Primary/secondary DNS resolvers",
+			Tags:         []string{"dns", "prod"},
+			UpdatedAt:    now,
 		},
 		{
-			ID:          uuid.NewString(),
-			Name:        "Timezone",
-			Code:        2,
-			Scope:       "SITE",
-			Format:      "string",
-			Value:       "UTC+8",
-			Description: "East-Asia factory timezone broadcast",
-			Tags:        []string{"apac", "factory"},
-			UpdatedAt:   now,
+			ID:           uuid.NewString(),
+			Name:         "Timezone",
+			Code:         2,
+			Scope:        "SITE",
+			Format:       "string",
+			DataType:     "string",
+			Value:        "UTC+8",
+			ValueExample: "UTC+8",
+			Description:  "East-Asia factory timezone broadcast",
+			Tags:         []string{"apac", "factory"},
+			UpdatedAt:    now,
 		},
 	}
 	for _, opt := range defaults {

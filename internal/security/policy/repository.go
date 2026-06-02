@@ -37,12 +37,12 @@ func NewRepository(db *sqlx.DB) Repository {
 
 func (r *mysqlRepository) ListRules(ctx context.Context, tenantID string) ([]Rule, error) {
 	const query = `
-SELECT id, tenant_id, name, description, priority, effect, enabled, created_at, updated_at
+SELECT id, name, description, priority, effect, enabled, created_at, updated_at
 FROM security_policy_rules
-WHERE tenant_id = ?
+WHERE 1=1
 ORDER BY priority ASC, created_at ASC`
 	rows := make([]ruleRecord, 0)
-	if err := r.db.SelectContext(ctx, &rows, query, tenantID); err != nil {
+	if err := r.db.SelectContext(ctx, &rows, query); err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
@@ -67,12 +67,12 @@ ORDER BY priority ASC, created_at ASC`
 
 func (r *mysqlRepository) GetRule(ctx context.Context, tenantID, ruleID string) (*Rule, error) {
 	const query = `
-SELECT id, tenant_id, name, description, priority, effect, enabled, created_at, updated_at
+SELECT id, name, description, priority, effect, enabled, created_at, updated_at
 FROM security_policy_rules
-WHERE tenant_id = ? AND id = ?
+WHERE id = ?
 LIMIT 1`
 	var rec ruleRecord
-	if err := r.db.GetContext(ctx, &rec, query, tenantID, ruleID); err != nil {
+	if err := r.db.GetContext(ctx, &rec, query, ruleID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrRuleNotFound
 		}
@@ -98,12 +98,11 @@ func (r *mysqlRepository) CreateRule(ctx context.Context, rule *Rule) error {
 		return errors.New("security policy: id required")
 	}
 	const insertRule = `
-INSERT INTO security_policy_rules (id, tenant_id, name, description, priority, effect, enabled, created_at, updated_at)
-VALUES (:id, :tenant_id, :name, :description, :priority, :effect, :enabled, :created_at, :updated_at)`
+INSERT INTO security_policy_rules (id, name, description, priority, effect, enabled, created_at, updated_at)
+VALUES (:id, :name, :description, :priority, :effect, :enabled, :created_at, :updated_at)`
 	return dbutil.WithTx(ctx, r.db, func(tx *sqlx.Tx) error {
 		params := map[string]any{
 			"id":          rule.ID,
-			"tenant_id":   rule.TenantID,
 			"name":        rule.Name,
 			"description": rule.Description,
 			"priority":    rule.Priority,
@@ -132,12 +131,11 @@ SET name = :name,
     priority = :priority,
     effect = :effect,
     enabled = :enabled,
-    updated_at = :updated_at
-WHERE tenant_id = :tenant_id AND id = :id`
+	updated_at = :updated_at
+WHERE id = :id`
 	return dbutil.WithTx(ctx, r.db, func(tx *sqlx.Tx) error {
 		params := map[string]any{
 			"id":          rule.ID,
-			"tenant_id":   rule.TenantID,
 			"name":        rule.Name,
 			"description": rule.Description,
 			"priority":    rule.Priority,
@@ -153,7 +151,7 @@ WHERE tenant_id = :tenant_id AND id = :id`
 		if affected == 0 {
 			return ErrRuleNotFound
 		}
-		if err := r.deleteMatches(ctx, tx, rule.TenantID, rule.ID); err != nil {
+		if err := r.deleteMatches(ctx, tx, rule.ID); err != nil {
 			return err
 		}
 		return r.persistMatches(ctx, tx, rule)
@@ -161,12 +159,12 @@ WHERE tenant_id = :tenant_id AND id = :id`
 }
 
 func (r *mysqlRepository) DeleteRule(ctx context.Context, tenantID, ruleID string) error {
-	const deleteRule = `DELETE FROM security_policy_rules WHERE tenant_id = ? AND id = ?`
+	const deleteRule = `DELETE FROM security_policy_rules WHERE id = ?`
 	return dbutil.WithTx(ctx, r.db, func(tx *sqlx.Tx) error {
-		if err := r.deleteMatches(ctx, tx, tenantID, ruleID); err != nil {
+		if err := r.deleteMatches(ctx, tx, ruleID); err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, deleteRule, tenantID, ruleID)
+		res, err := tx.ExecContext(ctx, deleteRule, ruleID)
 		if err != nil {
 			return err
 		}
@@ -184,7 +182,7 @@ func (r *mysqlRepository) loadMatches(ctx context.Context, ruleIDs []string) (ma
 		return result, nil
 	}
 	query, args, err := sqlx.In(`
-SELECT id, rule_id, tenant_id, match_type, match_value, negate, created_at
+SELECT id, rule_id, match_type, match_value, negate, created_at
 FROM security_policy_matches
 WHERE rule_id IN (?)
 ORDER BY id ASC`, ruleIDs)
@@ -207,12 +205,11 @@ func (r *mysqlRepository) persistMatches(ctx context.Context, tx *sqlx.Tx, rule 
 		return nil
 	}
 	const insertMatch = `
-INSERT INTO security_policy_matches (rule_id, tenant_id, match_type, match_value, negate, created_at)
-VALUES (:rule_id, :tenant_id, :match_type, :match_value, :negate, :created_at)`
+INSERT INTO security_policy_matches (rule_id, match_type, match_value, negate, created_at)
+VALUES (:rule_id, :match_type, :match_value, :negate, :created_at)`
 	for _, match := range rule.Matches {
 		params := map[string]any{
 			"rule_id":     rule.ID,
-			"tenant_id":   rule.TenantID,
 			"match_type":  strings.ToLower(string(match.Type)),
 			"match_value": strings.TrimSpace(match.Value),
 			"negate":      boolToInt(match.Negate),
@@ -225,9 +222,9 @@ VALUES (:rule_id, :tenant_id, :match_type, :match_value, :negate, :created_at)`
 	return nil
 }
 
-func (r *mysqlRepository) deleteMatches(ctx context.Context, tx *sqlx.Tx, tenantID, ruleID string) error {
-	const deleteMatches = `DELETE FROM security_policy_matches WHERE tenant_id = ? AND rule_id = ?`
-	if _, err := tx.ExecContext(ctx, deleteMatches, tenantID, ruleID); err != nil {
+func (r *mysqlRepository) deleteMatches(ctx context.Context, tx *sqlx.Tx, ruleID string) error {
+	const deleteMatches = `DELETE FROM security_policy_matches WHERE rule_id = ?`
+	if _, err := tx.ExecContext(ctx, deleteMatches, ruleID); err != nil {
 		return err
 	}
 	return nil
@@ -235,7 +232,6 @@ func (r *mysqlRepository) deleteMatches(ctx context.Context, tx *sqlx.Tx, tenant
 
 type ruleRecord struct {
 	ID          string    `db:"id"`
-	TenantID    string    `db:"tenant_id"`
 	Name        string    `db:"name"`
 	Description string    `db:"description"`
 	Priority    int       `db:"priority"`
@@ -248,7 +244,6 @@ type ruleRecord struct {
 func (r ruleRecord) ToModel() Rule {
 	return Rule{
 		ID:          r.ID,
-		TenantID:    r.TenantID,
 		Name:        r.Name,
 		Description: r.Description,
 		Priority:    r.Priority,
@@ -262,7 +257,6 @@ func (r ruleRecord) ToModel() Rule {
 type matchRecord struct {
 	ID        uint64    `db:"id"`
 	RuleID    string    `db:"rule_id"`
-	TenantID  string    `db:"tenant_id"`
 	Type      string    `db:"match_type"`
 	Value     string    `db:"match_value"`
 	Negate    bool      `db:"negate"`
@@ -273,7 +267,6 @@ func (m matchRecord) ToModel() Match {
 	return Match{
 		ID:        m.ID,
 		RuleID:    m.RuleID,
-		TenantID:  m.TenantID,
 		Type:      MatchType(strings.ToLower(m.Type)),
 		Value:     m.Value,
 		Negate:    m.Negate,

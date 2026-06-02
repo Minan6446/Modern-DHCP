@@ -9,7 +9,6 @@ import (
 
 	"github.com/jmoiron/sqlx"
 
-	"modern-dhcp/internal/storage"
 	"modern-dhcp/pkg/models"
 )
 
@@ -24,10 +23,6 @@ type DeviceFilter struct {
 	Search     string
 	Limit      int
 	Offset     int
-}
-
-type tenantHandleProvider interface {
-	Handle(ctx context.Context, tenantID string) (storage.TenantHandle, error)
 }
 
 // Repository exposes persistence operations for the IoT registry.
@@ -46,49 +41,18 @@ type Repository interface {
 	DeleteProfile(ctx context.Context, tenantID, profileID string) error
 }
 
-// RepositoryOption customizes repository construction.
-type RepositoryOption func(*MySQLRepository)
-
-// WithTenantRouter wires the per-tenant router for dedicated schemas.
-func WithTenantRouter(router tenantHandleProvider) RepositoryOption {
-	return func(r *MySQLRepository) {
-		r.router = router
-	}
-}
-
 // MySQLRepository persists IoT registry state through sqlx.
 type MySQLRepository struct {
-	db     *sqlx.DB
-	router tenantHandleProvider
+	db *sqlx.DB
 }
 
 // NewRepository constructs a MySQL-backed IoT registry repository.
-func NewRepository(db *sqlx.DB, opts ...RepositoryOption) *MySQLRepository {
-	repo := &MySQLRepository{db: db}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(repo)
-		}
-	}
-	return repo
+func NewRepository(db *sqlx.DB) *MySQLRepository {
+	return &MySQLRepository{db: db}
 }
 
 func (r *MySQLRepository) tenantDB(ctx context.Context, tenantID string) (*sqlx.DB, error) {
-	if tenantID == "" || r.router == nil {
-		return r.db, nil
-	}
-	handle, err := r.router.Handle(ctx, tenantID)
-	if err != nil {
-		return nil, err
-	}
-	if handle.DB == nil {
-		return r.db, nil
-	}
-	db := handle.DB
-	if handle.Schema != "" {
-		db = storage.SchemaAware(db, handle.Schema)
-	}
-	return db, nil
+	return r.db, nil
 }
 
 // UpsertDevice creates or updates a device registration keyed by tenant/device-id.
@@ -99,12 +63,12 @@ func (r *MySQLRepository) UpsertDevice(ctx context.Context, device *models.IoTDe
 	}
 	_, err = db.NamedExecContext(ctx, `
 INSERT INTO iot_devices (
-    id, tenant_id, device_id, display_name, hardware_addr,
+	id, device_id, display_name, hardware_addr,
     profile_id, lease_profile_id, sleep_class, sleep_interval, offline_window,
     sleepy_hint, status, firmware_version, labels, metadata, last_seen,
     created_at, updated_at)
 VALUES (
-    :id, :tenant_id, :device_id, :display_name, :hardware_addr,
+	:id, :device_id, :display_name, :hardware_addr,
     :profile_id, :lease_profile_id, :sleep_class, :sleep_interval, :offline_window,
     :sleepy_hint, :status, :firmware_version, :labels, :metadata, :last_seen,
     :created_at, :updated_at)
@@ -128,13 +92,13 @@ ON DUPLICATE KEY UPDATE
 
 // GetDevice fetches a device by natural key.
 func (r *MySQLRepository) GetDevice(ctx context.Context, tenantID, deviceID string) (*models.IoTDevice, error) {
-	const query = `SELECT * FROM iot_devices WHERE tenant_id = ? AND device_id = ?`
+	const query = `SELECT * FROM iot_devices WHERE device_id = ?`
 	var device models.IoTDevice
 	db, err := r.tenantDB(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.GetContext(ctx, &device, query, tenantID, deviceID); err != nil {
+	if err := db.GetContext(ctx, &device, query, deviceID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -145,13 +109,13 @@ func (r *MySQLRepository) GetDevice(ctx context.Context, tenantID, deviceID stri
 
 // GetDeviceByID fetches a device by internal identifier.
 func (r *MySQLRepository) GetDeviceByID(ctx context.Context, tenantID, id string) (*models.IoTDevice, error) {
-	const query = `SELECT * FROM iot_devices WHERE tenant_id = ? AND id = ?`
+	const query = `SELECT * FROM iot_devices WHERE id = ?`
 	var device models.IoTDevice
 	db, err := r.tenantDB(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.GetContext(ctx, &device, query, tenantID, id); err != nil {
+	if err := db.GetContext(ctx, &device, query, id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -174,8 +138,7 @@ func (r *MySQLRepository) ListDevices(ctx context.Context, tenantID string, filt
 		builder strings.Builder
 		args    []any
 	)
-	builder.WriteString("SELECT * FROM iot_devices WHERE tenant_id = ?")
-	args = append(args, tenantID)
+	builder.WriteString("SELECT * FROM iot_devices WHERE 1=1")
 	if filter.Status != "" {
 		builder.WriteString(" AND status = ?")
 		args = append(args, filter.Status)
@@ -208,12 +171,12 @@ func (r *MySQLRepository) ListDevices(ctx context.Context, tenantID string, filt
 
 // DeleteDevice removes a registered device.
 func (r *MySQLRepository) DeleteDevice(ctx context.Context, tenantID, deviceID string) error {
-	const query = `DELETE FROM iot_devices WHERE tenant_id = ? AND device_id = ?`
+	const query = `DELETE FROM iot_devices WHERE device_id = ?`
 	db, err := r.tenantDB(ctx, tenantID)
 	if err != nil {
 		return err
 	}
-	res, err := db.ExecContext(ctx, query, tenantID, deviceID)
+	res, err := db.ExecContext(ctx, query, deviceID)
 	if err != nil {
 		return err
 	}
@@ -226,12 +189,12 @@ func (r *MySQLRepository) DeleteDevice(ctx context.Context, tenantID, deviceID s
 
 // RecordHeartbeat updates last-seen metadata for a device.
 func (r *MySQLRepository) RecordHeartbeat(ctx context.Context, tenantID, deviceID string, lastSeen time.Time, status string) error {
-	const query = `UPDATE iot_devices SET last_seen = ?, status = ?, updated_at = ? WHERE tenant_id = ? AND device_id = ?`
+	const query = `UPDATE iot_devices SET last_seen = ?, status = ?, updated_at = ? WHERE device_id = ?`
 	db, err := r.tenantDB(ctx, tenantID)
 	if err != nil {
 		return err
 	}
-	res, err := db.ExecContext(ctx, query, lastSeen, status, time.Now().UTC(), tenantID, deviceID)
+	res, err := db.ExecContext(ctx, query, lastSeen, status, time.Now().UTC(), deviceID)
 	if err != nil {
 		return err
 	}
@@ -249,11 +212,11 @@ func (r *MySQLRepository) CreateProfile(ctx context.Context, profile *models.IoT
 	}
 	_, err = db.NamedExecContext(ctx, `
 INSERT INTO iot_device_profiles (
-    id, tenant_id, name, description, sleep_class,
+	id, name, description, sleep_class,
     sleep_interval, offline_window, lease_profile_id,
     sleepy_capable, metadata, created_at, updated_at)
 VALUES (
-    :id, :tenant_id, :name, :description, :sleep_class,
+	:id, :name, :description, :sleep_class,
     :sleep_interval, :offline_window, :lease_profile_id,
     :sleepy_capable, :metadata, :created_at, :updated_at)`, profile)
 	return err
@@ -276,7 +239,7 @@ UPDATE iot_device_profiles SET
     sleepy_capable = :sleepy_capable,
     metadata = :metadata,
     updated_at = :updated_at
-WHERE id = :id AND tenant_id = :tenant_id`, profile)
+WHERE id = :id`, profile)
 	if err != nil {
 		return err
 	}
@@ -288,13 +251,13 @@ WHERE id = :id AND tenant_id = :tenant_id`, profile)
 
 // GetProfile fetches a profile by id.
 func (r *MySQLRepository) GetProfile(ctx context.Context, tenantID, profileID string) (*models.IoTDeviceProfile, error) {
-	const query = `SELECT * FROM iot_device_profiles WHERE tenant_id = ? AND id = ?`
+	const query = `SELECT * FROM iot_device_profiles WHERE id = ?`
 	var profile models.IoTDeviceProfile
 	db, err := r.tenantDB(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.GetContext(ctx, &profile, query, tenantID, profileID); err != nil {
+	if err := db.GetContext(ctx, &profile, query, profileID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -305,13 +268,13 @@ func (r *MySQLRepository) GetProfile(ctx context.Context, tenantID, profileID st
 
 // ListProfiles returns all profiles for a tenant.
 func (r *MySQLRepository) ListProfiles(ctx context.Context, tenantID string) ([]models.IoTDeviceProfile, error) {
-	const query = `SELECT * FROM iot_device_profiles WHERE tenant_id = ? ORDER BY updated_at DESC`
+	const query = `SELECT * FROM iot_device_profiles ORDER BY updated_at DESC`
 	db, err := r.tenantDB(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
 	var profiles []models.IoTDeviceProfile
-	if err := db.SelectContext(ctx, &profiles, query, tenantID); err != nil {
+	if err := db.SelectContext(ctx, &profiles, query); err != nil {
 		return nil, err
 	}
 	return profiles, nil
@@ -319,12 +282,12 @@ func (r *MySQLRepository) ListProfiles(ctx context.Context, tenantID string) ([]
 
 // DeleteProfile removes a profile definition.
 func (r *MySQLRepository) DeleteProfile(ctx context.Context, tenantID, profileID string) error {
-	const query = `DELETE FROM iot_device_profiles WHERE tenant_id = ? AND id = ?`
+	const query = `DELETE FROM iot_device_profiles WHERE id = ?`
 	db, err := r.tenantDB(ctx, tenantID)
 	if err != nil {
 		return err
 	}
-	res, err := db.ExecContext(ctx, query, tenantID, profileID)
+	res, err := db.ExecContext(ctx, query, profileID)
 	if err != nil {
 		return err
 	}

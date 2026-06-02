@@ -4,18 +4,25 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/juju/ratelimit"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.uber.org/zap"
 
+	dhcpv6fsm "modern-dhcp/internal/dhcpv6/leasefsm"
 	"modern-dhcp/internal/lease"
 	"modern-dhcp/internal/relay"
+	"modern-dhcp/pkg/models"
 )
 
 // Options configures the DHCPv6 UDP server.
@@ -24,10 +31,20 @@ type Options struct {
 	Port              int
 	TenantID          string
 	ServerID          []byte
+	RateLimitPPS      int
+	RelayWhitelist    []string
+	ClusterServerIDs  []string
 	ReadTimeout       time.Duration
 	PreferredLifetime time.Duration
 	ValidLifetime     time.Duration
 	Partitioner       *relay.Partitioner
+}
+
+type packetMiddleware func(ctx context.Context, msg *Message, pkt Packet, remote *net.UDPAddr) bool
+
+type rogueAdvertiseEvent struct {
+	Remote   string
+	ServerID string
 }
 
 // Server handles DHCPv6 UDP traffic and delegates to the handler.
@@ -37,10 +54,33 @@ type Server struct {
 	logger      *zap.Logger
 	serverID    []byte
 	partitioner *relay.Partitioner
+	relayAllow  map[string]struct{}
+	rateLimiter *dhcpv6IdentityRateLimiter
+	middleware  []packetMiddleware
+	rogueAllow  map[string]struct{}
+	rogueEvents chan rogueAdvertiseEvent
+
+	initMu               sync.Mutex
+	securityInitialized  bool
+	rogueDetectorStarted bool
 
 	mu   sync.Mutex
 	conn *net.UDPConn
+
+	fsmMu     sync.Mutex
+	leaseFSMs map[string]dhcpv6fsm.State
 }
+
+var (
+	dhcpv6PacketRateLimitedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "dhcpv6_packet_rate_limited_total",
+		Help: "Count of DHCPv6 packets dropped due to per-identity rate limiting",
+	})
+	dhcpv6RogueServerDetectedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "dhcpv6_rogue_server_detected_total",
+		Help: "Count of rogue DHCPv6 server Advertise packets detected",
+	})
+)
 
 // NewServer creates a DHCPv6 server instance.
 func NewServer(opts Options, handler *Handler, logger *zap.Logger) *Server {
@@ -50,11 +90,19 @@ func NewServer(opts Options, handler *Handler, logger *zap.Logger) *Server {
 	if opts.ReadTimeout == 0 {
 		opts.ReadTimeout = 5 * time.Second
 	}
+	if opts.RateLimitPPS <= 0 {
+		opts.RateLimitPPS = 10
+	}
 	serverID := opts.ServerID
 	if len(serverID) == 0 {
 		serverID = generateServerDUID()
 	}
-	return &Server{opts: opts, handler: handler, logger: logger, serverID: serverID, partitioner: opts.Partitioner}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	srv := &Server{opts: opts, handler: handler, logger: logger, serverID: serverID, partitioner: opts.Partitioner, relayAllow: normalizeRelayWhitelist(opts.RelayWhitelist), leaseFSMs: make(map[string]dhcpv6fsm.State)}
+	srv.initializeSecurityPipelines(nil)
+	return srv
 }
 
 // ListenAndServe starts processing DHCPv6 packets until the context is canceled.
@@ -62,6 +110,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if s.handler == nil {
 		return errors.New("dhcpv6: handler is nil")
 	}
+	s.initializeSecurityPipelines(ctx)
 
 	addr := &net.UDPAddr{IP: net.ParseIP(s.opts.BindAddress), Port: s.opts.Port}
 	if addr.IP == nil {
@@ -125,6 +174,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) processDatagram(ctx context.Context, data []byte, addr *net.UDPAddr) {
+	s.initializeSecurityPipelines(nil)
 	msg, err := ParseMessage(data)
 	if err != nil {
 		s.logger.Debug("dhcpv6 parse failed", zap.Error(err))
@@ -136,14 +186,74 @@ func (s *Server) processDatagram(ctx context.Context, data []byte, addr *net.UDP
 		s.logger.Debug("dhcpv6 packet conversion failed", zap.Error(err))
 		return
 	}
+	if len(msg.RelayHops) > 0 {
+		hopChain := relayHopChain(msg.RelayHops)
+		if s.logger != nil {
+			s.logger.Debug("dhcpv6 relay hop chain", zap.Int("hopCount", len(msg.RelayHops)), zap.Any("relayHopChain", hopChain))
+		}
+		if !s.isRelaySourceAllowed(pkt.LinkAddr) {
+			if s.logger != nil {
+				s.logger.Error("dhcpv6 relay source rejected", zap.String("linkAddr", ipString(pkt.LinkAddr)), zap.String("peerAddr", ipString(pkt.PeerAddr)), zap.String("remoteAddr", ipString(addr.IP)), zap.Any("relayHopChain", hopChain))
+			}
+			return
+		}
+	}
 	if !s.shouldHandleRelay(pkt) {
+		return
+	}
+	if !s.applyMiddleware(ctx, msg, pkt, addr) {
+		return
+	}
+	clientKey := leaseFSMClientKey(pkt)
+	if err := s.applyFSMPreTransition(clientKey, msg.MessageType); err != nil {
+		s.logger.Warn("dhcpv6 lease fsm pre-transition rejected", zap.String("clientKey", clientKey), zap.Uint8("messageType", msg.MessageType), zap.Error(err))
 		return
 	}
 
 	var result *lease.Result
 	switch msg.MessageType {
+	case MessageTypeSolicit:
+		var handleErr error
+		result, handleErr = s.handler.HandleSolicit(ctx, s.opts.TenantID, pkt)
+		if handleErr != nil {
+			if s.trySendNACK(msg, pkt, msg.MessageType, handleErr, addr) {
+				return
+			}
+			s.logger.Warn("dhcpv6 solicit handling failed", zap.Error(handleErr))
+			return
+		}
 	case MessageTypeInformationReq:
 		// stateless reply
+	case MessageTypeConfirm:
+		var handleErr error
+		result, handleErr = s.handler.HandleConfirm(ctx, s.opts.TenantID, pkt)
+		if handleErr != nil {
+			if s.trySendNACK(msg, pkt, msg.MessageType, handleErr, addr) {
+				return
+			}
+			s.logger.Warn("dhcpv6 confirm handling failed", zap.Error(handleErr))
+			return
+		}
+	case MessageTypeRenew:
+		var handleErr error
+		result, handleErr = s.handler.HandleRenew(ctx, s.opts.TenantID, pkt)
+		if handleErr != nil {
+			if s.trySendNACK(msg, pkt, msg.MessageType, handleErr, addr) {
+				return
+			}
+			s.logger.Warn("dhcpv6 renew handling failed", zap.Error(handleErr))
+			return
+		}
+	case MessageTypeRebind:
+		var handleErr error
+		result, handleErr = s.handler.HandleRebind(ctx, s.opts.TenantID, pkt)
+		if handleErr != nil {
+			if s.trySendNACK(msg, pkt, msg.MessageType, handleErr, addr) {
+				return
+			}
+			s.logger.Warn("dhcpv6 rebind handling failed", zap.Error(handleErr))
+			return
+		}
 	case MessageTypeRelease:
 		if err := s.handler.HandleRelease(ctx, s.opts.TenantID, pkt); err != nil {
 			s.logger.Warn("dhcpv6 release handling failed", zap.Error(err))
@@ -158,9 +268,16 @@ func (s *Server) processDatagram(ctx context.Context, data []byte, addr *net.UDP
 		var handleErr error
 		result, handleErr = s.handler.HandleRequest(ctx, s.opts.TenantID, pkt)
 		if handleErr != nil {
+			if s.trySendNACK(msg, pkt, msg.MessageType, handleErr, addr) {
+				return
+			}
 			s.logger.Warn("dhcpv6 handler error", zap.Error(handleErr))
 			return
 		}
+	}
+	if err := s.applyFSMSuccessTransition(clientKey, msg.MessageType); err != nil {
+		s.logger.Warn("dhcpv6 lease fsm success transition rejected", zap.String("clientKey", clientKey), zap.Uint8("messageType", msg.MessageType), zap.Error(err))
+		return
 	}
 
 	replyType := responseType(msg.MessageType)
@@ -175,6 +292,204 @@ func (s *Server) processDatagram(ctx context.Context, data []byte, addr *net.UDP
 	}
 
 	s.sendResponse(resp, addr)
+}
+
+func (s *Server) trySendNACK(req *Message, pkt Packet, reqType byte, err error, addr *net.UDPAddr) bool {
+	if err == nil {
+		return false
+	}
+	var nackErr *NACKError
+	if !errors.As(err, &nackErr) {
+		return false
+	}
+	respType := responseType(reqType)
+	if respType == 0 {
+		return true
+	}
+	result := zeroLifetimeConfirmResult(pkt)
+	resp, buildErr := s.buildResponse(req, pkt, result, respType, reqType)
+	if buildErr != nil {
+		s.logger.Warn("dhcpv6 nack response build failed", zap.Error(buildErr))
+		return true
+	}
+	s.logger.Info("dhcpv6 nack sent", zap.String("reason", nackErr.Error()))
+	s.sendResponse(resp, addr)
+	return true
+}
+
+func (s *Server) initializeSecurityPipelines(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	s.initMu.Lock()
+	defer s.initMu.Unlock()
+	if !s.securityInitialized {
+		s.rateLimiter = dhcpv6NewIdentityRateLimiter(s.opts.RateLimitPPS)
+		s.rogueAllow = normalizeServerIDSet(s.opts.ClusterServerIDs, s.serverID)
+		s.rogueEvents = make(chan rogueAdvertiseEvent, 128)
+		s.middleware = []packetMiddleware{
+			s.rateLimitMiddleware(),
+			s.rogueDetectMiddleware(),
+		}
+		s.securityInitialized = true
+	}
+	if ctx != nil && !s.rogueDetectorStarted {
+		s.rogueDetectorStarted = true
+		go s.runRogueDetector(ctx)
+	}
+}
+
+func (s *Server) applyMiddleware(ctx context.Context, msg *Message, pkt Packet, remote *net.UDPAddr) bool {
+	for i := range s.middleware {
+		if !s.middleware[i](ctx, msg, pkt, remote) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) rateLimitMiddleware() packetMiddleware {
+	return func(_ context.Context, msg *Message, pkt Packet, remote *net.UDPAddr) bool {
+		identity := packetIdentityKey(pkt)
+		if identity == "" {
+			identity = messageClientIDKey(msg)
+		}
+		if identity == "" || s.rateLimiter.allow(identity) {
+			return true
+		}
+		dhcpv6PacketRateLimitedTotal.Inc()
+		if s.logger != nil {
+			s.logger.Warn("dhcpv6 packet rate limit exceeded; dropping packet",
+				zap.String("identity", identity),
+				zap.String("remote", udpAddrString(remote)),
+				zap.Uint8("messageType", msg.MessageType),
+			)
+		}
+		return false
+	}
+}
+
+func (s *Server) rogueDetectMiddleware() packetMiddleware {
+	return func(_ context.Context, msg *Message, _ Packet, remote *net.UDPAddr) bool {
+		if msg == nil || msg.MessageType != MessageTypeAdvertise {
+			return true
+		}
+		serverID := canonicalServerID(msg.Option(OptionServerID))
+		if serverID == "" {
+			return false
+		}
+		if _, ok := s.rogueAllow[serverID]; ok {
+			return false
+		}
+		dhcpv6RogueServerDetectedTotal.Inc()
+		evt := rogueAdvertiseEvent{Remote: udpAddrString(remote), ServerID: serverID}
+		if s.rogueEvents != nil {
+			select {
+			case s.rogueEvents <- evt:
+			default:
+			}
+		}
+		if s.logger != nil {
+			s.logger.Error("rogue dhcpv6 advertise detected", zap.String("remote", evt.Remote), zap.String("serverId", evt.ServerID))
+		}
+		return false
+	}
+}
+
+func (s *Server) runRogueDetector(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt := <-s.rogueEvents:
+			if s.logger != nil {
+				s.logger.Debug("dhcpv6 rogue detector event", zap.String("remote", evt.Remote), zap.String("serverId", evt.ServerID))
+			}
+		}
+	}
+}
+
+func canonicalServerID(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	return strings.ToLower(hex.EncodeToString(raw))
+}
+
+func normalizeServerIDSet(clusterServerIDs []string, selfServerID []byte) map[string]struct{} {
+	out := make(map[string]struct{}, len(clusterServerIDs)+1)
+	if self := canonicalServerID(selfServerID); self != "" {
+		out[self] = struct{}{}
+	}
+	for _, raw := range clusterServerIDs {
+		trimmed := strings.TrimSpace(strings.ToLower(raw))
+		if trimmed == "" {
+			continue
+		}
+		if decoded, err := hex.DecodeString(trimmed); err == nil {
+			if normalized := canonicalServerID(decoded); normalized != "" {
+				out[normalized] = struct{}{}
+			}
+			continue
+		}
+		out[trimmed] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+type dhcpv6IdentityRateLimiter struct {
+	pps     int64
+	buckets map[string]*ratelimit.Bucket
+	mu      sync.Mutex
+}
+
+func dhcpv6NewIdentityRateLimiter(pps int) *dhcpv6IdentityRateLimiter {
+	if pps <= 0 {
+		pps = 10
+	}
+	return &dhcpv6IdentityRateLimiter{pps: int64(pps), buckets: make(map[string]*ratelimit.Bucket, 256)}
+}
+
+func (l *dhcpv6IdentityRateLimiter) allow(key string) bool {
+	if l == nil {
+		return true
+	}
+	key = strings.TrimSpace(strings.ToLower(key))
+	if key == "" {
+		return true
+	}
+	l.mu.Lock()
+	bucket, ok := l.buckets[key]
+	if !ok {
+		bucket = ratelimit.NewBucketWithRate(float64(l.pps), l.pps)
+		l.buckets[key] = bucket
+	}
+	l.mu.Unlock()
+	return bucket.TakeAvailable(1) == 1
+}
+
+func packetIdentityKey(pkt Packet) string {
+	if duid := strings.TrimSpace(strings.ToLower(pkt.DUID)); duid != "" {
+		return "duid:" + duid
+	}
+	if len(pkt.ClientMAC) > 0 {
+		return "mac:" + strings.ToLower(pkt.ClientMAC.String())
+	}
+	return ""
+}
+
+func messageClientIDKey(msg *Message) string {
+	if msg == nil {
+		return ""
+	}
+	clientID := msg.Option(OptionClientID)
+	if len(clientID) == 0 {
+		return ""
+	}
+	return "duid:" + strings.ToLower(hex.EncodeToString(clientID))
 }
 
 func responseType(msgType byte) byte {
@@ -196,6 +511,27 @@ func (s *Server) buildResponse(req *Message, pkt Packet, result *lease.Result, m
 	options = appendOption(options, OptionServerID, s.serverID)
 	if msgType == MessageTypeAdvertise {
 		options = appendOption(options, OptionPreference, []byte{0x40})
+	}
+
+	// RFC 3646 section 3: DNS Recursive Name Server option.
+	if dnsPayload := encodeIPv6AddressListOption(s.responseDNSServers(result, pkt)); len(dnsPayload) > 0 {
+		options = appendOption(options, OptionDNSRecursiveNameServer, dnsPayload)
+	}
+	// RFC 3646 section 4: Domain Search List option.
+	if domainPayload, err := encodeDomainSearchListOption(s.responseDomainSearchList(result, pkt)); err != nil {
+		s.logger.Warn("dhcpv6 domain search list encode failed", zap.Error(err))
+	} else if len(domainPayload) > 0 {
+		options = appendOption(options, OptionDomainSearchList, domainPayload)
+	}
+	// RFC 4704 section 4.1: Client FQDN option.
+	if fqdnPayload, err := encodeFQDNOption(s.responseFQDN(result, pkt)); err != nil {
+		s.logger.Warn("dhcpv6 fqdn encode failed", zap.Error(err))
+	} else if len(fqdnPayload) > 0 {
+		options = appendOption(options, OptionFQDN, fqdnPayload)
+	}
+	// RFC 5908 section 4: NTP Server option.
+	if ntpPayload := encodeNTPServerOption(s.responseNTPServers(result, pkt)); len(ntpPayload) > 0 {
+		options = appendOption(options, OptionNTPServer, ntpPayload)
 	}
 
 	if reqType == MessageTypeInformationReq {
@@ -226,6 +562,10 @@ func (s *Server) buildResponse(req *Message, pkt Packet, result *lease.Result, m
 
 		preferred := secondsValue(result.Profile.DefaultDuration, s.opts.PreferredLifetime, time.Hour)
 		valid := secondsValue(result.Profile.MaxDuration, s.opts.ValidLifetime, time.Duration(preferred)*2*time.Second)
+		if reqType == MessageTypeConfirm && result.Profile.DefaultDuration <= 0 && result.Profile.MaxDuration <= 0 {
+			preferred = 0
+			valid = 0
+		}
 		if valid < preferred {
 			valid = preferred
 		}
@@ -237,7 +577,7 @@ func (s *Server) buildResponse(req *Message, pkt Packet, result *lease.Result, m
 		if len(result.PrefixDelegations) > 0 {
 			for i := range result.PrefixDelegations {
 				pd := result.PrefixDelegations[i]
-				pdPayload, err := encodeIAPDOption(&pd, t1, t2, preferred, valid)
+				pdPayload, err := encodeIAPDOption(&pd, result.Pool, t1, t2, preferred, valid)
 				if err != nil {
 					return nil, err
 				}
@@ -288,11 +628,15 @@ func encodeIANA(iaid uint32, t1, t2 uint32, addr net.IP, preferred, valid uint32
 	return append(body, iaAddr...)
 }
 
-func encodeIAPDOption(pd *lease.PrefixDelegation, t1, t2, defaultPreferred, defaultValid uint32) ([]byte, error) {
+func encodeIAPDOption(pd *lease.PrefixDelegation, poolObj *models.AddressPool, t1, t2, defaultPreferred, defaultValid uint32) ([]byte, error) {
 	if pd == nil {
 		return nil, errors.New("dhcpv6: missing prefix delegation info")
 	}
-	prefix, err := netip.ParsePrefix(pd.Prefix)
+	prefixValue := strings.TrimSpace(pd.Prefix)
+	if prefixValue == "" && poolObj != nil {
+		prefixValue = strings.TrimSpace(poolObj.CIDR)
+	}
+	prefix, err := netip.ParsePrefix(prefixValue)
 	if err != nil {
 		return nil, fmt.Errorf("dhcpv6: invalid delegated prefix: %w", err)
 	}
@@ -412,6 +756,82 @@ func (s *Server) shouldHandleRelay(pkt Packet) bool {
 	return false
 }
 
+func (s *Server) isRelaySourceAllowed(linkAddr net.IP) bool {
+	if len(s.relayAllow) == 0 {
+		return true
+	}
+	key := normalizeIPv6Address(linkAddr)
+	if key == "" {
+		return false
+	}
+	_, ok := s.relayAllow[key]
+	return ok
+}
+
+func normalizeRelayWhitelist(raw []string) map[string]struct{} {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(raw))
+	for _, value := range raw {
+		if normalized := normalizeIPv6Address(net.ParseIP(strings.TrimSpace(value))); normalized != "" {
+			out[normalized] = struct{}{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func normalizeIPv6Address(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok || !addr.Is6() {
+		return ""
+	}
+	return addr.Unmap().String()
+}
+
+func ipString(ip net.IP) string {
+	if normalized := normalizeIPv6Address(ip); normalized != "" {
+		return normalized
+	}
+	if ip == nil {
+		return ""
+	}
+	return strings.TrimSpace(ip.String())
+}
+
+func udpAddrString(addr *net.UDPAddr) string {
+	if addr == nil {
+		return ""
+	}
+	return strings.TrimSpace(addr.String())
+}
+
+func relayHopChain(hops []RelayHop) []map[string]any {
+	if len(hops) == 0 {
+		return nil
+	}
+	chain := make([]map[string]any, 0, len(hops))
+	for idx := range hops {
+		entry := map[string]any{
+			"index":    idx,
+			"hopCount": hops[idx].HopCount,
+			"linkAddr": ipString(hops[idx].LinkAddr),
+			"peerAddr": ipString(hops[idx].PeerAddr),
+		}
+		if attrs := relayHopAttributes(hops[idx]); len(attrs) > 0 {
+			entry["attributes"] = attrs
+		}
+		chain = append(chain, entry)
+	}
+	return chain
+}
+
 func generateServerDUID() []byte {
 	duid := make([]byte, 14)
 	binary.BigEndian.PutUint16(duid[0:2], 1) // DUID-LLT
@@ -448,4 +868,105 @@ func clampSeconds(d time.Duration) uint32 {
 		return math.MaxUint32
 	}
 	return uint32(secs)
+}
+
+func leaseFSMClientKey(pkt Packet) string {
+	if id := strings.TrimSpace(pkt.DUID); id != "" {
+		return "duid:" + id
+	}
+	if len(pkt.ClientMAC) > 0 {
+		return "mac:" + strings.ToLower(pkt.ClientMAC.String())
+	}
+	return ""
+}
+
+func (s *Server) applyFSMPreTransition(clientKey string, msgType byte) error {
+	if clientKey == "" {
+		return nil
+	}
+	switch msgType {
+	case MessageTypeRenew:
+		return s.transitionLeaseState(clientKey, dhcpv6fsm.LeaseStateRenewing)
+	case MessageTypeRebind:
+		return s.transitionLeaseState(clientKey, dhcpv6fsm.LeaseStateRebinding)
+	default:
+		return nil
+	}
+}
+
+func (s *Server) applyFSMSuccessTransition(clientKey string, msgType byte) error {
+	if clientKey == "" {
+		return nil
+	}
+	switch msgType {
+	case MessageTypeSolicit:
+		return s.transitionLeaseState(clientKey, dhcpv6fsm.LeaseStateOffered)
+	case MessageTypeRequest, MessageTypeConfirm, MessageTypeRenew, MessageTypeRebind:
+		return s.transitionLeaseState(clientKey, dhcpv6fsm.LeaseStateBound)
+	case MessageTypeDecline:
+		return s.transitionLeaseState(clientKey, dhcpv6fsm.LeaseStateExpired)
+	case MessageTypeRelease:
+		return s.transitionLeaseState(clientKey, dhcpv6fsm.LeaseStateReleased)
+	default:
+		return nil
+	}
+}
+
+func (s *Server) transitionLeaseState(clientKey string, target dhcpv6fsm.State) error {
+	s.fsmMu.Lock()
+	defer s.fsmMu.Unlock()
+	current := s.leaseFSMs[clientKey]
+	if current == "" {
+		current = dhcpv6fsm.LeaseStateInit
+	}
+	if err := dhcpv6fsm.ValidateTransition(current, target); err != nil {
+		return err
+	}
+	if current == target {
+		return nil
+	}
+	s.leaseFSMs[clientKey] = target
+	if s.logger != nil {
+		s.logger.Debug("dhcpv6 lease fsm state changed", zap.String("clientKey", clientKey), zap.String("from", string(current)), zap.String("to", string(target)))
+	}
+	return nil
+}
+
+func (s *Server) responseDNSServers(result *lease.Result, pkt Packet) []net.IP {
+	servers := make([]net.IP, 0)
+	if result != nil && result.Pool != nil {
+		for _, raw := range result.Pool.DNS {
+			parsed := net.ParseIP(string(raw))
+			if parsed == nil || parsed.To16() == nil || parsed.To4() != nil {
+				s.logger.Warn("dhcpv6 dns server ignored: invalid IPv6", zap.String("value", string(raw)))
+				continue
+			}
+			servers = append(servers, append(net.IP(nil), parsed.To16()...))
+		}
+	}
+	if len(servers) > 0 {
+		return servers
+	}
+	if len(pkt.DNSRecursiveServers) > 0 {
+		return append([]net.IP(nil), pkt.DNSRecursiveServers...)
+	}
+	return nil
+}
+
+func (s *Server) responseDomainSearchList(_ *lease.Result, pkt Packet) []string {
+	if len(pkt.DomainSearchList) == 0 {
+		return nil
+	}
+	return append([]string(nil), pkt.DomainSearchList...)
+}
+
+func (s *Server) responseFQDN(_ *lease.Result, pkt Packet) string {
+	return pkt.FQDN
+}
+
+func (s *Server) responseNTPServers(_ *lease.Result, pkt Packet) []net.IP {
+	if len(pkt.NTPServers) == 0 {
+		return nil
+	}
+	return append([]net.IP(nil), pkt.NTPServers...)
 }

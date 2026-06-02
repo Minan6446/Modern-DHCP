@@ -16,7 +16,6 @@ var (
 // Session captures realtime editing presence for a resource.
 type Session struct {
 	ID           string          `db:"id" json:"id"`
-	TenantID     string          `db:"tenant_id" json:"tenantId"`
 	ResourceType string          `db:"resource_type" json:"resourceType"`
 	ResourceID   string          `db:"resource_id" json:"resourceId"`
 	UserID       string          `db:"user_id" json:"userId"`
@@ -33,7 +32,6 @@ type Session struct {
 // Lock enforces optimistic edits per resource.
 type Lock struct {
 	ID           string     `db:"id" json:"id"`
-	TenantID     string     `db:"tenant_id" json:"tenantId"`
 	ResourceType string     `db:"resource_type" json:"resourceType"`
 	ResourceID   string     `db:"resource_id" json:"resourceId"`
 	SessionID    string     `db:"session_id" json:"sessionId"`
@@ -49,7 +47,6 @@ type Lock struct {
 // Comment attaches threaded collaboration to resources.
 type Comment struct {
 	ID           string     `db:"id" json:"id"`
-	TenantID     string     `db:"tenant_id" json:"tenantId"`
 	ResourceType string     `db:"resource_type" json:"resourceType"`
 	ResourceID   string     `db:"resource_id" json:"resourceId"`
 	AuthorID     string     `db:"author_id" json:"authorId"`
@@ -65,7 +62,6 @@ type Comment struct {
 // Task coordinates assignments tied to a resource.
 type Task struct {
 	ID           string          `db:"id" json:"id"`
-	TenantID     string          `db:"tenant_id" json:"tenantId"`
 	Title        string          `db:"title" json:"title"`
 	AssigneeID   *string         `db:"assignee_id" json:"assigneeId,omitempty"`
 	ResourceType string          `db:"resource_type" json:"resourceType"`
@@ -83,7 +79,6 @@ type Task struct {
 // Approval documents workflow decisions for change requests.
 type Approval struct {
 	ID         string     `db:"id" json:"id"`
-	TenantID   string     `db:"tenant_id" json:"tenantId"`
 	WorkflowID string     `db:"workflow_id" json:"workflowId"`
 	Stage      int        `db:"stage" json:"stage"`
 	ApproverID string     `db:"approver_id" json:"approverId"`
@@ -99,7 +94,6 @@ type Approval struct {
 // Event is an append-only record emitted by the collaboration hub.
 type Event struct {
 	ID           int64           `db:"id" json:"id"`
-	TenantID     string          `db:"tenant_id" json:"tenantId"`
 	SessionID    *string         `db:"session_id" json:"sessionId,omitempty"`
 	ResourceType *string         `db:"resource_type" json:"resourceType,omitempty"`
 	ResourceID   *string         `db:"resource_id" json:"resourceId,omitempty"`

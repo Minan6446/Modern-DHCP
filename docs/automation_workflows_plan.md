@@ -1,81 +1,42 @@
-# Phase 2 Automation Workflows & UI Tooling Plan
+# 自动化与审批工作流计划
 
-## Objectives
-- Provide tenant-aware automation so inventory sync, policy audits, security scans, and alert fanout can be orchestrated without manual CLI usage.
-- Expose clear operator and tenant-admin controls in the Modern DHCP UI to schedule, pause, and inspect automation jobs.
-- Integrate automation state with notifications so alerting upgrades can reuse fanout workflows with minimal duplication.
-- Ensure every workflow is observable (metrics + logs) and auditable, aligning with Phase 2 multi-tenant access controls.
+本文件概述自动化模块的职责、任务生命周期、审批流与可观测性需求。
 
-## Current Baseline
-- `internal/automation` offers an in-memory scheduler (`Scheduler`), recurring schedules (`Service`), predefined `JobType` constants, and a `NotificationFanoutHandler` that bridges to `internal/notifications`.
-- No persistent queue or job history; runtime state is limited to `Snapshot()` diagnostics.
-- Config lacks declarative schedule definitions; enabling/disabling workflows requires code changes.
-- UI has no surfaces for automation (no list of schedules, no job inspector, no run-now controls).
+## 目标
+- 通过调度与审批流程减少手工操作，同时保证变更可审计、可回滚。
+- 支持可插拔的任务执行器与上下文，覆盖地址池、租约、策略、运维脚本等场景。
 
-## Workflow Catalog (Phase 2)
-1. **Inventory Sync (`inventory.sync`)**
-   - Pull CMDB/asset inventories to refresh pool metadata + device fingerprints per tenant.
-   - Inputs: tenant ID, source endpoints, delta window.
-2. **Policy Audit (`policy.audit`)**
-   - Re-evaluate policy baselines (RBAC, quotas, guardrails) and produce compliance reports.
-   - Inputs: tenant, policy set IDs, severity thresholds.
-3. **Security Scan (`security.scan`)**
-   - Run DHCP snooping/rogue detection tasks; feed results into guard + alerting pipelines.
-4. **Analytics Snapshot (`analytics.snapshot`)**
-   - Export monitoring aggregates + lease statistics for offline BI jobs.
-5. **Notification Fanout (`notification.fanout`)**
-   - Distribute alert payloads to email/webhook/PagerDuty channels based on automation outcomes.
-6. **Workflow Execution (`workflow.execution`)**
-   - Execute user-authored multi-step workflows (Phase 2.5) referencing a definition stored in DB.
+## 关键概念
+- Job：自动化任务，包含类型、参数、上下文、重试与超时设置。
+- Scheduler（internal/automation/scheduler）：按队列与优先级调度，支持限速。
+- Approval：可选审批节点，支持多级审批与超时。
+- Notification Handler：任务状态变更时推送通知（邮件/聊天/Webhook）。
 
-Each workflow requires tenant scoping, labels for filtering, and payload schemas published to docs/api.
+## 生命周期（示例）
+1. 创建：请求经过 API/CLI，校验参数与权限，记录审计。
+2. 排队：Scheduler 将任务放入队列，等待资源与审批。
+3. 审批：若需要审批，等待通过；超时可自动拒绝或升级。
+4. 执行：Worker 拉取任务，执行具体 action；支持幂等与重试。
+5. 完成：记录结果、指标与审计；触发通知。
+6. 失败/重试：按策略重试，超过上限后标记失败并发送告警。
 
-## Backend Delivery Plan
-1. **Config-Driven Schedules**
-   - Introduce `automation.schedules` section in config YAML with entries per `JobType` (enabled, interval, tenant, payload, channels).
-   - Extend `cmd/dhcpd/main.go` wiring to parse config and feed `ServiceOptions.Schedules`.
-2. **Handler Implementations**
-   - Build dedicated handlers under `internal/automation/workflow/` for inventory sync, policy audit, security scan, analytics export, workflow execution. Each handler should:
-     - Accept context + job payload, validate schema.
-     - Publish audit events and metrics tags (`automation_job_duration_seconds`, `automation_job_failures_total`).
-     - Support idempotent retries (respect `Job.Attempts`).
-3. **Persistence & History**
-   - Add lightweight persistence (PostgreSQL/MySQL) for job runs: `automation_jobs` table capturing id, type, tenant, payload hash, status, timestamps, output summary.
-   - Provide API endpoints `/api/v1/automation/jobs` (list/filter) and `/api/v1/automation/jobs/{id}` (details/logs).
-4. **Runbook APIs**
-   - Add `/api/v1/automation/schedules` (GET) returning `ScheduleSummary` and PATCH endpoint to toggle intervals/tenants.
-   - Provide `POST /api/v1/automation/jobs` to allow UI to trigger ad-hoc runs with payload override (subject to RBAC scopes).
-5. **Notification Integration**
-   - Ensure security scan + policy audit handlers enqueue `notification.fanout` jobs with severity derived from findings.
-   - Add mapping between automation outcomes and alert rules (e.g., policy audit failure => alert feed entry).
-6. **Observability**
-   - Emit Prometheus metrics per job type: counts, durations, retry attempts, in-flight worker count.
-   - Extend `Scheduler.Snapshot()` to include average wait time and expose via `/api/v1/monitoring/automation` endpoint.
+## 任务类型示例
+- 地址池：创建/扩容/缩容/权重调整。
+- 租约：批量释放、迁移、冻结。
+- 策略：发布/回滚策略变更。
+- 运维：生成报告、导出数据、触发外部编排。
 
-## UI Tooling Plan
-1. **Automation Service Module**
-   - Create `web/ui/src/services/automation.ts` with methods: `fetchSchedules`, `updateSchedule`, `listJobs`, `getJob`, `runJobNow`.
-   - Wire authentication headers + tenant context automatically.
-2. **Automation Workspace Route**
-   - Build new route `/automation` (guarded by RBAC `automation:manage`). Layout includes:
-     - Schedule table (job type, interval, tenant, status, next run) with enable/disable toggle + edit drawer.
-     - Job history panel (filter by tenant/job type/status, virtualization for large lists).
-     - Job detail drawer showing payload, logs, completion metrics, linked notifications.
-3. **Run-Now & Payload Builder**
-   - Provide modal to trigger ad-hoc jobs with payload templates specific to each workflow (pre-filled fields for tenant, filters, channels).
-   - Validate JSON before submit; show computed `channels` result (uses backend `MergeChannels` behavior as reference).
-4. **Notification Hooks**
-   - When a job generates alerts, surface them inline (chips linking to Alert Inbox) so operators can correlate automation + alerting.
-5. **Tenant Awareness**
-   - Reuse TenantContextDrawer state to scope list queries; tenant admins see only their jobs/schedules while super admins can view all.
-6. **Testing**
-   - Vitest unit tests for service/store logic with mocked API.
-   - Playwright e2e covering schedule toggle, job run, and detail inspection flows.
+## 配置与安全
+- 单租户模式：任务在全局队列中执行，不再区分租户上下文。
+- 权限：创建/审批/执行需满足 RBAC 规则；审批人列表与策略需在配置或数据库中管理。
+- 幂等：任务参数应携带业务幂等键，避免重复执行。
 
-## Rollout & Validation
-- **Week 1**: Config schema + backend schedule ingestion, persistence schema migration, API endpoints for schedules/jobs.
-- **Week 2**: Implement job handlers (inventory, policy, security, analytics) with metrics + notification fanout integration.
-- **Week 3**: Build UI workspace, service layer, and wiring for tenant context + RBAC.
-- **Week 4**: Add run-now UX, job detail view, alert correlations, and e2e tests; run shadow deployments to validate retry/backoff behavior.
+## 观测与告警
+- 指标：任务成功率、平均执行时长、重试次数、等待时间、审批超时。
+- 日志与审计：记录输入、执行决策、外部调用、通知结果。
+- 告警：P1 关注审批超时、关键任务失败；P2 关注重试率异常；P3 关注队列积压。
 
-This plan completes the "Design automation workflows & UI tooling" milestone and outlines concrete backend and frontend deliverables for Phase 2 automation.
+## 集成点
+- 通知：使用 internal/alerting + notifications 路由通知到渠道。
+- 审计：使用 internal/audit 记录审批与执行路径。
+- 安全：将敏感操作纳入审批；在安全事件触发时可自动执行隔离/封禁任务。

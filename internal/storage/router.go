@@ -16,8 +16,9 @@ import (
 
 // TenantHandle describes a tenant-scoped database handle plus optional schema hint.
 type TenantHandle struct {
-	DB     *sqlx.DB
-	Schema string
+	DB      *sqlx.DB
+	Replica *sqlx.DB
+	Schema  string
 }
 
 // TenantRouter hands out tenant-specific handles according to the configured tenancy mode.
@@ -37,12 +38,20 @@ func NewTenantRouter(defaultDB *sqlx.DB, cfg config.TenancyConfig) *TenantRouter
 		mode = "shared"
 	}
 	return &TenantRouter{
-		defaultHandle: TenantHandle{DB: defaultDB, Schema: cfg.DefaultSchema},
+		defaultHandle: TenantHandle{DB: defaultDB, Replica: nil, Schema: cfg.DefaultSchema},
 		mode:          mode,
 		overrides:     cfg.Dedicated,
 		poolCfg:       cfg.Router,
 		handles:       make(map[string]TenantHandle),
 	}
+}
+
+// WithDefaultReplica attaches a read-replica handle for shared tenancy mode.
+func (r *TenantRouter) WithDefaultReplica(replica *sqlx.DB) *TenantRouter {
+	if replica != nil {
+		r.defaultHandle.Replica = replica
+	}
+	return r
 }
 
 // Handle returns the database handle and schema for the provided tenant ID.
@@ -60,11 +69,10 @@ func (r *TenantRouter) Handle(ctx context.Context, tenantID string) (TenantHandl
 	if ok {
 		return handle, nil
 	}
-	db, err := r.openTenantDB(ctx, override)
+	handle, err := r.openTenantHandle(ctx, override)
 	if err != nil {
 		return TenantHandle{}, err
 	}
-	handle = TenantHandle{DB: db, Schema: override.Schema}
 	r.mu.Lock()
 	r.handles[tenantID] = handle
 	r.mu.Unlock()
@@ -79,17 +87,34 @@ func (r *TenantRouter) Close() error {
 		if handle.DB != nil {
 			_ = handle.DB.Close()
 		}
+		if handle.Replica != nil {
+			_ = handle.Replica.Close()
+		}
 		delete(r.handles, tenantID)
 	}
 	return nil
 }
 
-func (r *TenantRouter) openTenantDB(ctx context.Context, cfg config.TenantDatabaseConfig) (*sqlx.DB, error) {
-	driver := cfg.Driver
+func (r *TenantRouter) openTenantHandle(ctx context.Context, cfg config.TenantDatabaseConfig) (TenantHandle, error) {
+	writer, err := r.openDB(ctx, cfg.Driver, cfg.DSN)
+	if err != nil {
+		return TenantHandle{}, err
+	}
+	var replica *sqlx.DB
+	if cfg.ReplicaDSN != "" {
+		replica, err = r.openDB(ctx, cfg.Driver, cfg.ReplicaDSN)
+		if err != nil {
+			_ = writer.Close()
+			return TenantHandle{}, err
+		}
+	}
+	return TenantHandle{DB: writer, Replica: replica, Schema: cfg.Schema}, nil
+}
+
+func (r *TenantRouter) openDB(ctx context.Context, driver, dsn string) (*sqlx.DB, error) {
 	if driver == "" {
 		driver = DriverMySQL
 	}
-	dsn := cfg.DSN
 	if dsn == "" {
 		return nil, fmt.Errorf("tenant router: missing DSN for driver %s", driver)
 	}

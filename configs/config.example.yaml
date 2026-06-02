@@ -9,6 +9,14 @@ service:
   metricsPort: 9090
   enableIPv6: true
   enableBOOTP: true
+  tls:
+    enabled: false
+    autoSelfSigned: true
+    certFile: data/cluster/pki/api-server-cert.pem
+    keyFile: data/cluster/pki/api-server-key.pem
+    clientCaFile: ""
+    requireClientCert: false
+    selfSignedDir: data/cluster/pki
   cors:
     enabled: true
     allowedOrigins:
@@ -31,11 +39,17 @@ deployment:
   bareMetal:
     provisioningTool: ipxe
     osImage: rocky-9.3
-    kernelArgs:
-      - console=ttyS0
-      - intel_iommu=on
-    raidLayout: raid10
-    nicBonding: lacp
+          ackTimeout: 2s
+          snapshotInterval: 5m
+          syncTxnReconcileInterval: 30s
+          syncTxnReconcileBackoffMax: 5m
+          syncTxnReconcileFailureAlertThreshold: 3
+          syncTxnReconcileAlertCooldown: 5m
+          syncTxnMaxEntries: 100
+          syncTxnRetention: 168h
+          syncTxnArchiveLimit: 500
+          enforceAck: true
+          ackFailurePolicy: strict
     outOfBand: redfish
   virtualMachine:
     hypervisors:
@@ -151,7 +165,7 @@ storage:
     failover: postgres
     mysql:
       enabled: true
-      dsn: "user:password@tcp(mysql-primary:3306)/modern_dhcp?parseTime=true&loc=Local"
+      dsn: "dhcp:Gtyt5zB5kKbD3TWn@tcp(10.0.11.24:3306)/dhcp?parseTime=true&loc=Local"
       maxConnections: 200
       connMaxLifetime: 300s
       migrationTool: goose
@@ -339,7 +353,7 @@ rbac:
   cacheTtl: 60s
 
 mysql:
-  dsn: "dhcp_web:deGdZtfckN4zcCdW@tcp(10.0.11.24:3306)/dhcp_db?parseTime=true&loc=Local"
+  dsn: "dhcp:Gtyt5zB5kKbD3TWn@tcp(10.0.11.24:3306)/dhcp?parseTime=true&loc=Local"
   maxOpenConns: 50
   maxIdleConns: 10
   connMaxLifetime: 300s
@@ -358,6 +372,15 @@ redis:
   username: "dhcpredis"
   password: "dhcp123"
   database: 0
+  useTls: false
+  tlsSkipVerify: false
+  connectTimeout: 2s
+  dialTimeout: 2s
+  readTimeout: 2s
+  writeTimeout: 2s
+  poolSize: 64
+  minIdleConns: 8
+  maxRetries: 2
 
 kafka:
   brokers:
@@ -424,6 +447,8 @@ ha:
       - kafka-2:9092
     topic: dhcp.replication.journal
     ackTimeout: 2s
+    enforceAck: true
+    ackFailurePolicy: strict
     snapshotInterval: 5m
     binlogSource: mysql-primary:3306
   ingress:
@@ -486,6 +511,13 @@ iot:
 
 security:
   enabled: true
+  dhcpv4:
+    macRateLimitPPS: 10
+    relayWhitelist: []
+    rogueDetector:
+      enabled: false
+      interface: ""
+      clusterNodes: []
   snooping:
     enabled: true
     grpcEndpoint: collector:7443
@@ -528,8 +560,23 @@ security:
     holdDuration: 5s
     maxAttempts: 3
     reclaimScanLimit: 1
+    arpTimeout: 1s
+    arpRetries: 2
+    icmpRetries: 2
+    cacheTTL: 30s
+    conflictTTL: 120s
+    pools:
+      default:
+        enabled: true
+        arpTimeout: 1s
+        arpRetries: 2
+        icmpRetries: 2
   macAcl:
     enforceWhitelist: false
+    bindingExemptAcl: false
+    renewExemptBlocked: false
+    cacheTtl: 5m
+    defaultAction: allow
     whitelist:
       - "00:11:22:33:44:55"
     blacklist:
@@ -598,6 +645,12 @@ relay:
   enabled: true
   option82:
     preserveRaw: true
+    whitelist:
+      enabled: false
+      circuitIdAllow: []
+      circuitIdDeny: []
+      remoteIdAllow: []
+      remoteIdDeny: []
     subOptionMappings:
       "150":
         key: vlan-id
@@ -631,7 +684,9 @@ monitoring:
     endpoint: /metrics
   tracing:
     exporter: otlp
-    endpoint: http://localhost:4317
+    endpoint: localhost:4317
+    insecure: true
+    samplerRatio: 0.1
   alerting:
     enabled: true
     evaluateInterval: 30s
@@ -768,8 +823,15 @@ automation:
     workerCount: 8
     maxAttempts: 5
     defaultTimeout: 45s
-  jobs:
-    inventory:
+  approvals:
+    enabled: true
+    requireFor:
+      - schedule.toggle
+      - schedule.update
+      - job.run
+    autoApplyOnApprove: true
+  schedules:
+    inventory.sync:
       enabled: true
       interval: 30m
       initialDelay: 2m
@@ -782,7 +844,7 @@ automation:
         includeHardware: true
       channels:
         - cmdb-webhook
-    policyAudit:
+    policy.audit:
       enabled: true
       interval: 1h
       tenantId: global
@@ -793,7 +855,7 @@ automation:
       channels:
         - ops-chat
         - grafana-webhook
-    securityScan:
+    security.scan:
       enabled: true
       interval: 15m
       tenantId: global
@@ -803,7 +865,7 @@ automation:
         severityThreshold: major
       channels:
         - secops-webhook
-    analytics:
+    analytics.snapshot:
       enabled: true
       interval: 12h
       tenantId: reporting
@@ -813,7 +875,7 @@ automation:
           - pool_capacity
       channels:
         - data-lake-webhook
-    notificationFanout:
+    notification.fanout:
       enabled: true
       interval: 1m
       tenantId: global
@@ -821,6 +883,14 @@ automation:
         batchSize: 200
       channels:
         - ops-chat
+    workflow.execution:
+      enabled: false
+      interval: 4h
+      tenantId: integration
+      labels:
+        pipeline: onboarding
+      payload:
+        workflowId: default-onboarding
 
 notifications:
   enabled: true
@@ -922,3 +992,383 @@ opsSupport:
           - "--tenant"
         allowedRoles:
           - admin
+  maintenance:
+    enabled: true
+    playbooks:
+      - id: lifecycle-upgrade
+        title: Lifecycle Upgrade
+        description: Rolling upgrade sequence for core control plane
+        tags:
+          - upgrade
+          - zero-downtime
+        steps:
+          - id: announce-window
+            title: Announce Maintenance Window
+            summary: Send broadcast to tenant admins about upcoming upgrade
+            duration: 10m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.notificationFanout
+          - id: snapshot-config
+            title: Snapshot Configuration
+            summary: Capture current configuration to backup destination
+            duration: 5m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.workflowExecution
+          - id: upgrade-nodes
+            title: Upgrade Control Plane Nodes
+            summary: Run rolling upgrade automation across DHCP nodes
+            duration: 30m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - snapshot-config
+            automationJobType: automation.workflowExecution
+          - id: validation
+            title: Validate Post-Upgrade Health
+            summary: Execute smoke tests against API and lease pipeline
+            duration: 15m
+            responsible: qa
+            requiresApproval: false
+            dependsOn:
+              - upgrade-nodes
+            automationJobType: automation.workflowExecution
+      - id: resilience-drill
+        title: Resilience Drill
+        description: Exercises failover workflow and runbooks
+        tags:
+          - resilience
+          - failover
+        steps:
+          - id: simulate-failure
+            title: Simulate Node Failure
+            summary: Trigger synthetic outage on primary node
+            duration: 10m
+            responsible: ops
+            requiresApproval: true
+            automationJobType: automation.workflowExecution
+          - id: promote-secondary
+            title: Promote Secondary Cluster
+            summary: Promote standby cluster and verify lease continuity
+            duration: 20m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - simulate-failure
+            automationJobType: automation.workflowExecution
+          - id: retro
+            title: Capture Findings
+            summary: Document drill results and improvement items
+            duration: 15m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.metricsReview
+    windows:
+      - id: weekly-maintenance
+        name: Weekly Maintenance
+        cron: "0 3 * * SUN"
+        duration: 2h
+        timezone: UTC
+      - id: apac-window
+        name: APAC Friendly Window
+        cron: "0 6 * * TUE"
+        duration: 90m
+        timezone: Asia/Singapore
+      - id: dr-drill
+        name: Quarterly DR Drill
+        cron: "0 5 1 */3 *"
+        duration: 3h
+        timezone: UTC
+    upgradePlans:
+      - id: 24q3-service-pack
+        version: 24.3.2
+        summary: Rolling out Q3 service pack with security fixes
+        scheduledFor: "2024-08-18T03:00:00Z"
+        prerequisites:
+          - backup-service-pack
+          - change-approved
+        steps:
+          - id: drain-traffic
+            title: Drain Traffic
+            summary: Reduce pool assignment rate via throttling
+            duration: 15m
+            responsible: ops
+            requiresApproval: true
+            automationJobType: automation.workflowExecution
+          - id: apply-service-pack
+            title: Apply Service Pack
+            summary: Deploy patch bundle to each node sequentially
+            duration: 45m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - drain-traffic
+            automationJobType: automation.workflowExecution
+        rollbackPlan:
+          - id: revert-service-pack
+            title: Revert Service Pack
+            summary: Reinstall previous release and restore config snapshot
+            duration: 40m
+            responsible: ops
+            requiresApproval: true
+            automationJobType: automation.workflowExecution
+        releaseNotes: https://kb.example.com/releases/24.3.2
+      - id: 24q4-feature
+        version: 24.4.0
+        summary: Major feature enablement for mobility optimizations
+        scheduledFor: "2024-11-10T02:30:00Z"
+        prerequisites:
+          - capacity-check
+          - cab-approved
+        steps:
+          - id: enable-feature-flags
+            title: Enable Feature Flags
+            summary: Turn on progressive delivery flags for new mobility pipeline
+            duration: 20m
+            responsible: ops
+            requiresApproval: true
+            automationJobType: automation.workflowExecution
+          - id: monitor-impact
+            title: Monitor Impact
+            summary: Observe performance KPIs for 30 minutes post-change
+            duration: 30m
+            responsible: ops
+            requiresApproval: false
+            dependsOn:
+              - enable-feature-flags
+            automationJobType: automation.metricsReview
+        rollbackPlan:
+          - id: disable-feature-flags
+            title: Disable Feature Flags
+            summary: Roll back to previous mobility settings
+            duration: 10m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.workflowExecution
+        releaseNotes: https://kb.example.com/releases/24.4.0
+  backups:
+    enabled: true
+    schedules:
+      - id: nightly-config
+        name: Nightly Configuration Backup
+        cron: "0 2 * * *"
+        retention: 168h
+        window: 1h
+        type: config
+        enabled: true
+        destinations:
+          - primary-s3
+      - id: hourly-lease
+        name: Hourly Lease Capture
+        cron: "0 * * * *"
+        retention: 72h
+        window: 20m
+        type: data
+        enabled: true
+        destinations:
+          - primary-s3
+          - analytics-lake
+      - id: weekly-report
+        name: Weekly Reporting Snapshot
+        cron: "30 4 * * MON"
+        retention: 720h
+        window: 2h
+        type: analytics
+        enabled: true
+        destinations:
+          - analytics-lake
+    destinations:
+      - id: primary-s3
+        name: Primary S3 Bucket
+        kind: s3
+        endpoint: https://s3.example.com/modern-dhcp/backups
+        credentials: ${S3_BACKUP_TOKEN}
+        metadata:
+          region: us-east-1
+          bucket: modern-dhcp-prod
+      - id: analytics-lake
+        name: Analytics Lake
+        kind: s3
+        endpoint: https://lake.example.com/ingest
+        credentials: ${DATALAKE_TOKEN}
+        metadata:
+          region: us-west-2
+          purpose: analytics
+      - id: tape-vault
+        name: Tape Vault
+        kind: glacier
+        endpoint: arn:aws:glacier:us-east-1:123456789012:vaults/modern-dhcp
+        credentials: ${GLACIER_TOKEN}
+        metadata:
+          retention: 365d
+          encryption: kms-managed
+    restoreWorkflows:
+      - id: full-restore
+        name: Full Environment Restore
+        description: Guided workflow to recover the entire platform from backups
+        steps:
+          - id: validate-backup
+            title: Validate Backup Integrity
+            summary: Ensure selected backup has completed verification checks
+            duration: 10m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.workflowExecution
+          - id: restore-database
+            title: Restore Database
+            summary: Run database restore procedure using automation job
+            duration: 40m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - validate-backup
+            automationJobType: automation.workflowExecution
+          - id: restore-app
+            title: Restore Application Nodes
+            summary: Rehydrate application nodes with restored data
+            duration: 30m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - restore-database
+            automationJobType: automation.workflowExecution
+        checks:
+          - backup-verified
+          - dr-window
+        approvals:
+          - platform-director
+          - security-duty
+      - id: tenant-restore
+        name: Tenant Scoped Restore
+        description: Recover tenant specific configuration and lease data
+        steps:
+          - id: select-tenant
+            title: Select Tenant Snapshot
+            summary: Filter catalog to tenant-scoped backups
+            duration: 5m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.workflowExecution
+          - id: apply-tenant-data
+            title: Apply Tenant Data
+            summary: Restore tenant configuration and lease records
+            duration: 25m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - select-tenant
+            automationJobType: automation.workflowExecution
+        checks:
+          - tenant-approval
+          - backup-verified
+        approvals:
+          - tenant-admin
+          - ops-manager
+    verification:
+      enabled: true
+      schedule: "15 4 * * MON"
+      retention: 45
+      sandboxEnv: ephemeral-restore-lab
+      alertChannel: secops-webhook
+  performance:
+    enabled: true
+    probes:
+      - id: api-latency
+        name: API Latency Probe
+        description: Executes synthetic API calls measuring lease response times
+        command: /app/probes/api_latency.sh
+        interval: 5m
+        slo: 200
+        units: ms
+        thresholds:
+          warning: 180
+          major: 220
+          critical: 350
+      - id: db-replication
+        name: Database Replication Lag
+        description: Monitors replication delay across HA database cluster
+        command: /app/probes/db_replication.sh
+        interval: 1m
+        slo: 3
+        units: s
+        thresholds:
+          warning: 2
+          major: 4
+          critical: 6
+      - id: queue-depth
+        name: Automation Queue Depth
+        description: Checks automation queue size to surface throughput issues
+        command: /app/probes/queue_depth.sh
+        interval: 2m
+        slo: 100
+        units: jobs
+        thresholds:
+          warning: 75
+          major: 100
+          critical: 150
+    indicators:
+      - id: lease-success
+        name: Lease Success Rate
+        description: Percentage of successful discover-offer-ack transactions
+        target: 99.7
+        units: percent
+      - id: infra-cpu
+        name: Infrastructure CPU Utilization
+        description: Average CPU utilization across DHCP cluster
+        target: 70
+        units: percent
+      - id: failover-lag
+        name: Failover Lag Threshold
+        description: Acceptable maximum replication delay between failover pairs
+        target: 3
+        units: s
+    recommendations:
+      - id: scale-api-pool
+        title: Scale API Pool
+        summary: Suggests scaling API instances when latency exceeds targets
+        impact: high
+        steps:
+          - id: review-api-metrics
+            title: Review API Metrics
+            summary: Inspect API latency dashboards and saturation metrics
+            duration: 10m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.metricsReview
+          - id: add-capacity
+            title: Add Capacity
+            summary: Trigger automation workflow to add API replicas
+            duration: 15m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - review-api-metrics
+            automationJobType: automation.workflowExecution
+        signals:
+          - api-latency
+          - infra-cpu
+      - id: tune-db-replication
+        title: Tune DB Replication
+        summary: Adjust replication thresholds to reduce failover lag
+        impact: medium
+        steps:
+          - id: inspect-replication
+            title: Inspect Replication Stats
+            summary: Review database replication metrics and backlog
+            duration: 10m
+            responsible: ops
+            requiresApproval: false
+            automationJobType: automation.metricsReview
+          - id: adjust-replication
+            title: Adjust Replication Settings
+            summary: Apply replication tuning via automation workflow
+            duration: 12m
+            responsible: ops
+            requiresApproval: true
+            dependsOn:
+              - inspect-replication
+            automationJobType: automation.workflowExecution
+        signals:
+          - db-replication
+          - failover-lag

@@ -11,14 +11,18 @@ import (
 	"go.uber.org/zap"
 
 	"modern-dhcp/internal/audit"
+	"modern-dhcp/internal/lease"
 	"modern-dhcp/internal/metrics"
+	"modern-dhcp/internal/pool"
 	"modern-dhcp/internal/security/detector"
 	"modern-dhcp/internal/security/ipsgdai"
+	"modern-dhcp/internal/security/maclist"
 	"modern-dhcp/internal/security/policy"
 	"modern-dhcp/internal/security/radius"
 	"modern-dhcp/internal/security/ratelimit"
 	"modern-dhcp/internal/security/snooping"
 	"modern-dhcp/pkg/auditpayload"
+	"modern-dhcp/pkg/models"
 )
 
 var (
@@ -33,25 +37,27 @@ var (
 // Guard orchestrates pre-processing checks before DHCP logic executes.
 type Guard interface {
 	Check(ctx context.Context, ctxData *Context) error
+	CheckRenewACL(ctx context.Context, mac string) error
 	OnLeaseChange(ctx context.Context, change *LeaseChange)
 	OnSecurityEvent(ctx context.Context, evt Event)
 }
 
 // Context captures the minimal metadata required for guard evaluation.
 type Context struct {
-	TenantID    string
-	MessageType string
-	MAC         string
-	ClientID    string
-	CircuitID   string
-	RemoteID    string
-	RelayAgent  map[string]string
-	PortID      string
-	VLANID      int
-	InterfaceID string
-	RequestedIP string
-	GIAddr      string
-	Timestamp   time.Time
+	TenantID     string
+	MessageType  string
+	RequestPhase string
+	MAC          string
+	ClientID     string
+	CircuitID    string
+	RemoteID     string
+	RelayAgent   map[string]string
+	PortID       string
+	VLANID       int
+	InterfaceID  string
+	RequestedIP  string
+	GIAddr       string
+	Timestamp    time.Time
 }
 
 // LeaseChange describes lease lifecycle events that should propagate to network controllers.
@@ -101,12 +107,17 @@ const (
 
 // MACACL captures whitelist/blacklist/graylist policies.
 type MACACL struct {
-	Whitelist        []string
-	Blacklist        []string
-	Graylist         []string
-	GraylistAction   GraylistAction
-	EnforceWhitelist bool
+	Whitelist          []string
+	Blacklist          []string
+	Graylist           []string
+	GraylistAction     GraylistAction
+	EnforceWhitelist   bool
+	BindingExemptACL   bool
+	RenewExemptBlocked bool
+	DefaultAction      string
 }
+
+const macACLDefaultActionAllow = "allow"
 
 // Event encapsulates asynchronous signals (DAI alerts, RADIUS CoA, etc.).
 type Event struct {
@@ -120,6 +131,8 @@ type Event struct {
 type Dependencies struct {
 	Snooping         snooping.Store
 	Limiter          ratelimit.Limiter
+	BindingService   *pool.Service
+	LeaseService     *lease.Service
 	Detector         detector.Detector
 	Publisher        ipsgdai.Publisher
 	Radius           radius.Client
@@ -129,6 +142,7 @@ type Dependencies struct {
 	Quarantine       QuarantineSink
 	Logger           *zap.Logger
 	MACACL           *MACACL
+	MacList          maclist.Evaluator
 	Audit            *audit.Service
 	Policy           policy.Evaluator
 }
@@ -148,9 +162,21 @@ type QuarantineSignal struct {
 }
 
 type guardImpl struct {
-	deps   Dependencies
-	macACL *macACL
-	policy policy.Evaluator
+	deps             Dependencies
+	macACL           *macACL
+	policy           policy.Evaluator
+	bindingSvc       *pool.Service
+	bindingLookup    bindingLookup
+	leaseSvc         leaseValidityChecker
+	bindingExemptACL bool
+}
+
+type leaseValidityChecker interface {
+	HasValidLease(ctx context.Context, mac string) (bool, error)
+}
+
+type bindingLookup interface {
+	FindBinding(ctx context.Context, scope pool.ResourceScope, identifier, ip string) (*models.StaticBinding, error)
 }
 
 // New builds a guard that wires available dependencies.
@@ -158,7 +184,18 @@ func New(deps Dependencies) Guard {
 	if deps.Logger == nil {
 		deps.Logger = zap.NewNop()
 	}
-	return &guardImpl{deps: deps, macACL: normalizeMACACL(deps.MACACL), policy: deps.Policy}
+	acl := normalizeMACACL(deps.MACACL)
+	if acl != nil {
+		deps.Logger.Info("未命中名单默认动作已固定为 allow，EnforceWhitelist={当前值}",
+			zap.Bool("enforceWhitelist", acl.enforceWhitelist),
+			zap.String("defaultAction", acl.defaultAction),
+		)
+	}
+	exempt := false
+	if acl != nil {
+		exempt = acl.bindingExemptACL
+	}
+	return &guardImpl{deps: deps, macACL: acl, policy: deps.Policy, bindingSvc: deps.BindingService, bindingLookup: deps.BindingService, leaseSvc: deps.LeaseService, bindingExemptACL: exempt}
 }
 
 // NewNoop returns a guard instance that always allows traffic.
@@ -177,6 +214,21 @@ func (g *guardImpl) Check(ctx context.Context, ctxData *Context) error {
 	defer func() {
 		g.observeLatency(result, time.Since(start))
 	}()
+	if g.bindingLookup != nil && mac != "" {
+		scopeRef := pool.NewResourceScope(ctxData.TenantID, ctxData.TenantID)
+		binding, err := g.bindingLookup.FindBinding(ctx, scopeRef, mac, "")
+		if err != nil {
+			if !errors.Is(err, pool.ErrNotFound) {
+				g.deps.Logger.Warn("binding lookup failed before mac acl", zap.String("tenantId", ctxData.TenantID), zap.String("mac", ctxData.MAC), zap.Error(err))
+			}
+		} else if binding != nil && g.bindingExemptACL {
+			phase := normalizeACLRequestPhase(ctxData.RequestPhase)
+			traceID := traceIDFromContext(ctx)
+			observeMACACLCheck("allow", "none", phase)
+			g.deps.Logger.Info("绑定豁免放行", zap.String("mac", ctxData.MAC), zap.String("bindingIP", binding.IPAddress), zap.String("action", "allow"), zap.String("list_type", "none"), zap.String("request_phase", phase), zap.String("trace_id", traceID))
+			return nil
+		}
+	}
 	if err := g.enforceMACACL(ctx, ctxData, mac); err != nil {
 		result = "deny"
 		return err
@@ -255,6 +307,51 @@ func (g *guardImpl) Check(ctx context.Context, ctxData *Context) error {
 		}
 	}
 	return nil
+}
+
+// CheckRenewACL applies simplified ACL checks for renew/rebind phases.
+func (g *guardImpl) CheckRenewACL(ctx context.Context, mac string) error {
+	mac = normalizeMAC(mac)
+	if g == nil || mac == "" {
+		return nil
+	}
+	tenantID := lease.TenantIDFromContext(ctx)
+	requestPhase := requestPhaseFromContext(ctx)
+	traceID := traceIDFromContext(ctx)
+	g.deps.Logger.Info("续约校验", zap.String("tenantId", tenantID), zap.String("mac", mac), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID))
+
+	blacklisted := false
+	if g.deps.MacList != nil {
+		res, err := g.deps.MacList.Evaluate(ctx, tenantID, mac)
+		if err != nil {
+			g.deps.Logger.Warn("renew mac list evaluation failed", zap.String("tenantId", tenantID), zap.String("mac", mac), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID), zap.Error(err))
+		} else if res.Entry != nil && res.Entry.Type == maclist.ListTypeBlacklist {
+			blacklisted = true
+		}
+	}
+	if !blacklisted && g.macACL != nil && g.macACL.blacklist != nil {
+		_, blacklisted = g.macACL.blacklist[mac]
+	}
+	if !blacklisted {
+		observeMACACLCheck("allow", "none", requestPhase)
+		g.deps.Logger.Info("续约校验通过（非黑名单）", zap.String("mac", mac), zap.String("action", "allow"), zap.String("list_type", "none"), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID), zap.Bool("renewExemptTriggered", false))
+		return nil
+	}
+
+	if g.macACL != nil && g.macACL.renewExemptBlocked && g.leaseSvc != nil {
+		hasLease, err := g.leaseSvc.HasValidLease(ctx, mac)
+		if err != nil {
+			g.deps.Logger.Warn("续约豁免检查失败", zap.String("mac", mac), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID), zap.Error(err))
+		} else if hasLease {
+			observeMACACLCheck("allow", "black", requestPhase)
+			g.deps.Logger.Info("续约校验触发豁免放行", zap.String("mac", mac), zap.String("action", "allow"), zap.String("list_type", "black"), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID), zap.Bool("renewExemptTriggered", true))
+			return nil
+		}
+	}
+
+	observeMACACLCheck("block", "black", requestPhase)
+	g.deps.Logger.Info("续约校验拒绝（黑名单）", zap.String("mac", mac), zap.String("action", "block"), zap.String("list_type", "black"), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID), zap.Bool("renewExemptTriggered", false))
+	return ErrMACNotAllowed
 }
 
 func (g *guardImpl) applyQuarantine(ctx context.Context, ctxData *Context, verdict detector.Verdict) {
@@ -392,12 +489,17 @@ func (g *guardImpl) OnSecurityEvent(ctx context.Context, evt Event) {
 		Action:     "alert",
 		Details:    evt.Details,
 	}
+	payload.Scope = auditpayload.ScopeFromTenant(evt.TenantID)
 	g.recordSecurityAudit(ctx, payload, "security.alert")
 }
 
 type noopGuard struct{}
 
 func (n *noopGuard) Check(ctx context.Context, ctxData *Context) error {
+	return nil
+}
+
+func (n *noopGuard) CheckRenewACL(ctx context.Context, mac string) error {
 	return nil
 }
 
@@ -429,6 +531,7 @@ func (g *guardImpl) emitSecurityEvent(ctx context.Context, ctxData *Context, eve
 		Action:      action,
 		Details:     details,
 	}
+	payload.Scope = auditpayload.ScopeFromTenant(ctxData.TenantID)
 	auditAction := "security.alert"
 	switch strings.ToLower(verdict) {
 	case "deny":
@@ -481,41 +584,106 @@ func (g *guardImpl) observeLatency(result string, duration time.Duration) {
 }
 
 func (g *guardImpl) enforceMACACL(ctx context.Context, ctxData *Context, mac string) error {
-	if g == nil || g.macACL == nil || mac == "" {
+	if g == nil || mac == "" {
+		return nil
+	}
+	requestPhase := normalizeACLRequestPhase(ctxData.RequestPhase)
+	traceID := traceIDFromContext(ctx)
+	if g.deps.MacList != nil {
+		res, err := g.deps.MacList.Evaluate(ctx, ctxData.TenantID, mac)
+		if err != nil {
+			g.deps.Logger.Warn("mac list evaluation failed", zap.String("tenantId", ctxData.TenantID), zap.String("mac", ctxData.MAC), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID), zap.Error(err))
+		} else if res.Entry != nil {
+			details := map[string]any{"entryId": res.Entry.ID, "mac": ctxData.MAC, "listType": res.Entry.Type, "source": res.Entry.Source, "priority": res.Entry.Priority}
+			listType := normalizeACLListType(string(res.Entry.Type))
+			switch res.Entry.Action {
+			case maclist.ActionBlock:
+				observeMACACLCheck("block", listType, requestPhase)
+				g.deps.Logger.Info("mac list block", zap.String("tenantId", ctxData.TenantID), zap.String("mac", ctxData.MAC), zap.String("action", "block"), zap.String("list_type", listType), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID), zap.String("source", res.Entry.Source))
+				g.recordEvent(EventTypeACL, "deny")
+				g.emitSecurityEvent(ctx, ctxData, EventTypeACL, "deny", "mac list block", "block", details)
+				return ErrMACNotAllowed
+			case maclist.ActionAllow:
+				observeMACACLCheck("allow", listType, requestPhase)
+				g.deps.Logger.Info("mac list allow", zap.String("tenantId", ctxData.TenantID), zap.String("mac", ctxData.MAC), zap.String("action", "allow"), zap.String("list_type", listType), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID), zap.String("source", res.Entry.Source))
+				g.recordEvent(EventTypeACL, "allow")
+				g.emitSecurityEvent(ctx, ctxData, EventTypeACL, "allow", "mac list allow", "allow", details)
+				return nil
+			default:
+				observeMACACLCheck("monitor", listType, requestPhase)
+				g.deps.Logger.Info("mac list monitor", zap.String("tenantId", ctxData.TenantID), zap.String("mac", ctxData.MAC), zap.String("action", "monitor"), zap.String("list_type", listType), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID), zap.String("source", res.Entry.Source))
+				g.recordEvent(EventTypeACL, "gray")
+				g.emitSecurityEvent(ctx, ctxData, EventTypeACL, "gray", "mac list monitor", "monitor", details)
+				return nil
+			}
+		}
+	}
+	if g.macACL == nil {
+		observeMACACLCheck("allow", "none", requestPhase)
+		g.deps.Logger.Info("MAC未命中任何黑白灰名单，允许获取地址池IP",
+			zap.String("mac", ctxData.MAC),
+			zap.Bool("enforceWhitelist", false),
+			zap.String("action", macACLDefaultActionAllow),
+			zap.String("list_type", "none"),
+			zap.String("request_phase", requestPhase),
+			zap.String("trace_id", traceID),
+		)
 		return nil
 	}
 	if g.macACL.blacklist != nil {
 		if _, ok := g.macACL.blacklist[mac]; ok {
-			g.deps.Logger.Info("mac blacklist rejection", zap.String("tenantId", ctxData.TenantID), zap.String("mac", ctxData.MAC), zap.String("portId", ctxData.PortID))
+			observeMACACLCheck("block", "black", requestPhase)
+			g.deps.Logger.Info("mac blacklist rejection", zap.String("tenantId", ctxData.TenantID), zap.String("mac", ctxData.MAC), zap.String("action", "block"), zap.String("list_type", "black"), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID), zap.String("portId", ctxData.PortID))
 			g.recordEvent(EventTypeACL, "deny")
 			g.emitSecurityEvent(ctx, ctxData, EventTypeACL, "deny", "mac blacklist", "block", map[string]any{"mac": ctxData.MAC})
 			return ErrMACNotAllowed
 		}
 	}
-	if g.macACL.enforceWhitelist {
-		if g.macACL.whitelist == nil {
-			g.recordEvent(EventTypeACL, "deny")
-			g.emitSecurityEvent(ctx, ctxData, EventTypeACL, "deny", "whitelist required", "block", nil)
-			return ErrMACNotAllowed
-		}
-		if _, ok := g.macACL.whitelist[mac]; !ok {
-			g.deps.Logger.Info("mac whitelist miss", zap.String("tenantId", ctxData.TenantID), zap.String("mac", ctxData.MAC))
-			g.recordEvent(EventTypeACL, "deny")
-			g.emitSecurityEvent(ctx, ctxData, EventTypeACL, "deny", "whitelist miss", "block", nil)
-			return ErrMACNotAllowed
+	if g.macACL.whitelist != nil {
+		if _, ok := g.macACL.whitelist[mac]; ok {
+			observeMACACLCheck("allow", "white", requestPhase)
+			g.deps.Logger.Info("mac whitelist allow", zap.String("tenantId", ctxData.TenantID), zap.String("mac", ctxData.MAC), zap.String("action", "allow"), zap.String("list_type", "white"), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID))
+			g.recordEvent(EventTypeACL, "allow")
+			g.emitSecurityEvent(ctx, ctxData, EventTypeACL, "allow", "mac whitelist hit", "allow", map[string]any{"mac": ctxData.MAC})
+			return nil
 		}
 	}
 	if g.macACL.graylist != nil {
 		if _, ok := g.macACL.graylist[mac]; ok {
-			g.deps.Logger.Info("mac graylist hit", zap.String("tenantId", ctxData.TenantID), zap.String("mac", ctxData.MAC), zap.String("action", string(g.macACL.grayAction)))
+			observeMACACLCheck(string(g.macACL.grayAction), "gray", requestPhase)
+			g.deps.Logger.Info("mac graylist hit", zap.String("tenantId", ctxData.TenantID), zap.String("mac", ctxData.MAC), zap.String("action", string(g.macACL.grayAction)), zap.String("list_type", "gray"), zap.String("request_phase", requestPhase), zap.String("trace_id", traceID))
 			g.recordEvent(EventTypeACL, "gray")
 			verdict := string(g.macACL.grayAction)
 			g.emitSecurityEvent(ctx, ctxData, EventTypeACL, verdict, "graylist", string(g.macACL.grayAction), nil)
 			if g.macACL.grayAction == GraylistActionBlock {
 				return ErrMACNotAllowed
 			}
+			return nil
 		}
 	}
+	if g.macACL.enforceWhitelist {
+		observeMACACLCheck("block", "none", requestPhase)
+		g.deps.Logger.Info("白名单强制模式开启，未命中白名单拒绝分配IP",
+			zap.String("mac", ctxData.MAC),
+			zap.Bool("enforceWhitelist", g.macACL.enforceWhitelist),
+			zap.String("action", "block"),
+			zap.String("list_type", "none"),
+			zap.String("request_phase", requestPhase),
+			zap.String("trace_id", traceID),
+		)
+		g.recordEvent(EventTypeACL, "deny")
+		g.emitSecurityEvent(ctx, ctxData, EventTypeACL, "deny", "whitelist miss", "block", nil)
+		return ErrMACNotAllowed
+	}
+	observeMACACLCheck("allow", "none", requestPhase)
+	g.deps.Logger.Info("MAC未命中任何黑白灰名单，允许获取地址池IP",
+		zap.String("mac", ctxData.MAC),
+		zap.Bool("enforceWhitelist", g.macACL.enforceWhitelist),
+		zap.String("action", g.macACL.defaultAction),
+		zap.String("list_type", "none"),
+		zap.String("request_phase", requestPhase),
+		zap.String("trace_id", traceID),
+	)
 	return nil
 }
 
@@ -584,11 +752,14 @@ func normalizeMAC(addr string) string {
 }
 
 type macACL struct {
-	whitelist        map[string]struct{}
-	blacklist        map[string]struct{}
-	graylist         map[string]struct{}
-	grayAction       GraylistAction
-	enforceWhitelist bool
+	whitelist          map[string]struct{}
+	blacklist          map[string]struct{}
+	graylist           map[string]struct{}
+	grayAction         GraylistAction
+	enforceWhitelist   bool
+	bindingExemptACL   bool
+	renewExemptBlocked bool
+	defaultAction      string
 }
 
 func normalizeMACACL(cfg *MACACL) *macACL {
@@ -596,11 +767,14 @@ func normalizeMACACL(cfg *MACACL) *macACL {
 		return nil
 	}
 	acl := &macACL{
-		whitelist:        normalizeMACEntries(cfg.Whitelist),
-		blacklist:        normalizeMACEntries(cfg.Blacklist),
-		graylist:         normalizeMACEntries(cfg.Graylist),
-		grayAction:       cfg.GraylistAction,
-		enforceWhitelist: cfg.EnforceWhitelist,
+		whitelist:          normalizeMACEntries(cfg.Whitelist),
+		blacklist:          normalizeMACEntries(cfg.Blacklist),
+		graylist:           normalizeMACEntries(cfg.Graylist),
+		grayAction:         cfg.GraylistAction,
+		enforceWhitelist:   cfg.EnforceWhitelist,
+		bindingExemptACL:   cfg.BindingExemptACL,
+		renewExemptBlocked: cfg.RenewExemptBlocked,
+		defaultAction:      strings.ToLower(strings.TrimSpace(cfg.DefaultAction)),
 	}
 	if acl.grayAction == "" {
 		acl.grayAction = GraylistActionMonitor
@@ -608,8 +782,8 @@ func normalizeMACACL(cfg *MACACL) *macACL {
 	if acl.grayAction != GraylistActionMonitor && acl.grayAction != GraylistActionBlock {
 		acl.grayAction = GraylistActionMonitor
 	}
-	if !acl.enforceWhitelist && len(acl.whitelist) > 0 {
-		acl.enforceWhitelist = true
+	if acl.defaultAction != macACLDefaultActionAllow {
+		acl.defaultAction = macACLDefaultActionAllow
 	}
 	if !acl.hasRules() {
 		return nil
@@ -634,5 +808,5 @@ func normalizeMACEntries(entries []string) map[string]struct{} {
 }
 
 func (m *macACL) hasRules() bool {
-	return m.enforceWhitelist || len(m.whitelist) > 0 || len(m.blacklist) > 0 || len(m.graylist) > 0
+	return m.bindingExemptACL || m.enforceWhitelist || len(m.whitelist) > 0 || len(m.blacklist) > 0 || len(m.graylist) > 0 || m.defaultAction == macACLDefaultActionAllow
 }

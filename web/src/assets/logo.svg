@@ -1,0 +1,64 @@
+<svg width="200" height="200" viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="coreGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop stop-color="#4F8BFF" offset="0%" />
+      <stop stop-color="#2DD4BF" offset="100%" />
+    </linearGradient>
+    <radialGradient id="haloGrad" cx="50%" cy="50%" r="60%">
+      <stop offset="0%" stop-color="#1E3A5F" stop-opacity="0.9" />
+      <stop offset="100%" stop-color="#0B1626" stop-opacity="1" />
+    </radialGradient>
+    <linearGradient id="waveGrad" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#5AB0FF" />
+      <stop offset="100%" stop-color="#22D3EE" />
+    </linearGradient>
+  </defs>
+
+  <rect x="6" y="6" width="188" height="188" rx="24" fill="#07101E" />
+  <circle cx="100" cy="100" r="90" fill="url(#haloGrad)" />
+
+  <g opacity="0.5" stroke="#12314F" stroke-width="1.5">
+    <circle cx="100" cy="100" r="70" />
+    <circle cx="100" cy="100" r="48" />
+  </g>
+
+  <circle cx="100" cy="100" r="20" fill="url(#coreGrad)" stroke="#DFF6FF" stroke-width="1.2" />
+  <circle cx="100" cy="100" r="32" fill="none" stroke="#2DD4BF" stroke-width="1.5" opacity="0.5" stroke-dasharray="4 6" />
+
+  <g stroke-linecap="round" stroke-width="3" stroke="#4F8BFF">
+    <line x1="100" y1="36" x2="100" y2="56" />
+    <line x1="148" y1="52" x2="136" y2="68" />
+    <line x1="168" y1="100" x2="148" y2="100" />
+    <line x1="148" y1="148" x2="136" y2="132" />
+    <line x1="100" y1="168" x2="100" y2="148" />
+    <line x1="52" y1="148" x2="64" y2="132" />
+    <line x1="32" y1="100" x2="52" y2="100" />
+    <line x1="52" y1="52" x2="64" y2="68" />
+  </g>
+
+  <g fill="#5AB0FF" stroke="#DFF6FF" stroke-width="1">
+    <circle cx="100" cy="28" r="5" />
+    <circle cx="156" cy="44" r="4.5" />
+    <circle cx="176" cy="100" r="4.5" />
+    <circle cx="156" cy="156" r="4.5" />
+    <circle cx="100" cy="172" r="5" />
+    <circle cx="44" cy="156" r="4.5" />
+    <circle cx="24" cy="100" r="4.5" />
+    <circle cx="44" cy="44" r="4.5" />
+  </g>
+
+  <g stroke="url(#waveGrad)" stroke-width="4" stroke-linecap="round" fill="none" opacity="0.9">
+    <path d="M46 126 C70 112 90 116 104 124 C118 132 138 136 162 122" />
+    <path d="M46 142 C72 130 92 132 108 140 C124 148 142 152 164 140" opacity="0.6" />
+    <path d="M44 110 C68 96 90 96 112 104 C134 112 152 114 170 102" opacity="0.6" />
+  </g>
+
+  <g fill="#22D3EE" stroke="#DFF6FF" stroke-width="0.8">
+    <circle cx="52" cy="128" r="4" />
+    <circle cx="88" cy="122" r="4" />
+    <circle cx="120" cy="132" r="4" />
+    <circle cx="150" cy="118" r="4" />
+  </g>
+
+  <text x="100" y="34" text-anchor="middle" font-size="0" fill="#fff">Modern DHCP</text>
+</svg>

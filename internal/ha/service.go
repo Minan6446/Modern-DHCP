@@ -29,6 +29,8 @@ type Controller interface {
 	TriggerFailover(context.Context, failover.ManualFailoverRequest) error
 	UpdateIngressPolicy(context.Context, failover.IngressPolicy) error
 	Nodes() []failover.NodeStatus
+	UpsertNode(context.Context, failover.NodeRegistration) error
+	RemoveNode(context.Context, string) error
 }
 
 // Options configures the HA service wiring.
@@ -69,6 +71,22 @@ type LoadPolicy struct {
 	Strategy      string
 	Weights       map[string]int
 	StickySeconds int64
+}
+
+// AllowFailback arms manual failback when controller is available.
+func (s *Service) AllowFailback(ctx context.Context) error {
+	if s == nil || s.controller == nil {
+		return ErrControllerUnavailable
+	}
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
+	s.controller.AllowManualFailback()
+	return nil
 }
 
 // NewService builds a HA helper surface.
@@ -133,6 +151,26 @@ func (s *Service) UpdateLoadPolicy(ctx context.Context, policy LoadPolicy) error
 	return s.controller.UpdateIngressPolicy(ctx, payload)
 }
 
+// UpsertNode applies a dynamic cluster node mutation to the HA controller.
+func (s *Service) UpsertNode(ctx context.Context, node failover.NodeRegistration) error {
+	if s == nil || s.controller == nil {
+		return ErrControllerUnavailable
+	}
+	node.ID = strings.TrimSpace(node.ID)
+	node.Address = strings.TrimSpace(node.Address)
+	node.Region = strings.TrimSpace(node.Region)
+	node.Zone = strings.TrimSpace(node.Zone)
+	return s.controller.UpsertNode(ctx, node)
+}
+
+// RemoveNode removes a dynamic cluster node from HA controller membership.
+func (s *Service) RemoveNode(ctx context.Context, nodeID string) error {
+	if s == nil || s.controller == nil {
+		return ErrControllerUnavailable
+	}
+	return s.controller.RemoveNode(ctx, strings.TrimSpace(nodeID))
+}
+
 // Runbooks returns cached metadata for registered runbook files.
 func (s *Service) Runbooks(ctx context.Context) []Runbook {
 	if s == nil {
@@ -142,6 +180,17 @@ func (s *Service) Runbooks(ctx context.Context) []Runbook {
 		s.runbooks = s.loadRunbooks()
 	})
 	return append([]Runbook(nil), s.runbooks...)
+}
+
+// Mode returns the HA mode reported by the underlying controller when available.
+func (s *Service) Mode() string {
+	if s == nil || s.controller == nil {
+		return ""
+	}
+	if reporter, ok := s.controller.(interface{ Mode() string }); ok {
+		return strings.ToLower(strings.TrimSpace(reporter.Mode()))
+	}
+	return ""
 }
 
 func (s *Service) loadRunbooks() []Runbook {

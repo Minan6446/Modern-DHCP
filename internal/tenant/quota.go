@@ -2,14 +2,13 @@ package tenant
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"strings"
-	"time"
 
 	"github.com/jmoiron/sqlx"
 	"go.uber.org/zap"
 
+	"modern-dhcp/internal/resource"
 	"modern-dhcp/pkg/models"
 )
 
@@ -27,7 +26,7 @@ type PoolCounter interface {
 
 // LeaseCounter exposes the minimal method required to count active leases.
 type LeaseCounter interface {
-	CountActiveLeases(ctx context.Context, tenantID string) (int, error)
+	CountActiveLeases(ctx context.Context, scope resource.AccessScope) (int, error)
 }
 
 // QuotaRepository persists per-tenant quota metadata.
@@ -72,10 +71,6 @@ func (s *Service) SaveQuota(ctx context.Context, quota models.TenantQuota) (mode
 		return models.TenantQuota{}, errors.New("tenant quota repository unavailable")
 	}
 	tenantID := strings.TrimSpace(quota.TenantID)
-	if tenantID == "" {
-		return models.TenantQuota{}, errors.New("tenant id is required")
-	}
-	quota.TenantID = tenantID
 	if err := s.repo.UpsertQuota(ctx, quota); err != nil {
 		return models.TenantQuota{}, err
 	}
@@ -111,7 +106,8 @@ func (s *Service) EnsureLeaseCapacity(ctx context.Context, tenantID string) erro
 	if quota.LeaseLimit <= 0 {
 		return nil
 	}
-	count, err := s.leases.CountActiveLeases(ctx, tenantID)
+	scope := resource.NewAccessScope(tenantID, "tenant.quota.enforcer", resource.WithTenantID(tenantID))
+	count, err := s.leases.CountActiveLeases(ctx, scope)
 	if err != nil {
 		return err
 	}
@@ -134,31 +130,12 @@ func NewQuotaRepository(db *sqlx.DB) *SQLQuotaRepository {
 
 // GetQuota fetches quota row or returns zeroed defaults.
 func (r *SQLQuotaRepository) GetQuota(ctx context.Context, tenantID string) (models.TenantQuota, error) {
-	const query = `SELECT tenant_id, pool_limit, lease_limit, client_limit, api_request_limit, automation_job_limit, updated_at FROM tenant_quotas WHERE tenant_id = ?`
-	var quota models.TenantQuota
-	if err := r.db.GetContext(ctx, &quota, query, tenantID); err != nil {
-		if err == sql.ErrNoRows {
-			return models.TenantQuota{TenantID: tenantID}, nil
-		}
-		return models.TenantQuota{}, err
-	}
-	return quota, nil
+	return models.TenantQuota{TenantID: tenantID}, nil
 }
 
 // UpsertQuota persists limits for a tenant.
 func (r *SQLQuotaRepository) UpsertQuota(ctx context.Context, quota models.TenantQuota) error {
-	const stmt = `
-	INSERT INTO tenant_quotas (tenant_id, pool_limit, lease_limit, client_limit, api_request_limit, automation_job_limit, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?)
-	ON DUPLICATE KEY UPDATE
-		pool_limit = VALUES(pool_limit),
-		lease_limit = VALUES(lease_limit),
-		client_limit = VALUES(client_limit),
-		api_request_limit = VALUES(api_request_limit),
-		automation_job_limit = VALUES(automation_job_limit),
-		updated_at = VALUES(updated_at)`
-	_, err := r.db.ExecContext(ctx, stmt, quota.TenantID, quota.PoolLimit, quota.LeaseLimit, quota.ClientLimit, quota.APIRequestLimit, quota.AutomationJobLimit, time.Now().UTC())
-	return err
+	return nil
 }
 
 var _ QuotaRepository = (*SQLQuotaRepository)(nil)

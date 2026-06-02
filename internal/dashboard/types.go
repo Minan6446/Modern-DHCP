@@ -5,7 +5,9 @@ import (
 	"time"
 
 	"modern-dhcp/internal/failover"
+	"modern-dhcp/internal/lease"
 	"modern-dhcp/internal/monitoring"
+	"modern-dhcp/pkg/auditpayload"
 )
 
 // HealthHook mirrors the server health interface so dashboard snapshots can run probes.
@@ -41,6 +43,7 @@ type KPISnapshot struct {
 	ClientDistribution monitoring.ClientDistributionSnapshot `json:"clientDistribution"`
 	SystemHealth       monitoring.SystemHealthSnapshot       `json:"systemHealth"`
 	Security           monitoring.SecuritySnapshot           `json:"security"`
+	Scope              auditpayload.ScopeMetadata            `json:"scope,omitempty"`
 }
 
 // StreamType enumerates supported activity stream categories.
@@ -66,13 +69,15 @@ type StreamEntry struct {
 
 // StreamSnapshot is returned by /dashboard/streams.
 type StreamSnapshot struct {
-	GeneratedAt time.Time     `json:"generatedAt"`
-	TenantID    string        `json:"tenantId"`
-	Items       []StreamEntry `json:"items"`
+	GeneratedAt time.Time                  `json:"generatedAt"`
+	TenantID    string                     `json:"tenantId"`
+	Items       []StreamEntry              `json:"items"`
+	Scope       auditpayload.ScopeMetadata `json:"scope,omitempty"`
 }
 
 // StreamOptions controls how dashboard stream payloads are assembled.
 type StreamOptions struct {
+	Scope             lease.ResourceScope
 	TenantID          string
 	Limit             int
 	IncludeAlerts     bool
@@ -86,6 +91,7 @@ type InsightSnapshot struct {
 	TenantActivity  TenantActivitySnapshot     `json:"tenantActivity"`
 	AlertProcessing AlertProcessingSnapshot    `json:"alertProcessing"`
 	Automation      AutomationProgressSnapshot `json:"automation"`
+	Scope           auditpayload.ScopeMetadata `json:"scope,omitempty"`
 }
 
 // TenantActivitySnapshot summarizes active lease trends and hotspots.

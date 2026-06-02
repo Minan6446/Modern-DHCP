@@ -7,20 +7,22 @@ import (
 	"sort"
 	"strconv"
 	"time"
+
+	"modern-dhcp/internal/lease"
 )
 
 // Analytics builds anomaly and capacity planning insights for the tenant.
-func (a *Aggregator) Analytics(ctx context.Context, tenantID string, limit int) (AnalyticsSnapshot, error) {
+func (a *Aggregator) Analytics(ctx context.Context, scope lease.ResourceScope, limit int) (AnalyticsSnapshot, error) {
 	snapshot := AnalyticsSnapshot{GeneratedAt: time.Now().UTC()}
 	if a == nil {
 		return snapshot, errors.New("monitoring: aggregator unavailable")
 	}
-	usage, _, err := a.poolUsage(ctx, tenantID, limit)
+	usage, _, err := a.poolUsage(ctx, scope, limit)
 	if err != nil {
 		return snapshot, err
 	}
-	requests := a.requestSnapshots(tenantID)
-	security := a.securitySnapshot(tenantID)
+	requests := a.requestSnapshots(scope)
+	security := a.securitySnapshot(scope)
 	snapshot.Capacity = buildCapacityInsights(usage)
 	snapshot.Anomalies = detectAnomalies(usage, requests, security)
 	return snapshot, nil

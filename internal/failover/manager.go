@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,11 +43,13 @@ const (
 
 // StatusSnapshot exposes lightweight HA state to other subsystems.
 type StatusSnapshot struct {
-	Role              Role      `json:"role"`
-	State             State     `json:"state"`
-	PeerLastSeen      time.Time `json:"peerLastSeen"`
-	PeerHealthySince  time.Time `json:"peerHealthySince"`
-	ManualFailbackSet bool      `json:"manualFailbackSet"`
+	Role              Role                 `json:"role"`
+	State             State                `json:"state"`
+	FencingEpoch      string               `json:"fencingEpoch,omitempty"`
+	PeerLastSeen      time.Time            `json:"peerLastSeen"`
+	PeerHealthySince  time.Time            `json:"peerHealthySince"`
+	ManualFailbackSet bool                 `json:"manualFailbackSet"`
+	Replication       ReplicationTelemetry `json:"replication"`
 }
 
 // NodeStatus summarizes HA membership details for observability surfaces.
@@ -61,6 +64,17 @@ type NodeStatus struct {
 	LastHeartbeat time.Time `json:"lastHeartbeat"`
 	PeerLastSeen  time.Time `json:"peerLastSeen"`
 	Warnings      []string  `json:"warnings,omitempty"`
+}
+
+// NodeRegistration captures a dynamic HA membership mutation request.
+type NodeRegistration struct {
+	ID       string `json:"id"`
+	Address  string `json:"address,omitempty"`
+	Role     Role   `json:"role"`
+	Region   string `json:"region,omitempty"`
+	Zone     string `json:"zone,omitempty"`
+	Weight   int    `json:"weight,omitempty"`
+	Disabled bool   `json:"disabled,omitempty"`
 }
 
 // ManualFailoverRequest describes a manual failover/failback operation.
@@ -87,6 +101,8 @@ var (
 	ErrManualFailoverInvalid = errors.New("failover: invalid target role")
 	// ErrIngressControllerUnavailable indicates no ingress controller is wired.
 	ErrIngressControllerUnavailable = errors.New("failover: ingress controller unavailable")
+	// ErrNodeRegistrationInvalid indicates the node payload cannot be applied.
+	ErrNodeRegistrationInvalid = errors.New("failover: invalid node registration")
 )
 
 // StatusReporter exposes HA snapshots to other packages (e.g. HTTP server healthz).
@@ -127,6 +143,9 @@ type Manager struct {
 	failbackStable        time.Duration
 	manualFailbackAllowed atomic.Bool
 	metrics               metricsRecorder
+	dynamicNodes          map[string]NodeRegistration
+	replication           ReplicationTelemetry
+	fencingEpoch          string
 }
 
 // NewManager constructs a HA manager for the provided configuration. The
@@ -140,7 +159,7 @@ func NewManager(cfg config.HAConfig, logger *zap.Logger) *Manager {
 		logger:                logger,
 		role:                  RoleUnknown,
 		state:                 StateInit,
-		replicator:            defaultReplicator(),
+		replicator:            buildReplicator(cfg, logger),
 		configWatcher:         defaultConfigWatcher(),
 		coordinator:           buildCoordinator(cfg, logger),
 		heartbeat:             defaultHeartbeat(),
@@ -156,6 +175,9 @@ func NewManager(cfg config.HAConfig, logger *zap.Logger) *Manager {
 		probeFailureThreshold: cfg.Probe.FailureThreshold,
 		responder:             buildProbeResponder(cfg, logger),
 		metrics:               noopMetricsRecorder{},
+		dynamicNodes:          make(map[string]NodeRegistration),
+		replication:           ReplicationTelemetry{Healthy: true},
+		fencingEpoch:          nextFencingEpoch(),
 	}
 	if mgr.probeFailureThreshold <= 0 {
 		mgr.probeFailureThreshold = 3
@@ -415,7 +437,23 @@ func (m *Manager) observeReplication() {
 	if m.replicator == nil {
 		return
 	}
-	if !m.replicator.Healthy() {
+	healthy := m.replicator.Healthy()
+	telemetry := ReplicationTelemetry{
+		Healthy:   healthy,
+		UpdatedAt: time.Now().UTC(),
+	}
+	if reporter, ok := m.replicator.(ReplicationTelemetryReporter); ok {
+		reported := reporter.ReplicationTelemetry()
+		if reported.UpdatedAt.IsZero() {
+			reported.UpdatedAt = telemetry.UpdatedAt
+		}
+		reported.Healthy = reported.Healthy && healthy
+		telemetry = reported
+	}
+	m.mu.Lock()
+	m.replication = telemetry
+	m.mu.Unlock()
+	if !telemetry.Healthy {
 		m.logger.Warn("replicator unhealthy; standby sync may lag")
 	}
 }
@@ -427,6 +465,7 @@ func (m *Manager) setRole(role Role) {
 	if changed {
 		m.logger.Info("failover role change", zap.String("from", string(prev)), zap.String("to", string(role)))
 		m.role = role
+		m.fencingEpoch = nextFencingEpoch()
 		if role == RoleStandby {
 			m.manualFailbackAllowed.Store(false)
 		}
@@ -567,7 +606,31 @@ func (m *Manager) Nodes() []NodeStatus {
 		self.Warnings = warn
 	}
 	nodes := []NodeStatus{self}
-	if !m.peerLastSeen.IsZero() {
+	for _, reg := range m.dynamicNodes {
+		if reg.Disabled {
+			continue
+		}
+		id := strings.TrimSpace(reg.ID)
+		if id == "" || id == self.ID {
+			continue
+		}
+		last := time.Now().UTC()
+		if reg.Role == RoleStandby && !m.peerLastSeen.IsZero() {
+			last = m.peerLastSeen
+		}
+		nodes = append(nodes, NodeStatus{
+			ID:            id,
+			Role:          reg.Role,
+			State:         m.state,
+			Region:        reg.Region,
+			Zone:          reg.Zone,
+			Weight:        reg.Weight,
+			Self:          false,
+			LastHeartbeat: last,
+			PeerLastSeen:  m.peerLastSeen,
+		})
+	}
+	if len(nodes) == 1 && !m.peerLastSeen.IsZero() {
 		nodes = append(nodes, NodeStatus{
 			ID:            "peer",
 			Role:          oppositeRole(m.role),
@@ -579,6 +642,98 @@ func (m *Manager) Nodes() []NodeStatus {
 	return nodes
 }
 
+// UpsertNode applies a dynamic HA member mutation and updates partner wiring for standby peers.
+func (m *Manager) UpsertNode(ctx context.Context, node NodeRegistration) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if m == nil {
+		return ErrManualFailoverDisabled
+	}
+	id := strings.TrimSpace(node.ID)
+	if id == "" {
+		id = strings.TrimSpace(node.Address)
+	}
+	if id == "" {
+		return ErrNodeRegistrationInvalid
+	}
+	role := node.Role
+	if role == RoleUnknown {
+		role = RoleStandby
+	}
+	node.ID = id
+	node.Role = role
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if id == strings.TrimSpace(m.cfg.Node.ID) || role == RolePrimary {
+		m.cfg.Node.ID = id
+		if strings.TrimSpace(node.Region) != "" {
+			m.cfg.Node.Region = strings.TrimSpace(node.Region)
+		}
+		if strings.TrimSpace(node.Zone) != "" {
+			m.cfg.Node.Zone = strings.TrimSpace(node.Zone)
+		}
+		if node.Weight > 0 {
+			m.cfg.Node.Weight = node.Weight
+		}
+		m.dynamicNodes[id] = node
+		return nil
+	}
+
+	if node.Disabled {
+		delete(m.dynamicNodes, id)
+		if m.cfg.Partner.Address == strings.TrimSpace(node.Address) {
+			m.cfg.Partner.Address = ""
+			m.cfg.Partner.Enabled = false
+		}
+		return nil
+	}
+
+	m.dynamicNodes[id] = node
+	if role == RoleStandby {
+		if addr := strings.TrimSpace(node.Address); addr != "" {
+			m.cfg.Partner.Address = addr
+			m.cfg.Partner.Enabled = true
+		}
+	}
+	return nil
+}
+
+// RemoveNode removes a dynamic HA member by identifier.
+func (m *Manager) RemoveNode(ctx context.Context, nodeID string) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if m == nil {
+		return ErrManualFailoverDisabled
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return ErrNodeRegistrationInvalid
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	reg, ok := m.dynamicNodes[nodeID]
+	if !ok {
+		return nil
+	}
+	delete(m.dynamicNodes, nodeID)
+	if reg.Role == RoleStandby {
+		if strings.TrimSpace(reg.Address) == strings.TrimSpace(m.cfg.Partner.Address) {
+			m.cfg.Partner.Address = ""
+			m.cfg.Partner.Enabled = false
+		}
+	}
+	return nil
+}
+
 func (m *Manager) nodeWarningsLocked() []string {
 	var warnings []string
 	switch m.state {
@@ -588,6 +743,14 @@ func (m *Manager) nodeWarningsLocked() []string {
 		warnings = append(warnings, "peer down")
 	}
 	return warnings
+}
+
+// Mode reports the configured failover mode string.
+func (m *Manager) Mode() string {
+	if m == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(m.cfg.Mode))
 }
 
 func oppositeRole(role Role) Role {
@@ -607,10 +770,16 @@ func (m *Manager) Snapshot() StatusSnapshot {
 	return StatusSnapshot{
 		Role:              m.role,
 		State:             m.state,
+		FencingEpoch:      m.fencingEpoch,
 		PeerLastSeen:      m.peerLastSeen,
 		PeerHealthySince:  m.peerHealthySince,
 		ManualFailbackSet: m.manualFailbackAllowed.Load(),
+		Replication:       m.replication,
 	}
+}
+
+func nextFencingEpoch() string {
+	return strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 }
 
 func (m *Manager) handleProbeResult(res ProbeResult) {

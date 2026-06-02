@@ -4,6 +4,7 @@ import "time"
 
 // LeaseHistoryFilter constrains historical lease lookups.
 type LeaseHistoryFilter struct {
+	PoolID     string    `json:"poolId,omitempty"`
 	State      string    `json:"state,omitempty"`
 	Identifier string    `json:"identifier,omitempty"`
 	IPAddress  string    `json:"ipAddress,omitempty"`

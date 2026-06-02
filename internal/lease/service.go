@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/netip"
 	"sort"
@@ -13,12 +14,16 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	"modern-dhcp/internal/audit"
 	"modern-dhcp/internal/config"
+	"modern-dhcp/internal/dhcpv4/lock"
+	"modern-dhcp/internal/failover"
 	"modern-dhcp/internal/metrics"
 	"modern-dhcp/internal/netutil"
+	"modern-dhcp/internal/pool"
 	"modern-dhcp/internal/tenant"
 	"modern-dhcp/pkg/auditpayload"
 	"modern-dhcp/pkg/models"
@@ -37,11 +42,13 @@ var (
 	ErrPoolProtection       = errors.New("lease: pool is in protection mode")
 	ErrClientIsolated       = errors.New("lease: client isolated due to security policy")
 	ErrTenantRequired       = errors.New("lease: tenant id required")
+	ErrPrimaryRequired      = errors.New("lease: write requires primary role")
 )
 
 // ConflictProber checks whether an IP address already responds on the network.
 type ConflictProber interface {
-	Probe(ctx context.Context, addr netip.Addr) (bool, time.Duration, error)
+	ProbeARP(ctx context.Context, addr netip.Addr) (bool, time.Duration, error)
+	ProbeICMP(ctx context.Context, addr netip.Addr) (bool, time.Duration, error)
 }
 
 const (
@@ -64,13 +71,25 @@ const (
 
 // PoolReader exposes read-only pool lookups used during allocation.
 type PoolReader interface {
-	GetPool(ctx context.Context, tenantID, poolID string) (*models.AddressPool, error)
+	GetPool(ctx context.Context, scope pool.ResourceScope, poolID string) (*models.AddressPool, error)
+	FindBinding(ctx context.Context, scope pool.ResourceScope, identifier, ip string) (*models.StaticBinding, error)
+	ListBindingsByPool(ctx context.Context, scope pool.ResourceScope, poolID string) ([]models.StaticBinding, error)
 }
 
 // ReplicationJournal ensures lease writes are durably persisted to the CDC/journal plane
 // before ACKs are returned to clients.
 type ReplicationJournal interface {
 	ConfirmLease(ctx context.Context, lease *models.Lease) error
+}
+
+// SyncAckGate blocks response paths until peer synchronization ACK is confirmed.
+type SyncAckGate interface {
+	AwaitLeaseSyncAck(ctx context.Context, lease *models.Lease) error
+}
+
+// FailoverStatusReporter provides HA role snapshots for write guard checks.
+type FailoverStatusReporter interface {
+	Snapshot() failover.StatusSnapshot
 }
 
 // Service coordinates lease lifecycle operations.
@@ -84,6 +103,9 @@ type Service struct {
 	notifier       NotificationScheduler
 	metrics        *metrics.Collector
 	replication    ReplicationJournal
+	syncAckGate    SyncAckGate
+	syncAckPolicy  string
+	failoverStatus FailoverStatusReporter
 	auditSvc       *audit.Service
 	rrMu           sync.Mutex
 	rrCursor       map[string]uint32
@@ -93,6 +115,8 @@ type Service struct {
 	poolStates     map[string]poolThresholdState
 	conflictProber ConflictProber
 	conflictCfg    config.ConflictPreventionConfig
+	redisClient    redis.UniversalClient
+	allocLock      *lock.Manager
 }
 
 // ServiceOption configures optional lease service dependencies.
@@ -141,11 +165,41 @@ func WithReplicationJournal(journal ReplicationJournal) ServiceOption {
 	}
 }
 
+// WithSyncAckGate wires peer ACK confirmation into lease write paths.
+func WithSyncAckGate(gate SyncAckGate) ServiceOption {
+	return func(s *Service) {
+		s.syncAckGate = gate
+	}
+}
+
+// WithSyncAckPolicy controls behavior when peer ACK confirmation fails.
+// Supported values: strict, degraded.
+func WithSyncAckPolicy(policy string) ServiceOption {
+	return func(s *Service) {
+		s.syncAckPolicy = strings.ToLower(strings.TrimSpace(policy))
+	}
+}
+
+// WithFailoverStatusReporter wires HA snapshot reporting for primary write guard.
+func WithFailoverStatusReporter(reporter FailoverStatusReporter) ServiceOption {
+	return func(s *Service) {
+		s.failoverStatus = reporter
+	}
+}
+
 // WithConflictPrevention wires an IP conflict prober into the lease service.
 func WithConflictPrevention(cfg config.ConflictPreventionConfig, prober ConflictProber) ServiceOption {
 	return func(s *Service) {
 		s.conflictCfg = cfg
 		s.conflictProber = prober
+	}
+}
+
+// WithRedisAllocator enables Redis lock and bitmap acceleration for IPv4 allocation.
+func WithRedisAllocator(client redis.UniversalClient) ServiceOption {
+	return func(s *Service) {
+		s.redisClient = client
+		s.allocLock = lock.NewManager(client)
 	}
 }
 
@@ -215,13 +269,14 @@ type ComplianceMetadata struct {
 // NewService builds a lease service.
 func NewService(repo Repository, poolReader PoolReader, cfg config.PolicyConfig, logger *zap.Logger, opts ...ServiceOption) *Service {
 	svc := &Service{
-		repo:       repo,
-		poolReader: poolReader,
-		cfg:        cfg,
-		logger:     logger,
-		rrCursor:   make(map[string]uint32),
-		isolation:  make(map[string]*isolationEntry),
-		poolStates: make(map[string]poolThresholdState),
+		repo:          repo,
+		poolReader:    poolReader,
+		cfg:           cfg,
+		logger:        logger,
+		syncAckPolicy: "strict",
+		rrCursor:      make(map[string]uint32),
+		isolation:     make(map[string]*isolationEntry),
+		poolStates:    make(map[string]poolThresholdState),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -231,15 +286,58 @@ func NewService(repo Repository, poolReader PoolReader, cfg config.PolicyConfig,
 	return svc
 }
 
+func (s *Service) tenantFromScope(scope ResourceScope) (string, error) {
+	tenantID := strings.TrimSpace(scope.TenantOrDefault())
+	if tenantID == "" {
+		return "", ErrTenantRequired
+	}
+	return tenantID, nil
+}
+
+// HasValidLease reports whether the given MAC currently has an unexpired active lease.
+func (s *Service) HasValidLease(ctx context.Context, mac string) (bool, error) {
+	identifier := strings.TrimSpace(mac)
+	if identifier == "" {
+		return false, nil
+	}
+	tenantID := TenantIDFromContext(ctx)
+	if tenantID == "" {
+		return false, nil
+	}
+	scopeRef := NewResourceScope(tenantID, tenantID)
+	leaseRecord, err := s.repo.GetActiveLease(ctx, scopeRef.AccessScope(), identifier)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if leaseRecord == nil {
+		return false, nil
+	}
+	return leaseRecord.ExpiresAt.After(time.Now().UTC()), nil
+}
+
+func (s *Service) ensurePrimaryWrite(op string) error {
+	if s == nil || s.failoverStatus == nil {
+		return nil
+	}
+	snap := s.failoverStatus.Snapshot()
+	if snap.Role == failover.RolePrimary || snap.Role == failover.RoleUnknown {
+		return nil
+	}
+	return fmt.Errorf("%w: operation=%s role=%s state=%s", ErrPrimaryRequired, strings.TrimSpace(op), snap.Role, snap.State)
+}
+
 // AllocateOrReuse either reuses an existing lease or creates a new one.
-func (s *Service) AllocateOrReuse(ctx context.Context, tenantID, identifier string, profile models.LeaseProfile, poolID, ip string) (*Result, error) {
-	return s.AllocateOrReuseWithMetadata(ctx, tenantID, identifier, profile, poolID, ip, AllocationMetadata{})
+func (s *Service) AllocateOrReuse(ctx context.Context, scope ResourceScope, identifier string, profile models.LeaseProfile, poolID, ip string) (*Result, error) {
+	return s.AllocateOrReuseWithMetadata(ctx, scope, identifier, profile, poolID, ip, AllocationMetadata{})
 }
 
 // History returns historical lease records for a tenant with optional filters.
-func (s *Service) History(ctx context.Context, tenantID string, filter models.LeaseHistoryFilter) ([]models.Lease, int, error) {
-	if strings.TrimSpace(tenantID) == "" {
-		return nil, 0, ErrTenantRequired
+func (s *Service) History(ctx context.Context, scope ResourceScope, filter models.LeaseHistoryFilter) ([]models.Lease, int, error) {
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return nil, 0, err
 	}
 	if filter.Limit <= 0 {
 		filter.Limit = historyDefaultLimit
@@ -250,11 +348,7 @@ func (s *Service) History(ctx context.Context, tenantID string, filter models.Le
 	if filter.Offset < 0 {
 		filter.Offset = 0
 	}
-	records, err := s.repo.SearchLeaseHistory(ctx, tenantID, filter)
-	if err != nil {
-		return nil, 0, err
-	}
-	total, err := s.repo.CountLeaseHistory(ctx, tenantID, filter)
+	records, total, err := s.repo.SearchLeaseHistory(ctx, scope.AccessScope(), filter)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -262,7 +356,15 @@ func (s *Service) History(ctx context.Context, tenantID string, filter models.Le
 }
 
 // AllocateOrReuseWithMetadata augments allocation with user context for exhaustion controls.
-func (s *Service) AllocateOrReuseWithMetadata(ctx context.Context, tenantID, identifier string, profile models.LeaseProfile, poolID, ip string, meta AllocationMetadata) (*Result, error) {
+func (s *Service) AllocateOrReuseWithMetadata(ctx context.Context, scope ResourceScope, identifier string, profile models.LeaseProfile, poolID, ip string, meta AllocationMetadata) (*Result, error) {
+	tenantID, err := s.tenantFromScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.ensurePrimaryWrite("lease.allocate_or_reuse"); err != nil {
+		return nil, err
+	}
+	access := scope.AccessScope()
 	if err := s.checkIsolation(tenantID, identifier); err != nil {
 		return nil, err
 	}
@@ -275,10 +377,10 @@ allocate:
 	if attempt > maxAttempts {
 		return nil, ErrNoAvailableIP
 	}
-	existing, err := s.repo.GetActiveLease(ctx, tenantID, identifier)
+	existing, err := s.repo.GetActiveLease(ctx, access, identifier)
 	if err == nil {
 		s.logger.Debug("reusing lease", zap.String("leaseId", existing.ID))
-		pool, perr := s.ensurePool(ctx, tenantID, existing.PoolID)
+		pool, perr := s.ensurePool(ctx, scope, existing.PoolID)
 		if perr != nil {
 			return nil, perr
 		}
@@ -288,12 +390,11 @@ allocate:
 		s.applyMobilityMetadata(existing, meta)
 		s.applyComplianceMetadata(existing, meta)
 		s.applyLeaseTiming(existing, profile)
-		if err := s.repo.UpdateLease(ctx, existing); err != nil {
+		_ = s.bitmapSetByIP(ctx, pool, existing.IPAddress, false)
+		if err := s.persistLeaseUpdate(ctx, existing, pool); err != nil {
 			return nil, err
 		}
-		if err := s.confirmReplication(ctx, existing); err != nil {
-			return nil, err
-		}
+		s.recordBindingSeen(ctx, scope, identifier, existing.IPAddress)
 		res := &Result{Lease: existing, Reused: true, Profile: profile, RenewalTime: profile.RenewalTime, RebindingTime: profile.RebindingTime, Pool: pool}
 		retry, err := s.enforceConflictPrevention(ctx, tenantID, identifier, res)
 		if err != nil {
@@ -316,11 +417,13 @@ allocate:
 		}
 		return res, nil
 	}
-	if err != nil && err != ErrNotFound {
+	if errors.Is(err, ErrNotFound) {
+		// proceed to new allocation
+	} else {
 		return nil, err
 	}
 
-	if err := s.enforceLeaseLimits(ctx, tenantID, identifier, meta); err != nil {
+	if err := s.enforceLeaseLimits(ctx, scope, tenantID, identifier, meta); err != nil {
 		return nil, err
 	}
 	if s.quota != nil {
@@ -329,17 +432,45 @@ allocate:
 		}
 	}
 
+	var binding *models.StaticBinding
+	bindingMatch := false
+	if candidate, match, err := s.lookupBinding(ctx, scope, identifier, ip); err != nil {
+		return nil, err
+	} else {
+		binding = candidate
+		bindingMatch = match
+		if binding != nil && bindingMatch {
+			poolID = binding.PoolID
+			if binding.IPAddress != "" {
+				ip = binding.IPAddress
+			}
+		}
+	}
+
 	if poolID == "" {
 		return nil, ErrPoolRequired
 	}
-	pool, err := s.ensurePool(ctx, tenantID, poolID)
+	pool, err := s.ensurePool(ctx, scope, poolID)
 	if err != nil {
 		return nil, err
 	}
-	selectedIP, err := s.pickIPAddress(ctx, tenantID, pool, ip)
+	poolLock, err := s.acquirePoolLock(ctx, pool.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer poolLock.Unlock(context.Background())
+	reserved, err := s.bindingsForPool(ctx, scope, pool.ID)
+	if err != nil {
+		return nil, err
+	}
+	bindingForAllocation := binding
+	if !bindingMatch {
+		bindingForAllocation = nil
+	}
+	selectedIP, err := s.pickIPAddress(ctx, scope, pool, ip, bindingForAllocation, reserved)
 	if err != nil {
 		if errors.Is(err, ErrNoAvailableIP) && s.conflictEnabled() {
-			if reclaimed, ok, reclaimErr := s.tryReclaimConflictLease(ctx, tenantID, identifier, profile, pool, meta); reclaimErr != nil {
+			if reclaimed, ok, reclaimErr := s.tryReclaimConflictLease(ctx, scope, identifier, profile, pool, meta); reclaimErr != nil {
 				return nil, reclaimErr
 			} else if ok {
 				return reclaimed, nil
@@ -367,12 +498,11 @@ allocate:
 	s.applyComplianceMetadata(lease, meta)
 	s.applyLeaseTiming(lease, profile)
 
-	if err := s.repo.CreateLease(ctx, lease); err != nil {
+	_ = s.bitmapSetByIP(ctx, pool, lease.IPAddress, false)
+	if err := s.persistLeaseCreate(ctx, lease, pool); err != nil {
 		return nil, err
 	}
-	if err := s.confirmReplication(ctx, lease); err != nil {
-		return nil, err
-	}
+	s.recordBindingSeen(ctx, scope, identifier, lease.IPAddress)
 
 	res := &Result{Lease: lease, Reused: false, Profile: profile, RenewalTime: profile.RenewalTime, RebindingTime: profile.RebindingTime, Pool: pool}
 	retry, err := s.enforceConflictPrevention(ctx, tenantID, identifier, res)
@@ -398,6 +528,22 @@ allocate:
 	return res, nil
 }
 
+func (s *Service) recordBindingSeen(ctx context.Context, scope ResourceScope, identifier, ip string) {
+	if s.poolReader == nil {
+		return
+	}
+	writer, ok := s.poolReader.(interface {
+		RecordBindingSeen(ctx context.Context, scope pool.ResourceScope, identifier, ip, source string, seenAt time.Time) error
+	})
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(identifier) == "" && strings.TrimSpace(ip) == "" {
+		return
+	}
+	_ = writer.RecordBindingSeen(ctx, pool.ResourceScopeFromAccess(scope.AccessScope()), identifier, ip, "dhcp", time.Now().UTC())
+}
+
 func (s *Service) confirmReplication(ctx context.Context, lease *models.Lease) error {
 	if s.replication == nil {
 		return nil
@@ -412,25 +558,114 @@ func (s *Service) confirmReplication(ctx context.Context, lease *models.Lease) e
 	return nil
 }
 
-func (s *Service) ensurePool(ctx context.Context, tenantID, poolID string) (*models.AddressPool, error) {
+func (s *Service) confirmSyncAck(ctx context.Context, lease *models.Lease) error {
+	if s.syncAckGate == nil || lease == nil {
+		return nil
+	}
+	policy := strings.ToLower(strings.TrimSpace(s.syncAckPolicy))
+	if policy == "" {
+		policy = "strict"
+	}
+	if err := s.syncAckGate.AwaitLeaseSyncAck(ctx, lease); err != nil {
+		reason := classifySyncAckError(err)
+		if s.metrics != nil && s.metrics.LeaseSyncAckFailures != nil {
+			s.metrics.LeaseSyncAckFailures.WithLabelValues(strings.TrimSpace(lease.TenantID), policy, reason).Inc()
+		}
+		if policy == "degraded" {
+			if s.logger != nil {
+				s.logger.Warn("lease sync ack gate degraded", zap.String("leaseId", lease.ID), zap.String("reason", reason), zap.Error(err))
+			}
+			return nil
+		}
+		return fmt.Errorf("sync ack gate (%s): %w", reason, err)
+	}
+	return nil
+}
+
+func classifySyncAckError(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if msg == "" {
+		return "unknown"
+	}
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline") {
+		return "ack_timeout"
+	}
+	if strings.Contains(msg, "refused") {
+		return "ack_conn_refused"
+	}
+	if strings.Contains(msg, "reject") {
+		return "ack_rejected"
+	}
+	if strings.Contains(msg, "mismatch") || strings.Contains(msg, "invalid") || strings.Contains(msg, "decode") {
+		return "ack_protocol_error"
+	}
+	return "ack_io_error"
+}
+
+func (s *Service) ensurePool(ctx context.Context, scope ResourceScope, poolID string) (*models.AddressPool, error) {
 	if s.poolReader == nil {
 		return nil, ErrPoolReaderMissing
 	}
-	return s.poolReader.GetPool(ctx, tenantID, poolID)
+	if _, err := scope.TenantIDOrErr(); err != nil {
+		return nil, err
+	}
+	poolScope := pool.ResourceScopeFromAccess(scope.AccessScope())
+	return s.poolReader.GetPool(ctx, poolScope, poolID)
 }
 
-func (s *Service) pickIPAddress(ctx context.Context, tenantID string, pool *models.AddressPool, preferred string) (string, error) {
+func (s *Service) lookupBinding(ctx context.Context, scope ResourceScope, identifier, requestedIP string) (*models.StaticBinding, bool, error) {
+	if s.poolReader == nil {
+		return nil, false, nil
+	}
+	if strings.TrimSpace(identifier) == "" && strings.TrimSpace(requestedIP) == "" {
+		return nil, false, nil
+	}
+	pBinding, err := s.poolReader.FindBinding(ctx, pool.ResourceScopeFromAccess(scope.AccessScope()), identifier, requestedIP)
+	if err != nil {
+		if errors.Is(err, pool.ErrNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	matched := false
+	if pBinding != nil && pBinding.Identifier != "" {
+		matched = strings.EqualFold(pBinding.Identifier, identifier)
+	}
+	return pBinding, matched, nil
+}
+
+func (s *Service) bindingsForPool(ctx context.Context, scope ResourceScope, poolID string) ([]models.StaticBinding, error) {
+	if s.poolReader == nil || poolID == "" {
+		return nil, nil
+	}
+	bindings, err := s.poolReader.ListBindingsByPool(ctx, pool.ResourceScopeFromAccess(scope.AccessScope()), poolID)
+	if err != nil {
+		if errors.Is(err, pool.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return bindings, nil
+}
+
+func (s *Service) pickIPAddress(ctx context.Context, scope ResourceScope, pool *models.AddressPool, preferred string, binding *models.StaticBinding, reserved []models.StaticBinding) (string, error) {
 	if pool == nil {
 		return "", ErrPoolRequired
 	}
 	if s.poolReader == nil {
 		return "", ErrPoolReaderMissing
 	}
+	if _, err := scope.TenantIDOrErr(); err != nil {
+		return "", err
+	}
 	prefix, err := netip.ParsePrefix(pool.CIDR)
 	if err != nil {
 		return "", ErrUnsupportedCIDR
 	}
-	usedIPs, err := s.repo.ListActiveIPs(ctx, tenantID, pool.ID)
+	usedIPs, err := s.repo.ListActiveIPs(ctx, scope.AccessScope(), pool.ID)
 	if err != nil {
 		return "", err
 	}
@@ -439,17 +674,27 @@ func (s *Service) pickIPAddress(ctx context.Context, tenantID string, pool *mode
 		usedSet[addr] = struct{}{}
 	}
 	cooldownSet := make(map[string]struct{})
-	if cooldownIPs, err := s.repo.ListCooldownIPs(ctx, tenantID, pool.ID, time.Now().UTC()); err == nil {
+	if cooldownIPs, err := s.repo.ListCooldownIPs(ctx, scope.AccessScope(), pool.ID, time.Now().UTC()); err == nil {
 		for _, addr := range cooldownIPs {
 			cooldownSet[addr] = struct{}{}
 		}
 	} else {
 		return "", err
 	}
-	rangeStart, rangeEnd := s.resolvePoolBounds(pool, prefix)
-	if err := s.evaluatePoolThresholds(pool, len(usedSet), len(cooldownSet), rangeStart, rangeEnd); err != nil {
-		return "", err
+	reservedSet := make(map[string]struct{})
+	if len(reserved) > 0 {
+		for _, b := range reserved {
+			if binding != nil && b.ID == binding.ID {
+				continue
+			}
+			if b.IPAddress == "" {
+				continue
+			}
+			reservedSet[b.IPAddress] = struct{}{}
+			usedSet[b.IPAddress] = struct{}{}
+		}
 	}
+	rangeStart, rangeEnd := s.resolvePoolBounds(pool, prefix)
 	mode := s.normalizeAllocationMode(pool)
 	var (
 		ipv4Ex []ipv4Range
@@ -460,31 +705,80 @@ func (s *Service) pickIPAddress(ctx context.Context, tenantID string, pool *mode
 	} else {
 		ipv6Ex = s.buildIPv6Exclusions(pool, prefix, rangeStart, rangeEnd)
 	}
+	if binding != nil && binding.IPAddress != "" {
+		if addr, err := netip.ParseAddr(binding.IPAddress); err == nil && prefix.Contains(addr) && isUsableHost(prefix, addr) && withinBounds(addr, rangeStart, rangeEnd) && !isExcluded(addr, ipv4Ex, ipv6Ex) {
+			candidate := addr.String()
+			if _, blocked := cooldownSet[candidate]; blocked {
+				return "", ErrNoAvailableIP
+			}
+			if _, taken := usedSet[candidate]; !taken {
+				ok, acdErr := s.acdCheckCandidate(ctx, pool.ID, candidate)
+				if acdErr != nil {
+					return "", acdErr
+				}
+				if ok {
+					return candidate, nil
+				}
+				usedSet[candidate] = struct{}{}
+			}
+			return "", ErrNoAvailableIP
+		}
+	}
 	if preferred != "" {
 		if addr, err := netip.ParseAddr(preferred); err == nil && prefix.Contains(addr) && isUsableHost(prefix, addr) && withinBounds(addr, rangeStart, rangeEnd) && !isExcluded(addr, ipv4Ex, ipv6Ex) {
 			candidate := addr.String()
 			if _, blocked := cooldownSet[candidate]; blocked {
 				// remain under cooldown, pick another
 			} else if _, exists := usedSet[candidate]; !exists {
-				return candidate, nil
+				ok, acdErr := s.acdCheckCandidate(ctx, pool.ID, candidate)
+				if acdErr != nil {
+					return "", acdErr
+				}
+				if ok {
+					return candidate, nil
+				}
+				usedSet[candidate] = struct{}{}
 			}
 		}
+	}
+	if err := s.evaluatePoolThresholds(pool, len(usedSet), len(cooldownSet), rangeStart, rangeEnd); err != nil {
+		return "", err
 	}
 	if prefix.Addr().Is4() {
 		start32 := addrToUint32(rangeStart)
 		end32 := addrToUint32(rangeEnd)
-		switch mode {
-		case models.AllocationModeRoundRobin:
-			if candidate, ok := s.nextAvailableIPv4RoundRobin(pool.ID, start32, end32, usedSet, cooldownSet, pool.ReservePercent, ipv4Ex); ok {
-				return candidate, nil
+		if candidate, ok := s.bitmapFindAvailableIPv4(ctx, pool, rangeStart, rangeEnd, usedSet, cooldownSet, pool.ReservePercent, ipv4Ex); ok {
+			ok, acdErr := s.acdCheckCandidate(ctx, pool.ID, candidate)
+			if acdErr != nil {
+				return "", acdErr
 			}
-		case models.AllocationModePriorityWeighted:
-			if candidate, ok := nextAvailableIPv4Priority(start32, end32, usedSet, cooldownSet, pool.ReservePercent, ipv4Ex, s.normalizePriorityWeight(pool)); ok {
+			if ok {
 				return candidate, nil
 			}
 		}
-		if candidate, ok := nextAvailableIPv4Sequential(start32, end32, usedSet, cooldownSet, pool.ReservePercent, ipv4Ex); ok {
-			return candidate, nil
+		for attempt := 0; attempt < s.conflictAttemptBudget()*8; attempt++ {
+			candidate := ""
+			found := false
+			switch mode {
+			case models.AllocationModeRoundRobin:
+				candidate, found = s.nextAvailableIPv4RoundRobin(pool.ID, start32, end32, usedSet, cooldownSet, pool.ReservePercent, ipv4Ex)
+			case models.AllocationModePriorityWeighted:
+				candidate, found = nextAvailableIPv4Priority(start32, end32, usedSet, cooldownSet, pool.ReservePercent, ipv4Ex, s.normalizePriorityWeight(pool))
+			default:
+				candidate, found = nextAvailableIPv4Sequential(start32, end32, usedSet, cooldownSet, pool.ReservePercent, ipv4Ex)
+			}
+			if !found || candidate == "" {
+				break
+			}
+			ok, acdErr := s.acdCheckCandidate(ctx, pool.ID, candidate)
+			if acdErr != nil {
+				return "", acdErr
+			}
+			if ok {
+				return candidate, nil
+			}
+			usedSet[candidate] = struct{}{}
+			cooldownSet[candidate] = struct{}{}
 		}
 		return "", ErrNoAvailableIP
 	}
@@ -496,8 +790,15 @@ func (s *Service) pickIPAddress(ctx context.Context, tenantID string, pool *mode
 
 // MarkDeclined marks an active lease as declined/conflicted.
 
-func (s *Service) MarkDeclined(ctx context.Context, tenantID, identifier, reason string) error {
-	lease, err := s.repo.GetActiveLease(ctx, tenantID, identifier)
+func (s *Service) MarkDeclined(ctx context.Context, scope ResourceScope, identifier, reason string) error {
+	tenantID, err := s.tenantFromScope(scope)
+	if err != nil {
+		return err
+	}
+	if err := s.ensurePrimaryWrite("lease.mark_declined"); err != nil {
+		return err
+	}
+	lease, err := s.repo.GetActiveLease(ctx, scope.AccessScope(), identifier)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil
@@ -514,8 +815,14 @@ func (s *Service) MarkDeclined(ctx context.Context, tenantID, identifier, reason
 }
 
 // ReleaseLease marks a lease as released by administrators.
-func (s *Service) ReleaseLease(ctx context.Context, tenantID, leaseID string) (*models.Lease, bool, error) {
-	lease, err := s.repo.GetLeaseByID(ctx, tenantID, leaseID)
+func (s *Service) ReleaseLease(ctx context.Context, scope ResourceScope, leaseID string) (*models.Lease, bool, error) {
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return nil, false, err
+	}
+	if err := s.ensurePrimaryWrite("lease.release"); err != nil {
+		return nil, false, err
+	}
+	lease, err := s.repo.GetLeaseByID(ctx, scope.AccessScope(), leaseID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -530,12 +837,22 @@ func (s *Service) ReleaseLease(ctx context.Context, tenantID, leaseID string) (*
 	if err := s.repo.UpdateLease(ctx, lease); err != nil {
 		return nil, false, err
 	}
+	if poolObj, pErr := s.ensurePool(ctx, scope, lease.PoolID); pErr == nil {
+		_ = s.bitmapSetByIP(ctx, poolObj, lease.IPAddress, true)
+	}
 	return lease, true, nil
 }
 
 // DeclineLease marks a lease as declined/conflicted by administrators.
-func (s *Service) DeclineLease(ctx context.Context, tenantID, leaseID string) (*models.Lease, bool, error) {
-	lease, err := s.repo.GetLeaseByID(ctx, tenantID, leaseID)
+func (s *Service) DeclineLease(ctx context.Context, scope ResourceScope, leaseID string) (*models.Lease, bool, error) {
+	tenantID, err := s.tenantFromScope(scope)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := s.ensurePrimaryWrite("lease.decline"); err != nil {
+		return nil, false, err
+	}
+	lease, err := s.repo.GetLeaseByID(ctx, scope.AccessScope(), leaseID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -553,8 +870,14 @@ func (s *Service) DeclineLease(ctx context.Context, tenantID, leaseID string) (*
 }
 
 // ClearCooldown removes cooldown/quarantine state so the lease can be reissued.
-func (s *Service) ClearCooldown(ctx context.Context, tenantID, leaseID string) (*models.Lease, bool, error) {
-	lease, err := s.repo.GetLeaseByID(ctx, tenantID, leaseID)
+func (s *Service) ClearCooldown(ctx context.Context, scope ResourceScope, leaseID string) (*models.Lease, bool, error) {
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return nil, false, err
+	}
+	if err := s.ensurePrimaryWrite("lease.clear_cooldown"); err != nil {
+		return nil, false, err
+	}
+	lease, err := s.repo.GetLeaseByID(ctx, scope.AccessScope(), leaseID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -573,13 +896,25 @@ func (s *Service) ClearCooldown(ctx context.Context, tenantID, leaseID string) (
 }
 
 // ReleasePrefix releases a delegated prefix for a client/IAPD combination.
-func (s *Service) ReleasePrefix(ctx context.Context, tenantID, clientID string, iapdID uint32) error {
-	return s.updatePrefixState(ctx, tenantID, clientID, iapdID, leaseStateReleased)
+func (s *Service) ReleasePrefix(ctx context.Context, scope ResourceScope, clientID string, iapdID uint32) error {
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return err
+	}
+	if err := s.ensurePrimaryWrite("lease.prefix.release"); err != nil {
+		return err
+	}
+	return s.updatePrefixState(ctx, scope, clientID, iapdID, leaseStateReleased)
 }
 
 // DeclinePrefix marks a delegated prefix as declined/conflicted.
-func (s *Service) DeclinePrefix(ctx context.Context, tenantID, clientID string, iapdID uint32) error {
-	return s.updatePrefixState(ctx, tenantID, clientID, iapdID, leaseStateDeclined)
+func (s *Service) DeclinePrefix(ctx context.Context, scope ResourceScope, clientID string, iapdID uint32) error {
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return err
+	}
+	if err := s.ensurePrimaryWrite("lease.prefix.decline"); err != nil {
+		return err
+	}
+	return s.updatePrefixState(ctx, scope, clientID, iapdID, leaseStateDeclined)
 }
 
 func isUsableHost(prefix netip.Prefix, addr netip.Addr) bool {
@@ -1143,13 +1478,13 @@ func (s *Service) normalizeProfile(profile models.LeaseProfile) models.LeaseProf
 	return profile
 }
 
-func (s *Service) enforceLeaseLimits(ctx context.Context, tenantID, identifier string, meta AllocationMetadata) error {
+func (s *Service) enforceLeaseLimits(ctx context.Context, scope ResourceScope, tenantID, identifier string, meta AllocationMetadata) error {
 	identifier = strings.TrimSpace(strings.ToLower(identifier))
 	if identifier == "" {
 		return nil
 	}
 	if limit := s.exhaustion.MaxLeasesPerMAC; limit > 0 {
-		count, err := s.repo.CountActiveLeasesByIdentifier(ctx, tenantID, identifier)
+		count, err := s.repo.CountActiveLeasesByIdentifier(ctx, scope.AccessScope(), identifier)
 		if err != nil {
 			return err
 		}
@@ -1160,7 +1495,7 @@ func (s *Service) enforceLeaseLimits(ctx context.Context, tenantID, identifier s
 		}
 	}
 	if meta.UserID != "" && s.exhaustion.MaxLeasesPerUser > 0 {
-		count, err := s.repo.CountActiveLeasesByUser(ctx, tenantID, meta.UserID)
+		count, err := s.repo.CountActiveLeasesByUser(ctx, scope.AccessScope(), meta.UserID)
 		if err != nil {
 			return err
 		}
@@ -1426,8 +1761,11 @@ func (s *Service) enqueueNotificationJob(ctx context.Context, job NotificationJo
 	}
 }
 
-func (s *Service) updatePrefixState(ctx context.Context, tenantID, clientID string, iapdID uint32, state string) error {
-	lease, err := s.repo.GetActivePrefixLease(ctx, tenantID, clientID, iapdID)
+func (s *Service) updatePrefixState(ctx context.Context, scope ResourceScope, clientID string, iapdID uint32, state string) error {
+	if _, err := scope.TenantIDOrErr(); err != nil {
+		return err
+	}
+	lease, err := s.repo.GetActivePrefixLease(ctx, scope.AccessScope(), clientID, iapdID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil
@@ -1442,57 +1780,133 @@ func (s *Service) updatePrefixState(ctx context.Context, tenantID, clientID stri
 }
 
 // ReleasePrefixByID releases a delegated prefix via its lease ID.
-func (s *Service) ReleasePrefixByID(ctx context.Context, tenantID, prefixLeaseID string) (*models.PrefixLease, bool, error) {
-	return s.updatePrefixStateByID(ctx, tenantID, prefixLeaseID, leaseStateReleased)
+func (s *Service) ReleasePrefixByID(ctx context.Context, scope ResourceScope, prefixLeaseID string) (*models.PrefixLease, bool, error) {
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return nil, false, err
+	}
+	return s.updatePrefixStateByID(ctx, scope, prefixLeaseID, leaseStateReleased)
 }
 
 // DeclinePrefixByID marks a delegated prefix as declined via its lease ID.
-func (s *Service) DeclinePrefixByID(ctx context.Context, tenantID, prefixLeaseID string) (*models.PrefixLease, bool, error) {
-	return s.updatePrefixStateByID(ctx, tenantID, prefixLeaseID, leaseStateDeclined)
+func (s *Service) DeclinePrefixByID(ctx context.Context, scope ResourceScope, prefixLeaseID string) (*models.PrefixLease, bool, error) {
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return nil, false, err
+	}
+	return s.updatePrefixStateByID(ctx, scope, prefixLeaseID, leaseStateDeclined)
 }
 
 // ListPrefixLeases exposes prefix delegation search for HTTP handlers.
-func (s *Service) ListPrefixLeases(ctx context.Context, tenantID, state string, limit, offset int) ([]models.PrefixLease, error) {
-	return s.repo.ListPrefixLeases(ctx, tenantID, state, limit, offset)
+func (s *Service) ListPrefixLeases(ctx context.Context, scope ResourceScope, state string, limit, offset int) ([]models.PrefixLease, error) {
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return nil, err
+	}
+	return s.repo.ListPrefixLeases(ctx, scope.AccessScope(), state, limit, offset)
 }
 
 // ListLeases exposes repository search for HTTP handlers.
-func (s *Service) ListLeases(ctx context.Context, tenantID, state string, limit, offset int) ([]models.Lease, error) {
-	return s.repo.ListLeases(ctx, tenantID, state, limit, offset)
+func (s *Service) ListLeases(ctx context.Context, scope ResourceScope, state string, limit, offset int) ([]models.Lease, error) {
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return nil, err
+	}
+	return s.repo.ListLeases(ctx, scope.AccessScope(), state, limit, offset)
 }
 
 // CountActiveLeasesByPool returns utilization counters keyed by pool ID.
-func (s *Service) CountActiveLeasesByPool(ctx context.Context, tenantID string, poolIDs []string) (map[string]int64, error) {
+func (s *Service) CountActiveLeasesByPool(ctx context.Context, scope ResourceScope, poolIDs []string) (map[string]int64, error) {
 	if s.repo == nil {
 		return nil, errors.New("lease: repository unavailable")
 	}
-	return s.repo.CountActiveLeasesByPool(ctx, tenantID, poolIDs)
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return nil, err
+	}
+	return s.repo.CountActiveLeasesByPool(ctx, scope.AccessScope(), poolIDs)
+}
+
+// CountActiveLeases returns how many active leases exist for the tenant.
+func (s *Service) CountActiveLeases(ctx context.Context, scope ResourceScope) (int, error) {
+	if s.repo == nil {
+		return 0, errors.New("lease: repository unavailable")
+	}
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return 0, err
+	}
+	return s.repo.CountActiveLeases(ctx, scope.AccessScope())
+}
+
+// CountLeasesCreatedSince returns how many leases were created since the given time.
+func (s *Service) CountLeasesCreatedSince(ctx context.Context, scope ResourceScope, since time.Time) (int, error) {
+	if s.repo == nil {
+		return 0, errors.New("lease: repository unavailable")
+	}
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return 0, err
+	}
+	return s.repo.CountLeasesCreatedSince(ctx, scope.AccessScope(), since)
+}
+
+// CountConflictLeasesSince returns how many leases are marked as conflict/declined since the given time.
+func (s *Service) CountConflictLeasesSince(ctx context.Context, scope ResourceScope, since time.Time) (int, error) {
+	if s.repo == nil {
+		return 0, errors.New("lease: repository unavailable")
+	}
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return 0, err
+	}
+	return s.repo.CountConflictLeasesSince(ctx, scope.AccessScope(), since)
+}
+
+// AverageLeaseDurationHours returns average lease duration (in hours) for active leases.
+func (s *Service) AverageLeaseDurationHours(ctx context.Context, scope ResourceScope) (float64, error) {
+	if s.repo == nil {
+		return 0, errors.New("lease: repository unavailable")
+	}
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return 0, err
+	}
+	return s.repo.AverageLeaseDurationHours(ctx, scope.AccessScope())
+}
+
+// CountActiveLeasesByDeviceType aggregates active leases grouped by device type.
+func (s *Service) CountActiveLeasesByDeviceType(ctx context.Context, scope ResourceScope) (map[string]int64, error) {
+	if s.repo == nil {
+		return nil, errors.New("lease: repository unavailable")
+	}
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return nil, err
+	}
+	return s.repo.CountActiveLeasesByDeviceType(ctx, scope.AccessScope())
 }
 
 // UpdateSecurityState persists the security posture for a lease identifier.
 
 // UpdateSecurityState persists the security posture for a lease identifier (MAC/client-id).
-func (s *Service) UpdateSecurityState(ctx context.Context, tenantID, identifier, state string) error {
-	if tenantID == "" || identifier == "" {
+func (s *Service) UpdateSecurityState(ctx context.Context, scope ResourceScope, identifier, state string) error {
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return err
+	}
+	if identifier == "" {
 		return errors.New("lease: tenant and identifier required")
 	}
 	normalized, err := normalizeSecurityState(state)
 	if err != nil {
 		return err
 	}
-	return s.repo.UpdateSecurityState(ctx, tenantID, identifier, normalized, time.Now().UTC())
+	return s.repo.UpdateSecurityState(ctx, scope.AccessScope(), identifier, normalized, time.Now().UTC())
 }
 
 // UpdateLeaseSecurityState sets the security posture for a specific lease ID.
-func (s *Service) UpdateLeaseSecurityState(ctx context.Context, tenantID, leaseID, state string) (*models.Lease, string, bool, error) {
-	if tenantID == "" || leaseID == "" {
+func (s *Service) UpdateLeaseSecurityState(ctx context.Context, scope ResourceScope, leaseID, state string) (*models.Lease, string, bool, error) {
+	if _, err := s.tenantFromScope(scope); err != nil {
+		return nil, "", false, err
+	}
+	if leaseID == "" {
 		return nil, "", false, errors.New("lease: tenant and lease id required")
 	}
 	normalized, err := normalizeSecurityState(state)
 	if err != nil {
 		return nil, "", false, err
 	}
-	lease, err := s.repo.GetLeaseByID(ctx, tenantID, leaseID)
+	lease, err := s.repo.GetLeaseByID(ctx, scope.AccessScope(), leaseID)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -1501,7 +1915,7 @@ func (s *Service) UpdateLeaseSecurityState(ctx context.Context, tenantID, leaseI
 		return lease, previous, false, nil
 	}
 	now := time.Now().UTC()
-	if err := s.repo.UpdateSecurityStateByID(ctx, tenantID, leaseID, normalized, now); err != nil {
+	if err := s.repo.UpdateSecurityStateByID(ctx, scope.AccessScope(), leaseID, normalized, now); err != nil {
 		return nil, "", false, err
 	}
 	lease.SecurityState = normalized
@@ -1509,8 +1923,11 @@ func (s *Service) UpdateLeaseSecurityState(ctx context.Context, tenantID, leaseI
 	return lease, previous, true, nil
 }
 
-func (s *Service) updatePrefixStateByID(ctx context.Context, tenantID, prefixLeaseID string, state string) (*models.PrefixLease, bool, error) {
-	lease, err := s.repo.GetPrefixLeaseByID(ctx, tenantID, prefixLeaseID)
+func (s *Service) updatePrefixStateByID(ctx context.Context, scope ResourceScope, prefixLeaseID string, state string) (*models.PrefixLease, bool, error) {
+	if _, err := scope.TenantIDOrErr(); err != nil {
+		return nil, false, err
+	}
+	lease, err := s.repo.GetPrefixLeaseByID(ctx, scope.AccessScope(), prefixLeaseID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1619,7 +2036,7 @@ func (s *Service) enforceConflictPrevention(ctx context.Context, tenantID, ident
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, s.conflictProbeTimeout())
 	defer cancel()
-	alive, _, probeErr := s.conflictProber.Probe(probeCtx, addr)
+	alive, _, probeErr := s.conflictProber.ProbeICMP(probeCtx, addr)
 	if probeErr != nil {
 		if s.logger != nil {
 			s.logger.Warn("icmp probe failed", zap.String("ip", ip), zap.Error(probeErr))
@@ -1649,12 +2066,15 @@ func (s *Service) enforceConflictPrevention(ctx context.Context, tenantID, ident
 	return true, nil
 }
 
-func (s *Service) tryReclaimConflictLease(ctx context.Context, tenantID, identifier string, profile models.LeaseProfile, pool *models.AddressPool, meta AllocationMetadata) (*Result, bool, error) {
+func (s *Service) tryReclaimConflictLease(ctx context.Context, scope ResourceScope, identifier string, profile models.LeaseProfile, pool *models.AddressPool, meta AllocationMetadata) (*Result, bool, error) {
 	if !s.conflictEnabled() || pool == nil {
 		return nil, false, nil
 	}
 	limit := s.conflictScanLimit()
-	candidates, err := s.repo.ListLeasesByState(ctx, tenantID, pool.ID, leaseStateCooldown, limit)
+	if _, err := scope.TenantIDOrErr(); err != nil {
+		return nil, false, err
+	}
+	candidates, err := s.repo.ListLeasesByState(ctx, scope.AccessScope(), pool.ID, leaseStateCooldown, limit)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1668,7 +2088,7 @@ func (s *Service) tryReclaimConflictLease(ctx context.Context, tenantID, identif
 			continue
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, s.conflictProbeTimeout())
-		alive, _, probeErr := s.conflictProber.Probe(probeCtx, addr)
+		alive, _, probeErr := s.conflictProber.ProbeICMP(probeCtx, addr)
 		cancel()
 		if probeErr != nil {
 			if s.logger != nil {

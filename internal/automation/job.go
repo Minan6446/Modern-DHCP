@@ -75,4 +75,10 @@ type Snapshot struct {
 	ActiveWorkers      int       `json:"activeWorkers"`
 	RegisteredHandlers int       `json:"registeredHandlers"`
 	StartedAt          time.Time `json:"startedAt"`
+	UptimeSeconds      int64     `json:"uptimeSeconds"`
+	AverageWaitMillis  float64   `json:"averageWaitMillis"`
+	AverageRunMillis   float64   `json:"averageRunMillis"`
+	CompletedJobs      int64     `json:"completedJobs"`
+	FailedJobs         int64     `json:"failedJobs"`
+	RetryScheduled     int64     `json:"retryScheduled"`
 }

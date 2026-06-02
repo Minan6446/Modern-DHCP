@@ -11,6 +11,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"modern-dhcp/internal/lease"
 	"modern-dhcp/internal/monitoring"
 	"modern-dhcp/internal/pool"
 	"modern-dhcp/pkg/models"
@@ -127,18 +128,24 @@ type HeatmapSnapshot struct {
 }
 
 // Topology builds a graph from the tenant's pools and utilization.
-func (s *Service) Topology(ctx context.Context, tenantID string) (TopologySnapshot, error) {
+
+func (s *Service) Topology(ctx context.Context, scope lease.ResourceScope) (TopologySnapshot, error) {
 	if s == nil || s.pools == nil || s.leases == nil {
 		return TopologySnapshot{}, ErrDisabled
 	}
-	pools, err := s.pools.ListPools(ctx, tenantID, s.maxNodes, 0)
+	tenantID, err := scope.TenantIDOrErr()
+	if err != nil {
+		return TopologySnapshot{}, err
+	}
+	poolScope := pool.ResourceScopeFromAccess(scope.AccessScope())
+	pools, err := s.pools.ListPools(ctx, poolScope, s.maxNodes, 0)
 	if err != nil {
 		return TopologySnapshot{}, err
 	}
 	if len(pools) == 0 {
 		return TopologySnapshot{GeneratedAt: time.Now().UTC(), TenantID: tenantID}, nil
 	}
-	counts, err := s.leases.CountActiveLeasesByPool(ctx, tenantID, collectPoolIDs(pools))
+	counts, err := s.leases.CountActiveLeasesByPool(ctx, scope, collectPoolIDs(pools))
 	if err != nil {
 		return TopologySnapshot{}, err
 	}
@@ -152,18 +159,23 @@ func (s *Service) Topology(ctx context.Context, tenantID string) (TopologySnapsh
 }
 
 // LeaseHeatmap projects pool utilization onto geo buckets.
-func (s *Service) LeaseHeatmap(ctx context.Context, tenantID string) (HeatmapSnapshot, error) {
+func (s *Service) LeaseHeatmap(ctx context.Context, scope lease.ResourceScope) (HeatmapSnapshot, error) {
 	if s == nil || s.pools == nil || s.leases == nil {
 		return HeatmapSnapshot{}, ErrDisabled
 	}
-	pools, err := s.pools.ListPools(ctx, tenantID, s.heatmapLimit, 0)
+	tenantID, err := scope.TenantIDOrErr()
+	if err != nil {
+		return HeatmapSnapshot{}, err
+	}
+	poolScope := pool.ResourceScopeFromAccess(scope.AccessScope())
+	pools, err := s.pools.ListPools(ctx, poolScope, s.heatmapLimit, 0)
 	if err != nil {
 		return HeatmapSnapshot{}, err
 	}
 	if len(pools) == 0 {
 		return HeatmapSnapshot{GeneratedAt: time.Now().UTC(), TenantID: tenantID}, nil
 	}
-	counts, err := s.leases.CountActiveLeasesByPool(ctx, tenantID, collectPoolIDs(pools))
+	counts, err := s.leases.CountActiveLeasesByPool(ctx, scope, collectPoolIDs(pools))
 	if err != nil {
 		return HeatmapSnapshot{}, err
 	}

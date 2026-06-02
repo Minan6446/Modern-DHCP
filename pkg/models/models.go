@@ -58,16 +58,25 @@ type AddressPool struct {
 	Netmask        string      `db:"netmask" json:"netmask"`
 	RangeStart     string      `db:"range_start" json:"rangeStart"`
 	RangeEnd       string      `db:"range_end" json:"rangeEnd"`
+	Gateway        string      `db:"gateway" json:"gateway"`
+	Option43       string      `db:"option_43" json:"option43"`
+	DNS            StringList  `db:"dns" json:"dns"`
 	VLANID         *int        `db:"vlan_id" json:"vlanId"`
 	InterfaceID    *string     `db:"interface_id" json:"interfaceId"`
 	SSID           *string     `db:"ssid" json:"ssid"`
 	Location       *string     `db:"location" json:"location"`
+	GeoCode        *string     `db:"geo_code" json:"geoCode"`
+	DeviceProfile  *string     `db:"device_profile" json:"deviceProfile"`
+	TagFingerprint *string     `db:"tag_fingerprint" json:"tagFingerprint"`
 	ReservePercent int         `db:"reserve_percent" json:"reservePercent"`
+	MinLeaseTime   int         `db:"min_lease_time" json:"leaseTime"`
+	MaxLeaseTime   int         `db:"max_lease_time" json:"maxLeaseTime"`
 	LeaseProfileID string      `db:"lease_profile_id" json:"leaseProfileId"`
 	Tags           []byte      `db:"tags" json:"tags"`
 	Exclusions     IPRangeList `db:"exclusions" json:"exclusions"`
 	AllocationMode string      `db:"allocation_mode" json:"allocationMode"`
 	PriorityWeight int         `db:"priority_weight" json:"priorityWeight"`
+	Status         string      `db:"status" json:"status"`
 	CreatedAt      time.Time   `db:"created_at" json:"createdAt"`
 	UpdatedAt      time.Time   `db:"updated_at" json:"updatedAt"`
 }
@@ -152,16 +161,20 @@ type PolicyRule struct {
 
 // StaticBinding represents pre-assigned addresses.
 type StaticBinding struct {
-	ID             string    `db:"id" json:"id"`
-	TenantID       string    `db:"tenant_id" json:"tenantId"`
-	Identifier     string    `db:"identifier" json:"identifier"`
-	IdentifierType string    `db:"identifier_type" json:"identifierType"`
-	PoolID         string    `db:"pool_id" json:"poolId"`
-	IPAddress      string    `db:"ip_address" json:"ipAddress"`
-	LeaseProfileID string    `db:"lease_profile_id" json:"leaseProfileId"`
-	Metadata       []byte    `db:"metadata" json:"metadata"`
-	CreatedAt      time.Time `db:"created_at" json:"createdAt"`
-	UpdatedAt      time.Time `db:"updated_at" json:"updatedAt"`
+	ID              string     `db:"id" json:"id"`
+	TenantID        string     `db:"tenant_id" json:"tenantId"`
+	Identifier      string     `db:"identifier" json:"identifier"`
+	IdentifierType  string     `db:"identifier_type" json:"identifierType"`
+	PoolID          string     `db:"pool_id" json:"poolId"`
+	IPAddress       string     `db:"ip_address" json:"ipAddress"`
+	LeaseProfileID  string     `db:"lease_profile_id" json:"leaseProfileId"`
+	Metadata        []byte     `db:"metadata" json:"metadata"`
+	Status          string     `db:"status" json:"status"`
+	StatusSource    *string    `db:"status_source" json:"statusSource"`
+	LastSeenAt      *time.Time `db:"last_seen_at" json:"lastSeenAt"`
+	StatusUpdatedAt *time.Time `db:"status_updated_at" json:"statusUpdatedAt"`
+	CreatedAt       time.Time  `db:"created_at" json:"createdAt"`
+	UpdatedAt       time.Time  `db:"updated_at" json:"updatedAt"`
 }
 
 // AuditEvent captures administrative actions for compliance tracing.

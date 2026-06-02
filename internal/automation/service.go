@@ -43,11 +43,12 @@ type Service struct {
 	logger    *zap.Logger
 	store     JobStore
 
-	mu         sync.Mutex
-	runtimeCtx context.Context
-	cancel     context.CancelFunc
-	started    bool
-	wg         sync.WaitGroup
+	mu              sync.Mutex
+	runtimeCtx      context.Context
+	cancel          context.CancelFunc
+	started         bool
+	wg              sync.WaitGroup
+	scheduleCancels map[JobType]context.CancelFunc
 }
 
 // NewService builds a new automation service instance.
@@ -65,10 +66,11 @@ func NewService(opts ServiceOptions) *Service {
 		schedules[jobType] = cfg
 	}
 	return &Service{
-		scheduler: scheduler,
-		schedules: schedules,
-		logger:    logger,
-		store:     opts.Store,
+		scheduler:       scheduler,
+		schedules:       schedules,
+		logger:          logger,
+		store:           opts.Store,
+		scheduleCancels: make(map[JobType]context.CancelFunc),
 	}
 }
 
@@ -100,14 +102,30 @@ func (s *Service) Snapshot() Snapshot {
 
 // Schedules returns a deterministic slice of configured schedules.
 func (s *Service) Schedules() []ScheduleSummary {
+	s.mu.Lock()
 	entries := make([]ScheduleSummary, 0, len(s.schedules))
 	for jobType, cfg := range s.schedules {
-		entries = append(entries, ScheduleSummary{Type: jobType, Schedule: cfg})
+		entries = append(entries, ScheduleSummary{Type: jobType, Schedule: cloneScheduleConfig(cfg)})
 	}
+	s.mu.Unlock()
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Type < entries[j].Type
 	})
 	return entries
+}
+
+// Schedule returns a copy of the stored schedule configuration for the given job type.
+func (s *Service) Schedule(jobType JobType) (ScheduleConfig, bool) {
+	if s == nil {
+		return ScheduleConfig{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, ok := s.schedules[jobType]
+	if !ok {
+		return ScheduleConfig{}, false
+	}
+	return cloneScheduleConfig(cfg), true
 }
 
 // Start launches the scheduler and recurring job schedules.
@@ -132,6 +150,7 @@ func (s *Service) Start(ctx context.Context) error {
 	s.runtimeCtx = runtimeCtx
 	s.cancel = cancel
 	s.started = true
+	s.scheduleCancels = make(map[JobType]context.CancelFunc, len(s.schedules))
 
 	active := 0
 	for jobType, cfg := range s.schedules {
@@ -139,8 +158,7 @@ func (s *Service) Start(ctx context.Context) error {
 			continue
 		}
 		active++
-		s.wg.Add(1)
-		go s.runSchedule(runtimeCtx, jobType, cfg)
+		s.launchScheduleLocked(jobType, cfg)
 	}
 	s.logger.Info("automation service started", zap.Int("schedules", active))
 	return nil
@@ -159,10 +177,17 @@ func (s *Service) Stop(ctx context.Context) error {
 	}
 	cancel := s.cancel
 	s.started = false
+	cancels := s.scheduleCancels
+	s.scheduleCancels = make(map[JobType]context.CancelFunc)
 	s.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
+	}
+	for _, fn := range cancels {
+		if fn != nil {
+			fn()
+		}
 	}
 	s.wg.Wait()
 	return s.scheduler.Stop(ctx)
@@ -197,6 +222,34 @@ func (s *Service) runSchedule(ctx context.Context, jobType JobType, cfg Schedule
 				s.logger.Warn("failed to enqueue scheduled job", zap.String("jobType", string(jobType)), zap.Error(err))
 			}
 		}
+	}
+}
+
+func (s *Service) launchScheduleLocked(jobType JobType, cfg ScheduleConfig) {
+	if s.runtimeCtx == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(s.runtimeCtx)
+	s.scheduleCancels[jobType] = cancel
+	s.wg.Add(1)
+	go s.runSchedule(ctx, jobType, cloneScheduleConfig(cfg))
+}
+
+// UpdateSchedule overwrites the schedule configuration for a given job type.
+func (s *Service) UpdateSchedule(jobType JobType, cfg ScheduleConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	normalized := sanitizeScheduleConfig(cfg)
+	s.schedules[jobType] = normalized
+
+	if cancel, ok := s.scheduleCancels[jobType]; ok {
+		cancel()
+		delete(s.scheduleCancels, jobType)
+	}
+
+	if s.started && normalized.Enabled && normalized.Interval > 0 {
+		s.launchScheduleLocked(jobType, normalized)
 	}
 }
 
@@ -268,4 +321,52 @@ func (s *Service) normalizeJob(job Job) Job {
 		job.TriggeredBy = triggeredBy
 	}
 	return job
+}
+
+func cloneScheduleConfig(cfg ScheduleConfig) ScheduleConfig {
+	return ScheduleConfig{
+		Enabled:      cfg.Enabled,
+		Interval:     cfg.Interval,
+		InitialDelay: cfg.InitialDelay,
+		TenantID:     cfg.TenantID,
+		Labels:       cloneLabels(cfg.Labels),
+		Payload:      clonePayload(cfg.Payload),
+		Channels:     append([]string(nil), cfg.Channels...),
+	}
+}
+
+func sanitizeScheduleConfig(cfg ScheduleConfig) ScheduleConfig {
+	normalized := cloneScheduleConfig(cfg)
+	normalized.TenantID = strings.TrimSpace(normalized.TenantID)
+	if normalized.Interval < 0 {
+		normalized.Interval = 0
+	}
+	if normalized.InitialDelay < 0 {
+		normalized.InitialDelay = 0
+	}
+	normalized.Channels = normalizeChannels(normalized.Channels)
+	return normalized
+}
+
+func normalizeChannels(channels []string) []string {
+	if len(channels) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(channels))
+	result := make([]string, 0, len(channels))
+	for _, raw := range channels {
+		ch := strings.ToLower(strings.TrimSpace(raw))
+		if ch == "" {
+			continue
+		}
+		if _, exists := seen[ch]; exists {
+			continue
+		}
+		seen[ch] = struct{}{}
+		result = append(result, ch)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }

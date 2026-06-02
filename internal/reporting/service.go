@@ -5,19 +5,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
 	"modern-dhcp/internal/audit"
+	"modern-dhcp/internal/lease"
 	"modern-dhcp/internal/monitoring"
 	"modern-dhcp/pkg/auditpayload"
 )
 
 var (
 	// ErrReportingDisabled is returned when reporting dependencies are missing.
-	ErrReportingDisabled = errors.New("reporting: service disabled")
+	ErrReportingDisabled   = errors.New("reporting: service disabled")
+	ErrTenantScopeRequired = errors.New("reporting: tenant scope required")
 )
 
 // Options wires dependencies for the reporting service.
@@ -59,14 +62,18 @@ func NewService(opts Options) *Service {
 }
 
 // MonthlyUsage generates the monthly address utilization snapshot.
-func (s *Service) MonthlyUsage(ctx context.Context, tenantID string, limit int) (MonthlyUsageReport, error) {
+func (s *Service) MonthlyUsage(ctx context.Context, scope lease.ResourceScope, limit int) (MonthlyUsageReport, error) {
 	if s.monitor == nil {
 		return MonthlyUsageReport{}, ErrReportingDisabled
 	}
 	if limit <= 0 {
 		limit = 50
 	}
-	overview, err := s.monitor.Overview(ctx, tenantID, limit)
+	normalizedScope, tenantID, err := normalizeTenantScope(scope, "")
+	if err != nil {
+		return MonthlyUsageReport{}, err
+	}
+	overview, err := s.monitor.Overview(ctx, normalizedScope, limit)
 	if err != nil {
 		return MonthlyUsageReport{}, err
 	}
@@ -89,12 +96,16 @@ func (s *Service) MonthlyUsage(ctx context.Context, tenantID string, limit int) 
 }
 
 // SecurityCompliance assembles guard findings and admin activity logs.
-func (s *Service) SecurityCompliance(ctx context.Context, tenantID string, limit int) (SecurityComplianceReport, error) {
+func (s *Service) SecurityCompliance(ctx context.Context, scope lease.ResourceScope, limit int) (SecurityComplianceReport, error) {
 	if s.audit == nil {
 		return SecurityComplianceReport{}, ErrReportingDisabled
 	}
 	if limit <= 0 {
 		limit = 200
+	}
+	_, tenantID, err := normalizeTenantScope(scope, "")
+	if err != nil {
+		return SecurityComplianceReport{}, err
 	}
 	filter := audit.ListEventsFilter{
 		Actions: []string{"security.alert", "security.violation", "security.error", "admin.activity"},
@@ -113,6 +124,9 @@ func (s *Service) SecurityCompliance(ctx context.Context, tenantID string, limit
 			if len(evt.Payload) > 0 {
 				if err := json.Unmarshal(evt.Payload, &payload); err == nil {
 					incident.Payload = payload
+					if !payload.Scope.IsZero() {
+						incident.Scope = payload.Scope
+					}
 				}
 			}
 			if evt.Action == "security.violation" {
@@ -141,6 +155,7 @@ func (s *Service) SecurityCompliance(ctx context.Context, tenantID string, limit
 				Sensitive:   payload.Sensitive,
 				ObservedAt:  evt.CreatedAt,
 				Correlation: payload.CorrelationID,
+				Scope:       payload.Scope,
 			}
 			report.AdminActivities = append(report.AdminActivities, record)
 		}
@@ -149,14 +164,18 @@ func (s *Service) SecurityCompliance(ctx context.Context, tenantID string, limit
 }
 
 // CapacityPlanning highlights pools approaching saturation.
-func (s *Service) CapacityPlanning(ctx context.Context, tenantID string, limit int) (CapacityPlanningReport, error) {
+func (s *Service) CapacityPlanning(ctx context.Context, scope lease.ResourceScope, limit int) (CapacityPlanningReport, error) {
 	if s.monitor == nil {
 		return CapacityPlanningReport{}, ErrReportingDisabled
 	}
 	if limit <= 0 {
 		limit = 100
 	}
-	pools, err := s.monitor.Pools(ctx, tenantID, limit)
+	normalizedScope, tenantID, err := normalizeTenantScope(scope, "")
+	if err != nil {
+		return CapacityPlanningReport{}, err
+	}
+	pools, err := s.monitor.Pools(ctx, normalizedScope, limit)
 	if err != nil {
 		return CapacityPlanningReport{}, err
 	}
@@ -181,12 +200,16 @@ func (s *Service) CapacityPlanning(ctx context.Context, tenantID string, limit i
 }
 
 // AuditTrail builds a chronological view filtered by resource/correlation ID.
-func (s *Service) AuditTrail(ctx context.Context, tenantID, resource, correlationID string, limit int) (AuditTrailReport, error) {
+func (s *Service) AuditTrail(ctx context.Context, scope lease.ResourceScope, resource, correlationID string, limit int) (AuditTrailReport, error) {
 	if s.audit == nil {
 		return AuditTrailReport{}, ErrReportingDisabled
 	}
 	if limit <= 0 {
 		limit = 200
+	}
+	_, tenantID, err := normalizeTenantScope(scope, "")
+	if err != nil {
+		return AuditTrailReport{}, err
 	}
 	filter := audit.ListEventsFilter{Resource: resource, CorrelationID: correlationID, Limit: limit}
 	events, err := s.audit.ListEventsFiltered(ctx, tenantID, filter)
@@ -231,4 +254,20 @@ func decodePayloadMap(raw json.RawMessage) (map[string]any, error) {
 		return nil, err
 	}
 	return payload, nil
+}
+
+func normalizeTenantScope(scope lease.ResourceScope, fallback string) (lease.ResourceScope, string, error) {
+	tenant := strings.TrimSpace(scope.TenantOrDefault())
+	if tenant == "" {
+		tenant = strings.TrimSpace(fallback)
+	}
+	if tenant == "" {
+		return scope, "", ErrTenantScopeRequired
+	}
+	if scope.IsZero() {
+		scope = lease.NewResourceScope("", tenant)
+	} else {
+		scope = scope.WithTenantOverride(tenant)
+	}
+	return scope, tenant, nil
 }

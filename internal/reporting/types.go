@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"modern-dhcp/internal/monitoring"
+	"modern-dhcp/pkg/auditpayload"
 	"modern-dhcp/pkg/models"
 )
 
@@ -30,22 +31,24 @@ type SecurityComplianceReport struct {
 
 // SecurityIncident represents a single guard/security audit event.
 type SecurityIncident struct {
-	Action    string    `json:"action"`
-	Actor     string    `json:"actor"`
-	CreatedAt time.Time `json:"createdAt"`
-	Payload   any       `json:"payload,omitempty"`
+	Action    string                     `json:"action"`
+	Actor     string                     `json:"actor"`
+	CreatedAt time.Time                  `json:"createdAt"`
+	Payload   any                        `json:"payload,omitempty"`
+	Scope     auditpayload.ScopeMetadata `json:"scope,omitempty"`
 }
 
 // AdminActivityRecord captures privileged API usage.
 type AdminActivityRecord struct {
-	Actor       string    `json:"actor"`
-	Role        string    `json:"role"`
-	Method      string    `json:"method"`
-	Path        string    `json:"path"`
-	StatusCode  int       `json:"statusCode"`
-	Sensitive   bool      `json:"sensitive"`
-	ObservedAt  time.Time `json:"observedAt"`
-	Correlation string    `json:"correlationId,omitempty"`
+	Actor       string                     `json:"actor"`
+	Role        string                     `json:"role"`
+	Method      string                     `json:"method"`
+	Path        string                     `json:"path"`
+	StatusCode  int                        `json:"statusCode"`
+	Sensitive   bool                       `json:"sensitive"`
+	ObservedAt  time.Time                  `json:"observedAt"`
+	Correlation string                     `json:"correlationId,omitempty"`
+	Scope       auditpayload.ScopeMetadata `json:"scope,omitempty"`
 }
 
 // SecurityComplianceSummary aggregates KPI style counts.

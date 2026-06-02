@@ -16,22 +16,27 @@ type RequestRecorder interface {
 type RequestTracker interface {
 	RequestRecorder
 	Snapshot(tenantID string) []RequestPhaseSnapshot
+	Window() time.Duration
 }
 
 // tracker implements RequestTracker with in-memory aggregates.
 type tracker struct {
 	mu      sync.RWMutex
 	buckets map[string]*requestPhaseStats
+	started time.Time
 }
 
 // NewRequestTracker builds a thread-safe tracker instance.
 func NewRequestTracker() RequestTracker {
-	return &tracker{buckets: make(map[string]*requestPhaseStats)}
+	return &tracker{buckets: make(map[string]*requestPhaseStats), started: time.Now()}
 }
 
 func (t *tracker) ObserveRequest(tenantID, protocol, message string, success bool, duration time.Duration) {
 	key := trackerKey(tenantID, protocol, message)
 	t.mu.Lock()
+	if t.started.IsZero() {
+		t.started = time.Now()
+	}
 	bucket := t.buckets[key]
 	if bucket == nil {
 		bucket = &requestPhaseStats{
@@ -68,6 +73,16 @@ func (t *tracker) Snapshot(tenantID string) []RequestPhaseSnapshot {
 		return results[i].Protocol < results[j].Protocol
 	})
 	return results
+}
+
+func (t *tracker) Window() time.Duration {
+	t.mu.RLock()
+	started := t.started
+	t.mu.RUnlock()
+	if started.IsZero() {
+		return 0
+	}
+	return time.Since(started)
 }
 
 func trackerKey(tenantID, protocol, message string) string {

@@ -3,7 +3,6 @@ package snooping
 import (
 	"context"
 	"strings"
-	"sync"
 	"time"
 
 	"modern-dhcp/internal/metrics"
@@ -20,7 +19,6 @@ type staticStore struct {
 	trusted map[string]struct{}
 	ttl     time.Duration
 	metrics *metrics.Collector
-	once    sync.Once
 }
 
 // NewStaticStore returns a store that trusts a static list of port identifiers.

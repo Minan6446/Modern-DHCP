@@ -2,10 +2,13 @@ package rbac
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
+
+	"modern-dhcp/internal/resource"
 )
 
 // ResolverOptions tune runtime behavior for capability resolution.
@@ -14,11 +17,62 @@ type ResolverOptions struct {
 	Logger   *zap.Logger
 }
 
+// PrincipalContext represents the authenticated principal and their access scope.
+type PrincipalContext struct {
+	UserID    string               `json:"userId"`
+	SessionID string               `json:"sessionId,omitempty"`
+	Scope     resource.AccessScope `json:"scope"`
+	IssuedAt  time.Time            `json:"issuedAt"`
+}
+
+// PrincipalContextOption customizes a PrincipalContext during creation.
+type PrincipalContextOption func(*PrincipalContext)
+
+// NewPrincipalContext constructs a PrincipalContext with sane defaults.
+func NewPrincipalContext(userID string, scope resource.AccessScope, opts ...PrincipalContextOption) PrincipalContext {
+	ctx := PrincipalContext{UserID: strings.TrimSpace(userID), Scope: scope, IssuedAt: time.Now().UTC()}
+	if ctx.Scope.Principal == "" {
+		ctx.Scope.Principal = ctx.UserID
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&ctx)
+		}
+	}
+	return ctx
+}
+
+// WithPrincipalSession sets the session identifier.
+func WithPrincipalSession(sessionID string) PrincipalContextOption {
+	return func(ctx *PrincipalContext) {
+		ctx.SessionID = strings.TrimSpace(sessionID)
+	}
+}
+
+// WithPrincipalIssuedAt overrides the issued-at timestamp.
+func WithPrincipalIssuedAt(ts time.Time) PrincipalContextOption {
+	return func(ctx *PrincipalContext) {
+		if ts.IsZero() {
+			return
+		}
+		ctx.IssuedAt = ts
+	}
+}
+
+// EffectiveScope guarantees the contained AccessScope carries the principal ID.
+func (p PrincipalContext) EffectiveScope() resource.AccessScope {
+	scope := p.Scope
+	if scope.Principal == "" {
+		scope.Principal = p.UserID
+	}
+	return scope
+}
+
 // ResolveOptions describes the tenant/org/resource scope of a request.
 type ResolveOptions struct {
-	TenantID  string
 	OrgUnitID string
 	Now       time.Time
+	Principal PrincipalContext
 }
 
 // Resolver evaluates assignments, inheritance, and temporary grants for a principal.
@@ -106,7 +160,6 @@ func (r *Resolver) Resolve(ctx context.Context, principalID string, opts Resolve
 	}
 	return Resolution{
 		PrincipalID:  principalID,
-		TenantID:     opts.TenantID,
 		OrgUnitID:    opts.OrgUnitID,
 		Capabilities: capabilities,
 		Grants:       grantDetails,
@@ -120,6 +173,7 @@ func (r *Resolver) capabilitiesForRole(ctx context.Context, roleName string) ([]
 	}
 	capSet := make(map[string]struct{})
 	r.collectCapabilities(ctx, role, capSet)
+	augmentUserCapabilities(capSet)
 	result := make([]string, 0, len(capSet))
 	for capName := range capSet {
 		result = append(result, capName)
@@ -160,16 +214,23 @@ func (r *Resolver) loadRole(ctx context.Context, roleName string) (Role, error) 
 }
 
 func (r *Resolver) matchesScope(assignment Assignment, opts ResolveOptions) bool {
-	if opts.TenantID == "" {
-		return true
-	}
-	if assignment.TenantID != nil && *assignment.TenantID != "" && *assignment.TenantID != opts.TenantID {
+	assignment.HydrateScope()
+	scope := opts.Principal.EffectiveScope()
+	if !assignment.Scope.MatchesAccessScope(scope) {
 		return false
 	}
-	if opts.OrgUnitID == "" || assignment.OrgUnitID == nil || *assignment.OrgUnitID == "" {
+	return matchesOrgScope(assignment, opts)
+}
+
+func matchesOrgScope(assignment Assignment, opts ResolveOptions) bool {
+	org := strings.TrimSpace(opts.OrgUnitID)
+	if org == "" {
 		return true
 	}
-	return *assignment.OrgUnitID == opts.OrgUnitID
+	if assignment.OrgUnitID == nil || strings.TrimSpace(*assignment.OrgUnitID) == "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(*assignment.OrgUnitID), org)
 }
 
 func findAssignmentByID(assignments []Assignment, id string) (Assignment, bool) {
@@ -179,4 +240,30 @@ func findAssignmentByID(assignments []Assignment, id string) (Assignment, bool) 
 		}
 	}
 	return Assignment{}, false
+}
+
+func augmentUserCapabilities(capabilities map[string]struct{}) {
+	if capabilities == nil {
+		return
+	}
+	if _, ok := capabilities[CapabilityRBACAssignmentRead]; ok {
+		capabilities[CapabilityRBACRoleRead] = struct{}{}
+		capabilities[CapabilityUserRead] = struct{}{}
+	}
+	if _, ok := capabilities[CapabilityRBACAssignmentWrite]; ok {
+		capabilities[CapabilityRBACRoleManage] = struct{}{}
+		capabilities[CapabilityRBACRoleRead] = struct{}{}
+		capabilities[CapabilityUserManage] = struct{}{}
+		capabilities[CapabilityUserRead] = struct{}{}
+	}
+	if _, ok := capabilities[CapabilityUserRead]; ok {
+		capabilities[CapabilityAuthProviderRead] = struct{}{}
+	}
+	if _, ok := capabilities[CapabilityUserManage]; ok {
+		capabilities[CapabilityAuthProviderManage] = struct{}{}
+		capabilities[CapabilityAuthProviderRead] = struct{}{}
+	}
+	if _, ok := capabilities[CapabilityRBACRoleManage]; ok {
+		capabilities[CapabilityRBACRoleRead] = struct{}{}
+	}
 }

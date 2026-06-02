@@ -55,6 +55,18 @@ type fakeCoordinator struct {
 	primary bool
 }
 
+type fakeReplicator struct {
+	healthy   bool
+	telemetry ReplicationTelemetry
+}
+
+func (f *fakeReplicator) Start(ctx context.Context) {}
+func (f *fakeReplicator) Stop()                     {}
+func (f *fakeReplicator) Healthy() bool             { return f.healthy }
+func (f *fakeReplicator) ReplicationTelemetry() ReplicationTelemetry {
+	return f.telemetry
+}
+
 func (f *fakeCoordinator) Start(ctx context.Context) {}
 func (f *fakeCoordinator) Stop()                     {}
 func (f *fakeCoordinator) Healthy() bool             { return f.healthy }
@@ -208,5 +220,51 @@ func TestSnapshotReflectsState(t *testing.T) {
 	}
 	if !snap.ManualFailbackSet {
 		t.Fatalf("expected manual flag to be reflected in snapshot")
+	}
+	if snap.FencingEpoch == "" {
+		t.Fatalf("expected fencing epoch in snapshot")
+	}
+}
+
+func TestFencingEpochRotatesOnRoleChange(t *testing.T) {
+	mgr := NewManager(config.HAConfig{}, zap.NewNop())
+	before := mgr.Snapshot().FencingEpoch
+	if before == "" {
+		t.Fatalf("expected initial fencing epoch")
+	}
+	time.Sleep(1 * time.Nanosecond)
+	mgr.setRole(RolePrimary)
+	after := mgr.Snapshot().FencingEpoch
+	if after == "" {
+		t.Fatalf("expected fencing epoch after role transition")
+	}
+	if after == before {
+		t.Fatalf("expected fencing epoch to rotate on role change")
+	}
+}
+
+func TestObserveReplicationPropagatesTelemetryToSnapshot(t *testing.T) {
+	mgr := NewManager(config.HAConfig{}, zap.NewNop())
+	mgr.replicator = &fakeReplicator{
+		healthy: true,
+		telemetry: ReplicationTelemetry{
+			ApplyLagMs: 17,
+			LastOffset: "mysql-bin.000123:4567",
+			Healthy:    true,
+			LastError:  "",
+			UpdatedAt:  time.Now().UTC(),
+		},
+	}
+
+	mgr.observeReplication()
+	snap := mgr.Snapshot()
+	if snap.Replication.ApplyLagMs != 17 {
+		t.Fatalf("expected replication lag 17ms, got %d", snap.Replication.ApplyLagMs)
+	}
+	if snap.Replication.LastOffset != "mysql-bin.000123:4567" {
+		t.Fatalf("unexpected replication last offset: %s", snap.Replication.LastOffset)
+	}
+	if !snap.Replication.Healthy {
+		t.Fatalf("expected replication healthy in snapshot")
 	}
 }

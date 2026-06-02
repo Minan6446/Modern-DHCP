@@ -16,7 +16,10 @@ import (
 	"modern-dhcp/internal/audit"
 	"modern-dhcp/internal/automation"
 	"modern-dhcp/internal/failover"
+	"modern-dhcp/internal/lease"
 	"modern-dhcp/internal/monitoring"
+	"modern-dhcp/internal/scopeutil"
+	"modern-dhcp/pkg/auditpayload"
 )
 
 var (
@@ -125,11 +128,13 @@ func (s *Service) Health(ctx context.Context) (HealthSummary, error) {
 	return summary, nil
 }
 
-// KPIs exposes summarized utilization metrics for a tenant.
-func (s *Service) KPIs(ctx context.Context, tenantID string, limit int) (KPISnapshot, error) {
-	if tenantID == "" {
-		return KPISnapshot{}, errors.New("dashboard: tenant id required")
+// KPIs exposes summarized utilization metrics for a tenant scope.
+func (s *Service) KPIs(ctx context.Context, scope lease.ResourceScope, limit int) (KPISnapshot, error) {
+	tenantID, err := scope.TenantIDOrErr()
+	if err != nil {
+		return KPISnapshot{}, err
 	}
+	tenantID = strings.TrimSpace(tenantID)
 	if snapshot, ok := s.cachedKPI(tenantID); ok {
 		return snapshot, nil
 	}
@@ -139,7 +144,7 @@ func (s *Service) KPIs(ctx context.Context, tenantID string, limit int) (KPISnap
 	if limit <= 0 {
 		limit = s.hotspotLimit
 	}
-	overview, err := s.monitor.Overview(ctx, tenantID, limit)
+	overview, err := s.monitor.Overview(ctx, scope, limit)
 	if err != nil {
 		return KPISnapshot{}, err
 	}
@@ -171,13 +176,23 @@ func (s *Service) KPIs(ctx context.Context, tenantID string, limit int) (KPISnap
 		ClientDistribution: overview.ClientDistribution,
 		SystemHealth:       overview.SystemHealth,
 		Security:           overview.Security,
+		Scope:              scopeutil.FromLeaseScope(scope),
 	}
 	s.storeKPI(tenantID, snapshot)
 	return snapshot, nil
 }
 
 // Streams composes alert, event, and audit activity for dashboards.
+
 func (s *Service) Streams(ctx context.Context, opts StreamOptions) (StreamSnapshot, error) {
+	tenantID := strings.TrimSpace(opts.TenantID)
+	if tenantID == "" && !opts.Scope.IsZero() {
+		tenantID = strings.TrimSpace(opts.Scope.TenantOrDefault())
+	}
+	if tenantID == "" {
+		return StreamSnapshot{}, errors.New("dashboard: tenant scope required")
+	}
+	scopeMeta := scopeutil.FromLeaseScope(opts.Scope)
 	limit := s.normalizeLimit(opts.Limit)
 	includeAlerts := opts.IncludeAlerts
 	includeOps := opts.IncludeOperations
@@ -187,16 +202,16 @@ func (s *Service) Streams(ctx context.Context, opts StreamOptions) (StreamSnapsh
 	}
 	entries := make([]StreamEntry, 0, limit*2)
 	if includeAlerts {
-		alerts, err := s.buildAlertStream(opts.TenantID, limit, opts.Since)
+		alerts, err := s.buildAlertStream(tenantID, limit, opts.Since)
 		if err != nil && s.logger != nil {
-			s.logger.Warn("dashboard: alert stream degraded", zap.String("tenantId", opts.TenantID), zap.Error(err))
+			s.logger.Warn("dashboard: alert stream degraded", zap.String("tenantId", tenantID), zap.Error(err))
 		}
 		entries = append(entries, alerts...)
 	}
 	if includeOps {
-		opsEntries, err := s.buildOperationStream(ctx, opts.TenantID, limit, opts.Since)
+		opsEntries, err := s.buildOperationStream(ctx, tenantID, limit, opts.Since)
 		if err != nil && s.logger != nil {
-			s.logger.Warn("dashboard: audit stream degraded", zap.String("tenantId", opts.TenantID), zap.Error(err))
+			s.logger.Warn("dashboard: audit stream degraded", zap.String("tenantId", tenantID), zap.Error(err))
 		} else {
 			entries = append(entries, opsEntries...)
 		}
@@ -209,20 +224,27 @@ func (s *Service) Streams(ctx context.Context, opts StreamOptions) (StreamSnapsh
 	}
 	return StreamSnapshot{
 		GeneratedAt: s.now(),
-		TenantID:    opts.TenantID,
+		TenantID:    tenantID,
 		Items:       entries,
+		Scope:       scopeMeta,
 	}, nil
 }
 
-// Insights returns automation and alert processing summaries for a tenant.
-func (s *Service) Insights(ctx context.Context, tenantID string) (InsightSnapshot, error) {
-	snapshot, err := s.buildInsightSnapshot(ctx, tenantID)
+// Insights returns automation and alert processing summaries for a tenant scope.
+func (s *Service) Insights(ctx context.Context, scope lease.ResourceScope) (InsightSnapshot, error) {
+	tenantID, err := scope.TenantIDOrErr()
 	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn("dashboard: insights degraded", zap.String("tenantId", tenantID), zap.Error(err))
-		}
-		return s.sampleInsightSnapshot(tenantID), err
+		return InsightSnapshot{}, err
 	}
+	tenantID = strings.TrimSpace(tenantID)
+	snapshot, buildErr := s.buildInsightSnapshot(ctx, scope)
+	if buildErr != nil {
+		if s.logger != nil {
+			s.logger.Warn("dashboard: insights degraded", zap.String("tenantId", tenantID), zap.Error(buildErr))
+		}
+		return s.sampleInsightSnapshot(tenantID, scopeutil.FromLeaseScope(scope)), buildErr
+	}
+	snapshot.Scope = scopeutil.FromLeaseScope(scope)
 	return snapshot, nil
 }
 
@@ -412,12 +434,18 @@ func classifyAuditSeverity(action string) string {
 	}
 }
 
-func (s *Service) buildInsightSnapshot(ctx context.Context, tenantID string) (InsightSnapshot, error) {
+func (s *Service) buildInsightSnapshot(ctx context.Context, scope lease.ResourceScope) (InsightSnapshot, error) {
 	if s.monitor == nil || s.alertFeed == nil {
 		return InsightSnapshot{}, errMonitoringUnavailable
 	}
+	tenantID, err := scope.TenantIDOrErr()
+	if err != nil {
+		return InsightSnapshot{}, err
+	}
+	tenantID = strings.TrimSpace(tenantID)
 	const poolSample = 25
-	pools, err := s.monitor.Pools(ctx, tenantID, poolSample)
+	scopeMeta := scopeutil.FromLeaseScope(scope)
+	pools, err := s.monitor.Pools(ctx, scope, poolSample)
 	if err != nil {
 		return InsightSnapshot{}, err
 	}
@@ -439,7 +467,7 @@ func (s *Service) buildInsightSnapshot(ctx context.Context, tenantID string) (In
 	alerts := s.alertFeed.Snapshot(tenantID, 25)
 	trend := s.trackAlertTrend(tenantID, alerts.Totals.Open)
 	mttr := calcMTTR(alerts.Alerts)
-	automation := s.buildAutomationSnapshot(tenantID)
+	automation := s.buildAutomationSnapshot(tenantID, scope)
 	snapshot := InsightSnapshot{
 		GeneratedAt: s.now(),
 		TenantActivity: TenantActivitySnapshot{
@@ -456,17 +484,18 @@ func (s *Service) buildInsightSnapshot(ctx context.Context, tenantID string) (In
 		},
 		Automation: automation,
 	}
+	snapshot.Scope = scopeMeta
 	return snapshot, nil
 }
 
-func (s *Service) buildAutomationSnapshot(tenantID string) AutomationProgressSnapshot {
+func (s *Service) buildAutomationSnapshot(tenantID string, scope lease.ResourceScope) AutomationProgressSnapshot {
 	snapshot := AutomationProgressSnapshot{
 		Workflows:  make([]AutomationWorkflowSnapshot, 0, 5),
 		NextWindow: s.now().Add(30 * time.Minute).Format(time.RFC3339),
 	}
 	phases := []monitoring.RequestPhaseSnapshot(nil)
 	if s.monitor != nil {
-		phases = s.monitor.Requests(tenantID)
+		phases = s.monitor.Requests(scope)
 	}
 	for idx, phase := range phases {
 		if len(snapshot.Workflows) >= 5 {
@@ -602,7 +631,7 @@ const (
 	workflowStateBlocked = "blocked"
 )
 
-func (s *Service) sampleInsightSnapshot(tenantID string) InsightSnapshot {
+func (s *Service) sampleInsightSnapshot(tenantID string, scopeMeta auditpayload.ScopeMetadata) InsightSnapshot {
 	now := s.now()
 	alerts := monitoring.SampleAlertEntries(tenantID)
 	totals := sampleAlertTotals(alerts)
@@ -649,6 +678,7 @@ func (s *Service) sampleInsightSnapshot(tenantID string) InsightSnapshot {
 			ResponseTrend: 2,
 		},
 		Automation: automation,
+		Scope:      scopeMeta,
 	}
 }
 

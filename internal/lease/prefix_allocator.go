@@ -2,22 +2,26 @@ package lease
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"math/big"
 	"net/netip"
 	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"modern-dhcp/internal/netutil"
+	"modern-dhcp/internal/pool"
 	"modern-dhcp/pkg/models"
 )
 
 // AllocateOrReusePrefixes ensures each IA_PD request gets a persisted prefix lease.
-func (s *Service) AllocateOrReusePrefixes(ctx context.Context, tenantID, clientID string, profile models.LeaseProfile, pool *models.AddressPool, requests []PrefixRequest) ([]PrefixDelegation, error) {
+func (s *Service) AllocateOrReusePrefixes(ctx context.Context, scope ResourceScope, clientID string, profile models.LeaseProfile, pool *models.AddressPool, requests []PrefixRequest) ([]PrefixDelegation, error) {
 	if len(requests) == 0 || pool == nil {
 		return nil, nil
+	}
+	tenantID, err := s.tenantFromScope(scope)
+	if err != nil {
+		return nil, err
 	}
 	poolPrefix, err := netip.ParsePrefix(pool.CIDR)
 	if err != nil {
@@ -26,7 +30,8 @@ func (s *Service) AllocateOrReusePrefixes(ctx context.Context, tenantID, clientI
 	if !poolPrefix.Addr().Is6() {
 		return nil, ErrUnsupportedCIDR
 	}
-	existing, err := s.repo.ListActivePrefixes(ctx, tenantID, pool.ID)
+	access := scope.AccessScope()
+	existing, err := s.repo.ListActivePrefixes(ctx, access, pool.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -37,7 +42,7 @@ func (s *Service) AllocateOrReusePrefixes(ctx context.Context, tenantID, clientI
 	}
 	delegations := make([]PrefixDelegation, 0, len(requests))
 	for _, req := range requests {
-		pd, err := s.allocateOrReusePrefix(ctx, tenantID, clientID, profile, pool, poolPrefix, req, used)
+		pd, err := s.allocateOrReusePrefix(ctx, scope, tenantID, clientID, profile, pool, poolPrefix, req, used)
 		if err != nil {
 			return nil, err
 		}
@@ -49,8 +54,11 @@ func (s *Service) AllocateOrReusePrefixes(ctx context.Context, tenantID, clientI
 	return delegations, nil
 }
 
-func (s *Service) allocateOrReusePrefix(ctx context.Context, tenantID, clientID string, profile models.LeaseProfile, pool *models.AddressPool, poolPrefix netip.Prefix, req PrefixRequest, used map[string]struct{}) (*PrefixDelegation, error) {
-	existing, err := s.repo.GetActivePrefixLease(ctx, tenantID, clientID, req.IAPDID)
+func (s *Service) allocateOrReusePrefix(ctx context.Context, scope ResourceScope, tenantID, clientID string, profile models.LeaseProfile, pool *models.AddressPool, poolPrefix netip.Prefix, req PrefixRequest, used map[string]struct{}) (*PrefixDelegation, error) {
+	if _, err := scope.TenantIDOrErr(); err != nil {
+		return nil, err
+	}
+	existing, err := s.repo.GetActivePrefixLease(ctx, scope.AccessScope(), clientID, req.IAPDID)
 	if err == nil {
 		s.applyPrefixTiming(existing, profile)
 		if err := s.repo.UpdatePrefixLease(ctx, existing); err != nil {
@@ -70,7 +78,9 @@ func (s *Service) allocateOrReusePrefix(ctx context.Context, tenantID, clientID 
 		}
 		return pd, nil
 	}
-	if err != nil && err != ErrNotFound {
+	if errors.Is(err, ErrNotFound) {
+		// proceed with new prefix allocation
+	} else {
 		return nil, err
 	}
 	length := determinePrefixLength(poolPrefix, req)
@@ -126,42 +136,17 @@ func determinePrefixLength(poolPrefix netip.Prefix, req PrefixRequest) int {
 }
 
 func (s *Service) pickAvailablePrefix(poolPrefix netip.Prefix, length int, req PrefixRequest, used map[string]struct{}) (netip.Prefix, bool) {
+	allocator, err := pool.NewIPv6PrefixPool(poolPrefix, length, used)
+	if err != nil {
+		return netip.Prefix{}, false
+	}
 	if addr, ok := netip.AddrFromSlice(req.Prefix); ok {
 		candidate := netip.PrefixFrom(addr, length).Masked()
-		if poolPrefix.Contains(candidate.Masked().Addr()) {
-			key := candidate.String()
-			if _, exists := used[key]; !exists {
-				return candidate, true
-			}
+		if allocated, ok := allocator.AllocateAvailablePrefix(candidate); ok {
+			return allocated, true
 		}
 	}
-	diff := length - poolPrefix.Bits()
-	if diff < 0 {
-		diff = 0
-	}
-	maxCandidates := 1 << 12 // cap iterations to avoid long scans
-	baseInt := netutil.AddrToBig(poolPrefix.Masked().Addr())
-	step := new(big.Int).Lsh(big.NewInt(1), uint(128-length))
-	total := new(big.Int).Lsh(big.NewInt(1), uint(diff))
-	for i := 0; i < maxCandidates; i++ {
-		idx := big.NewInt(int64(i))
-		if idx.Cmp(total) >= 0 {
-			break
-		}
-		offset := new(big.Int).Mul(step, idx)
-		candidateInt := new(big.Int).Add(baseInt, offset)
-		addr, ok := netutil.BigToAddr(candidateInt)
-		if !ok {
-			continue
-		}
-		candidate := netip.PrefixFrom(addr, length).Masked()
-		key := candidate.String()
-		if _, exists := used[key]; exists {
-			continue
-		}
-		return candidate, true
-	}
-	return netip.Prefix{}, false
+	return allocator.AllocateAvailablePrefix(netip.Prefix{})
 }
 
 func (s *Service) applyPrefixTiming(lease *models.PrefixLease, profile models.LeaseProfile) {

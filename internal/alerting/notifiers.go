@@ -38,11 +38,15 @@ func NewEmailNotifier(name, from string, recipients []string, logger *zap.Logger
 func (n *EmailNotifier) Name() string { return n.name }
 
 func (n *EmailNotifier) Notify(_ context.Context, event Event) error {
-	if len(n.recipients) == 0 {
+	targets := append([]string(nil), n.recipients...)
+	if dynamic := parseLabelList(event.Labels, "receiver_emails"); len(dynamic) > 0 {
+		targets = dynamic
+	}
+	if len(targets) == 0 {
 		return errors.New("email notifier missing recipients")
 	}
 	if n.logger != nil {
-		n.logger.Info("email alert", zap.Strings("to", n.recipients), zap.String("subject", event.Summary), zap.String("severity", string(event.Severity)))
+		n.logger.Info("email alert", zap.Strings("to", targets), zap.String("subject", event.Summary), zap.String("severity", string(event.Severity)))
 	}
 	return nil
 }
@@ -61,11 +65,15 @@ func NewSMSNotifier(name string, numbers []string, logger *zap.Logger) *SMSNotif
 func (n *SMSNotifier) Name() string { return n.name }
 
 func (n *SMSNotifier) Notify(_ context.Context, event Event) error {
-	if len(n.numbers) == 0 {
+	numbers := append([]string(nil), n.numbers...)
+	if dynamic := parseLabelList(event.Labels, "receiver_phones"); len(dynamic) > 0 {
+		numbers = dynamic
+	}
+	if len(numbers) == 0 {
 		return errors.New("sms notifier missing numbers")
 	}
 	if n.logger != nil {
-		n.logger.Info("sms alert", zap.Strings("numbers", n.numbers), zap.String("summary", event.Summary))
+		n.logger.Info("sms alert", zap.Strings("numbers", numbers), zap.String("summary", event.Summary))
 	}
 	return nil
 }
@@ -170,7 +178,13 @@ func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
 	if n.client == nil {
 		return errors.New("webhook notifier missing client")
 	}
-	if _, err := url.Parse(n.url); err != nil {
+	targetURL := strings.TrimSpace(n.url)
+	if labels := event.Labels; labels != nil {
+		if dynamic := strings.TrimSpace(labels["webhook_url"]); dynamic != "" {
+			targetURL = dynamic
+		}
+	}
+	if _, err := url.Parse(targetURL); err != nil {
 		return err
 	}
 	payload := map[string]any{
@@ -185,7 +199,7 @@ func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -202,9 +216,35 @@ func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
 		return fmt.Errorf("webhook responded with %d", resp.StatusCode)
 	}
 	if n.logger != nil {
-		n.logger.Info("webhook alert delivered", zap.String("url", n.url))
+		n.logger.Info("webhook alert delivered", zap.String("url", targetURL))
 	}
 	return nil
+}
+
+func parseLabelList(labels map[string]string, key string) []string {
+	if len(labels) == 0 {
+		return nil
+	}
+	raw := strings.TrimSpace(labels[key])
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	items := make([]string, 0, len(parts))
+	seen := make(map[string]struct{})
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		items = append(items, value)
+	}
+	return items
 }
 
 // SNMPNotifier sends traps to legacy NMS endpoints.

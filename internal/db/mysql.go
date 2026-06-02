@@ -32,3 +32,25 @@ func NewMySQL(ctx context.Context, cfg config.MySQLConfig) (*sqlx.DB, error) {
 
 	return db, nil
 }
+
+// NewMySQLReplica returns a configured sqlx DB handle for a read-replica if defined.
+func NewMySQLReplica(ctx context.Context, cfg config.MySQLConfig) (*sqlx.DB, error) {
+	if cfg.ReplicaDSN == "" {
+		return nil, nil
+	}
+	replicaCfg := cfg
+	replicaCfg.DSN = cfg.ReplicaDSN
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err := sqlx.Open("mysql", replicaCfg.DSN)
+	if err != nil {
+		return nil, fmt.Errorf("open mysql replica: %w", err)
+	}
+	applyPoolSettings(db, replicaCfg.ReplicaMaxOpenConns, replicaCfg.ReplicaMaxIdleConns, replicaCfg.ReplicaConnMaxLife, replicaCfg.ReplicaConnMaxIdle)
+	if err := pingWithRetry(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping mysql replica: %w", err)
+	}
+	return db, nil
+}

@@ -12,6 +12,7 @@ import (
 type SnoopingTracker interface {
 	snooping.Observer
 	Snapshot(tenantID string, window time.Duration) SnoopingWindow
+	Events(tenantID string, window time.Duration, limit int) []SnoopingEvent
 }
 
 // SnoopingWindow summarizes snooping lookup outcomes for dashboards.
@@ -85,27 +86,10 @@ func (t *snoopingTracker) Record(obs snooping.Observation) {
 func (t *snoopingTracker) Snapshot(tenantID string, window time.Duration) SnoopingWindow {
 	canonical := normalizeTenant(tenantID)
 	snap := SnoopingWindow{TenantID: canonical, Window: window}
-	if t == nil || window <= 0 {
+	if t == nil {
 		return snap
 	}
-	cutoff := time.Now().UTC().Add(-window)
-	t.mu.Lock()
-	key := strings.ToLower(canonical)
-	bucket := t.perTenant[key]
-	if len(bucket) > 0 {
-		prune := 0
-		for prune < len(bucket) && bucket[prune].occurredAt.Before(cutoff) {
-			prune++
-		}
-		if prune > 0 {
-			bucket = append([]snoopEvent(nil), bucket[prune:]...)
-			t.perTenant[key] = bucket
-		}
-	}
-	copyBuf := make([]snoopEvent, len(bucket))
-	copy(copyBuf, bucket)
-	t.mu.Unlock()
-
+	copyBuf := t.recentEvents(canonical, window)
 	if len(copyBuf) == 0 {
 		return snap
 	}
@@ -129,8 +113,67 @@ func (t *snoopingTracker) Snapshot(tenantID string, window time.Duration) Snoopi
 	snap.LastVLAN = last.vlan
 	snap.LastReason = last.reason
 	snap.LastEvent = last.occurredAt
-	if snap.LastEvent.Before(cutoff) {
-		snap.LastEvent = time.Now().UTC()
+	if window > 0 {
+		cutoff := time.Now().UTC().Add(-window)
+		if snap.LastEvent.Before(cutoff) {
+			snap.LastEvent = time.Now().UTC()
+		}
 	}
 	return snap
+}
+
+func (t *snoopingTracker) Events(tenantID string, window time.Duration, limit int) []SnoopingEvent {
+	canonical := normalizeTenant(tenantID)
+	if t == nil {
+		return nil
+	}
+	events := t.recentEvents(canonical, window)
+	if len(events) == 0 {
+		return nil
+	}
+	if limit <= 0 || limit > len(events) {
+		limit = len(events)
+	}
+	start := len(events) - limit
+	selected := events[start:]
+	result := make([]SnoopingEvent, len(selected))
+	for idx, evt := range selected {
+		result[idx] = SnoopingEvent{
+			TenantID:   canonical,
+			OccurredAt: evt.occurredAt,
+			MAC:        evt.mac,
+			PortID:     evt.port,
+			VLANID:     evt.vlan,
+			Result:     evt.result,
+			Reason:     evt.reason,
+		}
+	}
+	return result
+}
+
+func (t *snoopingTracker) recentEvents(tenantID string, window time.Duration) []snoopEvent {
+	if t == nil {
+		return nil
+	}
+	key := strings.ToLower(tenantID)
+	var cutoff time.Time
+	if window > 0 {
+		cutoff = time.Now().UTC().Add(-window)
+	}
+	t.mu.Lock()
+	bucket := t.perTenant[key]
+	if len(bucket) > 0 && !cutoff.IsZero() {
+		prune := 0
+		for prune < len(bucket) && bucket[prune].occurredAt.Before(cutoff) {
+			prune++
+		}
+		if prune > 0 {
+			bucket = append([]snoopEvent(nil), bucket[prune:]...)
+			t.perTenant[key] = bucket
+		}
+	}
+	copyBuf := make([]snoopEvent, len(bucket))
+	copy(copyBuf, bucket)
+	t.mu.Unlock()
+	return copyBuf
 }

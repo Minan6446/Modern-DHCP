@@ -88,11 +88,11 @@ func (s *sqlJobStore) RecordPending(ctx context.Context, job Job) error {
 
 	const insert = `
 INSERT INTO automation_jobs (
-    id, tenant_id, job_type, status, source, triggered_by, priority, attempts,
+	id, job_type, status, source, triggered_by, priority, attempts,
     payload_hash, labels, payload, result_summary, error_message, not_before,
     queued_at, started_at, completed_at, updated_at)
 VALUES (
-    :id, :tenant_id, :job_type, :status, :source, :triggered_by, :priority, :attempts,
+	:id, :job_type, :status, :source, :triggered_by, :priority, :attempts,
     :payload_hash, :labels, :payload, '', '', :not_before,
     :queued_at, NULL, NULL, :updated_at)`
 
@@ -178,16 +178,12 @@ func (s *sqlJobStore) ListJobs(ctx context.Context, opts ListJobsOptions) ([]Job
 		return nil, nil
 	}
 	query := `
-SELECT id, tenant_id, job_type, status, source, triggered_by, priority, attempts,
+SELECT id, job_type, status, source, triggered_by, priority, attempts,
        payload_hash, labels, payload, result_summary, error_message, not_before,
        queued_at, started_at, completed_at, updated_at
 FROM automation_jobs
 WHERE 1 = 1`
 	args := make([]any, 0)
-	if tenant := strings.TrimSpace(opts.TenantID); tenant != "" {
-		query += " AND tenant_id = ?"
-		args = append(args, tenant)
-	}
 	if len(opts.Types) > 0 {
 		query += " AND job_type IN (" + placeholders(len(opts.Types)) + ")"
 		for _, t := range opts.Types {
@@ -240,10 +236,6 @@ func (s *sqlJobStore) CountJobs(ctx context.Context, opts ListJobsOptions) (int,
 	}
 	query := "SELECT COUNT(1) FROM automation_jobs WHERE 1 = 1"
 	args := make([]any, 0)
-	if tenant := strings.TrimSpace(opts.TenantID); tenant != "" {
-		query += " AND tenant_id = ?"
-		args = append(args, tenant)
-	}
 	if len(opts.Types) > 0 {
 		query += " AND job_type IN (" + placeholders(len(opts.Types)) + ")"
 		for _, t := range opts.Types {
@@ -282,7 +274,7 @@ func (s *sqlJobStore) GetJob(ctx context.Context, id string) (*JobRun, error) {
 	}
 	row := jobRow{}
 	query := `
-SELECT id, tenant_id, job_type, status, source, triggered_by, priority, attempts,
+SELECT id, job_type, status, source, triggered_by, priority, attempts,
        payload_hash, labels, payload, result_summary, error_message, not_before,
        queued_at, started_at, completed_at, updated_at
 FROM automation_jobs WHERE id = ?`
@@ -304,7 +296,6 @@ var ErrJobNotFound = errors.New("automation: job not found")
 
 type jobRow struct {
 	ID            string         `db:"id"`
-	TenantID      string         `db:"tenant_id"`
 	Type          string         `db:"job_type"`
 	Status        string         `db:"status"`
 	Source        string         `db:"source"`
@@ -330,7 +321,6 @@ func (r jobRow) toJobRun() (JobRun, error) {
 	}
 	run := JobRun{
 		ID:          r.ID,
-		TenantID:    r.TenantID,
 		Type:        JobType(r.Type),
 		Status:      JobStatus(r.Status),
 		Source:      r.Source,
@@ -372,7 +362,6 @@ func buildJobParams(job Job) (map[string]any, error) {
 	payloadHash := hashPayload(job.Payload)
 	params := map[string]any{
 		"id":           job.ID,
-		"tenant_id":    job.TenantID,
 		"job_type":     job.Type,
 		"source":       strings.TrimSpace(job.Source),
 		"triggered_by": strings.TrimSpace(job.TriggeredBy),

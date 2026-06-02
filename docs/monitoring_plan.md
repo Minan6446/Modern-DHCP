@@ -1,46 +1,60 @@
-# Section 12 – Monitoring & Diagnostics Implementation Plan
+# 观测与告警计划
 
-This plan decomposes the "Full-Scope Monitoring" requirement into deliverable workstreams. The strategy is to ship continuously—each milestone adds API capabilities, metrics, or tooling that downstream UIs can consume.
+更新日期：2026-02-10（当前主干）
 
-## Milestone A – Metrics Foundation (current sprint)
-1. **Collector Expansion**
-   - Add counters/histograms/gauges for:
-     - DHCP request lifecycle (DISCOVER/OFFER/REQUEST/ACK success + failure variants)
-     - Request latency distributions (per message type)
-     - Pool utilization gauges (allocated vs capacity)
-     - System resource probes (CPU, memory, disk, NIC throughput)
-     - Database query timings & open connections
-   - Wire into existing handlers, pool service, lease service, DB instrumentation hooks.
-2. **Monitoring API Surface**
-   - Introduce `/api/v1/monitoring/*` namespace with read-only endpoints:
-     - `/dashboard/overview` – aggregates metrics for UI cards.
-     - `/dashboard/pools` – per-pool utilization snapshots & trends.
-     - `/dashboard/requests` – success counts + latency histogram buckets.
-     - `/health/system` – CPU/memory/disk/network snapshots plus HA state.
-3. **Data Sources**
-   - Implement `monitoring.Aggregator` that reads Prometheus collectors + runtime stats (Go `runtime`, OS counters, DB stats, security guard signals).
-   - Persist short-term trend buffers in-memory (ring buffer) for 5–15m charts; rely on Prometheus for long-term trends.
+本计划说明系统的指标、日志、告警与告警路由策略，帮助运维持续观察运行健康。
 
-## Milestone B – Diagnostics Tooling
-1. **Client Simulation Service**
-   - Extend existing `/simulate` to accept scenario templates & multi-step flows; log outcomes for later replay.
-2. **Packet Capture Hooks**
-   - Provide PCAP exporter that taps into DHCPv4/v6 UDP processing pipeline (toggle via config & API trigger).
-3. **Lease History Explorer**
-   - New endpoints to fetch per-client lease timelines + guard/security events.
-4. **Conflict Detection Console**
-   - Surface conflict metrics + latest offending clients, integrate with guard signals.
+## 指标暴露
+- Prometheus：默认 `/metrics` 端点，覆盖池解析、租约分配、策略命中、HTTP 请求、DB 连接池等指标。
+- 聚合快照（REST）：
+  - `/api/v1/monitoring/overview`：池利用率、租约状态分布、请求阶段统计、系统健康。
+  - `/api/v1/cluster/overview`：角色、复制延迟、抑制状态，供前端与 LB 使用。
+- 实时流（WebSocket）：
+  - `/api/v1/dashboard/streams/live`：事件/审计增量流；`limit`、`types`（alert|ops）。
+  - `/api/v1/monitoring/status/stream`：健康/概览流，支持 `tenantId`。
+- 代理要求：反代需开启 `proxy_http_version 1.1`，并透传 `Upgrade`/`Connection` 头以支持 WebSocket。
+- 自定义标签：池、VLAN、接口、Location 等元数据作为标签，便于分组。
 
-## Milestone C – Performance Monitoring & Advanced Dashboards
-1. **Histogram APIs** – expose response time percentile data built from Prometheus histograms.
-2. **Database Metrics Feed** – real-time query latency, connection usage, replication lag.
-3. **Resource Trend Jobs** – background sampler persisting resource stats for 24h horizon (store in Redis/MySQL for UI retrieval).
-4. **Network Traffic Monitor** – periodic netlink/Win32 counters that summarize ingress/egress DHCP packet rates per interface.
+## 告警原则
+- 三级分级：
+  - P1：服务不可用、写入失败、复制中断。
+  - P2：延迟升高、池容量高水位、安全事件频繁。
+  - P3：趋势预警、配置偏差、慢查询。
+- 静默与抑制：
+  - 维护窗口可配置静默；HA 切换期间可抑制级联告警。
+  - Rate Limit 与 Snooping 事件在短时间内去重，避免风暴。
 
-## Today’s Deliverables
-- Complete Milestone A items 1 & 2 partially:
-  - Expand `metrics.Collector` and wire request lifecycle counters.
-  - Implement `internal/monitoring` package with an `Aggregator` capable of producing overview + pool + request + system payloads (fed from collectors/runtime stats).
-  - Add `/api/v1/monitoring/overview`, `/api/v1/monitoring/pools`, `/api/v1/monitoring/requests`, `/api/v1/monitoring/health` endpoints returning aggregator results.
+## 指标与阈值示例
+- 可用性
+  - HTTP 5xx 率（按入口）；阈值 > 1% 触发 P1。
+  - `/cluster/overview` 延迟 > 2s 或角色未知触发 P1。
+- 池与租约
+  - 池可用容量 < 15% 触发 P1；< 30% 触发 P2。
+  - 租约失败率 > 5% 触发 P1；> 2% 触发 P2。
+- 数据库
+  - 连接池耗尽、慢查询数量、复制延迟 > 3s。
+- 安全
+  - Rate Limit 或 Snooping 事件在 5 分钟内超过全局阈值触发 P1/P2。
 
-Subsequent PRs will iterate on Milestone B & C.
+## 日志与审计
+- 结构化日志：包含请求 ID、角色、接口、阶段、耗时。
+- 审计：
+  - 记录变更类操作（池、策略、租约操作、审批决策）。
+  - 记录 HA 切换、告警抑制、自动化任务决策。
+
+## 告警路由
+- 配置来源：`configs/config.yaml` 的 `alerting` 与 `notifications` 部分。
+- 渠道：邮件、聊天、Webhook；可按严重级别分别路由。
+- 聚合：按池、事件类型聚合，减少重复。
+- 升级策略：未恢复的 P1 在 15 分钟内升级到值班/管理组。
+
+## 运维仪表盘（概览）
+- Overview：请求量、成功率、P99 延迟、活跃租约、池利用率。
+- Cluster：角色、复制延迟、节点健康、切换次数。
+- Security：Rate Limit/Snooping 事件趋势、封禁计数。
+- DB：QPS、慢查询、连接池使用率、复制延迟。
+ - Realtime：`/dashboard/streams/live` 连接状态与最近增量。
+
+## 运维操作手册挂钩
+- 告警触发后关联对应 Runbook（如 threat_response.md）。
+- 通过前端或 CLI 查看 `/cluster/overview` 与 `/monitoring/overview`，确认是否需要抑制或切换。

@@ -23,6 +23,25 @@ type Replicator interface {
 	Healthy() bool
 }
 
+// ReplicationTelemetry captures replicator runtime indicators for APIs/metrics.
+type ReplicationTelemetry struct {
+	ApplyLagMs int       `json:"applyLagMs"`
+	LastOffset string    `json:"lastOffset,omitempty"`
+	LastError  string    `json:"lastError,omitempty"`
+	UpdatedAt  time.Time `json:"updatedAt,omitempty"`
+	Healthy    bool      `json:"healthy"`
+	Mode       string    `json:"mode,omitempty"`
+	Source     string    `json:"source,omitempty"`
+	State      string    `json:"state,omitempty"`
+	MySQLRole  string    `json:"mysqlRole,omitempty"`
+	RedisRole  string    `json:"redisRole,omitempty"`
+}
+
+// ReplicationTelemetryReporter is an optional extension interface for Replicator.
+type ReplicationTelemetryReporter interface {
+	ReplicationTelemetry() ReplicationTelemetry
+}
+
 // ConfigWatcher validates GitOps/etcd snapshots and exposes checksums.
 type ConfigWatcher interface {
 	Start(ctx context.Context)
@@ -86,6 +105,9 @@ func (noopCoordinator) ShouldServePrimary() bool  { return true }
 func (noopReplicator) Start(ctx context.Context) {}
 func (noopReplicator) Stop()                     {}
 func (noopReplicator) Healthy() bool             { return true }
+func (noopReplicator) ReplicationTelemetry() ReplicationTelemetry {
+	return ReplicationTelemetry{Healthy: true, UpdatedAt: time.Now().UTC(), Mode: "standalone", Source: "local", State: "standalone"}
+}
 
 func (n *noopConfigWatcher) Start(ctx context.Context) {}
 func (n *noopConfigWatcher) Stop()                     {}
@@ -99,13 +121,6 @@ func (n *noopConfigWatcher) LastChecksum() string {
 		}
 	}
 	return ""
-}
-
-func (n *noopConfigWatcher) setChecksum(value string) {
-	if n == nil {
-		return
-	}
-	n.checksum.Store(value)
 }
 
 func (noopHeartbeat) Start(ctx context.Context, handler func()) {}

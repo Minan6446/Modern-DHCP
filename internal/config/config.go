@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/mitchellh/mapstructure"
@@ -15,6 +16,7 @@ type Config struct {
 	Deployment    DeploymentConfig    `mapstructure:"deployment"`
 	Storage       StorageMatrixConfig `mapstructure:"storage"`
 	Tenancy       TenancyConfig       `mapstructure:"tenancy"`
+	DataLifecycle DataLifecycleConfig `mapstructure:"dataLifecycle"`
 	RBAC          RBACConfig          `mapstructure:"rbac"`
 	Backup        BackupConfig        `mapstructure:"backup"`
 	UI            UIConfig            `mapstructure:"ui"`
@@ -48,8 +50,19 @@ type ServiceConfig struct {
 	MetricsPort int                 `mapstructure:"metricsPort"`
 	EnableIPv6  bool                `mapstructure:"enableIPv6"`
 	EnableBOOTP bool                `mapstructure:"enableBOOTP"`
+	TLS         ServiceTLSConfig    `mapstructure:"tls"`
 	CORS        CORSConfig          `mapstructure:"cors"`
 	DHCPv4      DHCPv4RuntimeConfig `mapstructure:"dhcpv4"`
+}
+
+type ServiceTLSConfig struct {
+	Enabled           bool   `mapstructure:"enabled"`
+	AutoSelfSigned    bool   `mapstructure:"autoSelfSigned"`
+	CertFile          string `mapstructure:"certFile"`
+	KeyFile           string `mapstructure:"keyFile"`
+	ClientCAFile      string `mapstructure:"clientCaFile"`
+	RequireClientCert bool   `mapstructure:"requireClientCert"`
+	SelfSignedDir     string `mapstructure:"selfSignedDir"`
 }
 
 // DHCPv4RuntimeConfig tunes the UDP server concurrency knobs.
@@ -146,9 +159,31 @@ type TenantRouterConfig struct {
 
 // TenantDatabaseConfig enumerates dedicated data sources per tenant.
 type TenantDatabaseConfig struct {
-	Driver string `mapstructure:"driver"`
-	DSN    string `mapstructure:"dsn"`
-	Schema string `mapstructure:"schema"`
+	Driver     string `mapstructure:"driver"`
+	DSN        string `mapstructure:"dsn"`
+	Schema     string `mapstructure:"schema"`
+	ReplicaDSN string `mapstructure:"replicaDsn"`
+}
+
+// DataLifecycleConfig captures partitioning and retention policies for hot tables.
+type DataLifecycleConfig struct {
+	Retention    RetentionConfig    `mapstructure:"retention"`
+	Partitioning PartitioningConfig `mapstructure:"partitioning"`
+}
+
+// RetentionConfig defines time-based cleanup thresholds.
+type RetentionConfig struct {
+	LeasesDays int `mapstructure:"leasesDays"`
+	AuditDays  int `mapstructure:"auditDays"`
+	EventsDays int `mapstructure:"eventsDays"`
+}
+
+// PartitioningConfig controls creation and expiry of table partitions.
+type PartitioningConfig struct {
+	Enabled          bool   `mapstructure:"enabled"`
+	Interval         string `mapstructure:"interval"`
+	FuturePartitions int    `mapstructure:"futurePartitions"`
+	ArchiveDSN       string `mapstructure:"archiveDsn"`
 }
 
 // RelationalStorageConfig captures relational database options and priorities.
@@ -457,11 +492,16 @@ type CORSConfig struct {
 
 // MySQLConfig holds database settings.
 type MySQLConfig struct {
-	DSN          string        `mapstructure:"dsn"`
-	MaxOpenConns int           `mapstructure:"maxOpenConns"`
-	MaxIdleConns int           `mapstructure:"maxIdleConns"`
-	ConnMaxLife  time.Duration `mapstructure:"connMaxLifetime"`
-	ConnMaxIdle  time.Duration `mapstructure:"connMaxIdleTime"`
+	DSN                 string        `mapstructure:"dsn"`
+	MaxOpenConns        int           `mapstructure:"maxOpenConns"`
+	MaxIdleConns        int           `mapstructure:"maxIdleConns"`
+	ConnMaxLife         time.Duration `mapstructure:"connMaxLifetime"`
+	ConnMaxIdle         time.Duration `mapstructure:"connMaxIdleTime"`
+	ReplicaDSN          string        `mapstructure:"replicaDsn"`
+	ReplicaMaxOpenConns int           `mapstructure:"replicaMaxOpenConns"`
+	ReplicaMaxIdleConns int           `mapstructure:"replicaMaxIdleConns"`
+	ReplicaConnMaxLife  time.Duration `mapstructure:"replicaConnMaxLifetime"`
+	ReplicaConnMaxIdle  time.Duration `mapstructure:"replicaConnMaxIdleTime"`
 }
 
 // PostgresConfig holds PostgreSQL connection settings.
@@ -475,10 +515,19 @@ type PostgresConfig struct {
 
 // RedisConfig keeps caching parameters.
 type RedisConfig struct {
-	Addresses []string `mapstructure:"addresses"`
-	Username  string   `mapstructure:"username"`
-	Password  string   `mapstructure:"password"`
-	Database  int      `mapstructure:"database"`
+	Addresses      []string      `mapstructure:"addresses"`
+	Username       string        `mapstructure:"username"`
+	Password       string        `mapstructure:"password"`
+	Database       int           `mapstructure:"database"`
+	UseTLS         bool          `mapstructure:"useTls"`
+	TLSSkipVerify  bool          `mapstructure:"tlsSkipVerify"`
+	ConnectTimeout time.Duration `mapstructure:"connectTimeout"`
+	DialTimeout    time.Duration `mapstructure:"dialTimeout"`
+	ReadTimeout    time.Duration `mapstructure:"readTimeout"`
+	WriteTimeout   time.Duration `mapstructure:"writeTimeout"`
+	PoolSize       int           `mapstructure:"poolSize"`
+	MinIdleConns   int           `mapstructure:"minIdleConns"`
+	MaxRetries     int           `mapstructure:"maxRetries"`
 }
 
 // KafkaConfig describes bus connectivity.
@@ -556,12 +605,21 @@ type TLSConfig struct {
 
 // ReplicationConfig describes CDC/Binlog synchronization for standby nodes.
 type ReplicationConfig struct {
-	CDCEnabled       bool          `mapstructure:"cdcEnabled"`
-	BinlogSource     string        `mapstructure:"binlogSource"`
-	SnapshotInterval time.Duration `mapstructure:"snapshotInterval"`
-	Brokers          []string      `mapstructure:"brokers"`
-	Topic            string        `mapstructure:"topic"`
-	AckTimeout       time.Duration `mapstructure:"ackTimeout"`
+	CDCEnabled                            bool          `mapstructure:"cdcEnabled"`
+	BinlogSource                          string        `mapstructure:"binlogSource"`
+	SnapshotInterval                      time.Duration `mapstructure:"snapshotInterval"`
+	Brokers                               []string      `mapstructure:"brokers"`
+	Topic                                 string        `mapstructure:"topic"`
+	AckTimeout                            time.Duration `mapstructure:"ackTimeout"`
+	EnforceAck                            bool          `mapstructure:"enforceAck"`
+	AckFailurePolicy                      string        `mapstructure:"ackFailurePolicy"`
+	SyncTxnReconcileInterval              time.Duration `mapstructure:"syncTxnReconcileInterval"`
+	SyncTxnReconcileFailureAlertThreshold int           `mapstructure:"syncTxnReconcileFailureAlertThreshold"`
+	SyncTxnReconcileAlertCooldown         time.Duration `mapstructure:"syncTxnReconcileAlertCooldown"`
+	SyncTxnReconcileBackoffMax            time.Duration `mapstructure:"syncTxnReconcileBackoffMax"`
+	SyncTxnMaxEntries                     int           `mapstructure:"syncTxnMaxEntries"`
+	SyncTxnRetention                      time.Duration `mapstructure:"syncTxnRetention"`
+	SyncTxnArchiveLimit                   int           `mapstructure:"syncTxnArchiveLimit"`
 }
 
 // ConfigSyncConfig governs GitOps/etcd configuration validation.
@@ -703,6 +761,7 @@ type AutoReclaimConfig struct {
 // SecurityConfig holds security guardrails.
 type SecurityConfig struct {
 	Enabled            bool                     `mapstructure:"enabled"`
+	DHCPv4             DHCPv4SecurityConfig     `mapstructure:"dhcpv4"`
 	Snooping           SnoopingConfig           `mapstructure:"snooping"`
 	RateLimit          RateLimitConfig          `mapstructure:"rateLimit"`
 	Detection          DetectionConfig          `mapstructure:"detection"`
@@ -715,6 +774,20 @@ type SecurityConfig struct {
 	Policy             SecurityPolicyConfig     `mapstructure:"policy"`
 }
 
+// DHCPv4SecurityConfig defines packet-level protections for DHCPv4 services.
+type DHCPv4SecurityConfig struct {
+	MACRateLimitPPS int                       `mapstructure:"macRateLimitPPS"`
+	RelayWhitelist  []string                  `mapstructure:"relayWhitelist"`
+	RogueDetector   DHCPv4RogueDetectorConfig `mapstructure:"rogueDetector"`
+}
+
+// DHCPv4RogueDetectorConfig configures passive rogue DHCP offer detection.
+type DHCPv4RogueDetectorConfig struct {
+	Enabled      bool     `mapstructure:"enabled"`
+	Interface    string   `mapstructure:"interface"`
+	ClusterNodes []string `mapstructure:"clusterNodes"`
+}
+
 // SecurityPolicyConfig toggles guard policy evaluation.
 type SecurityPolicyConfig struct {
 	Enabled  bool          `mapstructure:"enabled"`
@@ -723,11 +796,25 @@ type SecurityPolicyConfig struct {
 
 // ConflictPreventionConfig tunes proactive IP conflict detection.
 type ConflictPreventionConfig struct {
-	Enabled          bool          `mapstructure:"enabled"`
-	ProbeTimeout     time.Duration `mapstructure:"probeTimeout"`
-	HoldDuration     time.Duration `mapstructure:"holdDuration"`
-	MaxAttempts      int           `mapstructure:"maxAttempts"`
-	ReclaimScanLimit int           `mapstructure:"reclaimScanLimit"`
+	Enabled          bool                                    `mapstructure:"enabled"`
+	ProbeTimeout     time.Duration                           `mapstructure:"probeTimeout"`
+	HoldDuration     time.Duration                           `mapstructure:"holdDuration"`
+	MaxAttempts      int                                     `mapstructure:"maxAttempts"`
+	ReclaimScanLimit int                                     `mapstructure:"reclaimScanLimit"`
+	ARPTimeout       time.Duration                           `mapstructure:"arpTimeout"`
+	ARPRetries       int                                     `mapstructure:"arpRetries"`
+	ICMPRetries      int                                     `mapstructure:"icmpRetries"`
+	CacheTTL         time.Duration                           `mapstructure:"cacheTTL"`
+	ConflictTTL      time.Duration                           `mapstructure:"conflictTTL"`
+	Pools            map[string]ConflictPreventionPoolConfig `mapstructure:"pools"`
+}
+
+// ConflictPreventionPoolConfig overrides ACD behavior per address pool.
+type ConflictPreventionPoolConfig struct {
+	Enabled     bool          `mapstructure:"enabled"`
+	ARPTimeout  time.Duration `mapstructure:"arpTimeout"`
+	ARPRetries  int           `mapstructure:"arpRetries"`
+	ICMPRetries int           `mapstructure:"icmpRetries"`
 }
 
 // MDMConfig describes external mobile device management connectors.
@@ -789,6 +876,16 @@ type RelayOption82Config struct {
 	PreserveRaw       bool                          `mapstructure:"preserveRaw"`
 	SubOptionMappings map[string]RelaySubOptionSpec `mapstructure:"subOptionMappings"`
 	VendorProfiles    map[string]RelayVendorProfile `mapstructure:"vendorProfiles"`
+	Whitelist         RelayOption82WhitelistConfig  `mapstructure:"whitelist"`
+}
+
+// RelayOption82WhitelistConfig defines allow/deny rules for RFC3046 sub-options.
+type RelayOption82WhitelistConfig struct {
+	Enabled        bool     `mapstructure:"enabled"`
+	CircuitIDAllow []string `mapstructure:"circuitIdAllow"`
+	CircuitIDDeny  []string `mapstructure:"circuitIdDeny"`
+	RemoteIDAllow  []string `mapstructure:"remoteIdAllow"`
+	RemoteIDDeny   []string `mapstructure:"remoteIdDeny"`
 }
 
 // RelaySubOptionSpec maps a sub-option code to a metadata key and decode format.
@@ -946,11 +1043,15 @@ type DetectionConfig struct {
 
 // MACACLConfig defines static MAC allow/deny policies.
 type MACACLConfig struct {
-	Whitelist        []string `mapstructure:"whitelist"`
-	Blacklist        []string `mapstructure:"blacklist"`
-	Graylist         []string `mapstructure:"graylist"`
-	GraylistAction   string   `mapstructure:"graylistAction"`
-	EnforceWhitelist bool     `mapstructure:"enforceWhitelist"`
+	Whitelist          []string      `mapstructure:"whitelist"`
+	Blacklist          []string      `mapstructure:"blacklist"`
+	Graylist           []string      `mapstructure:"graylist"`
+	GraylistAction     string        `mapstructure:"graylistAction"`
+	EnforceWhitelist   bool          `mapstructure:"enforceWhitelist"`
+	BindingExemptACL   bool          `mapstructure:"bindingExemptAcl"`
+	RenewExemptBlocked bool          `mapstructure:"renewExemptBlocked"`
+	CacheTTL           time.Duration `mapstructure:"cacheTtl"`
+	DefaultAction      string        `mapstructure:"defaultAction"`
 }
 
 // ExhaustionConfig defines safeguards against address exhaustion attacks.
@@ -1013,6 +1114,7 @@ type AuthConfig struct {
 type ProviderCatalogConfig struct {
 	Local LocalProviderConfig `mapstructure:"local"`
 	LDAP  LDAPProviderConfig  `mapstructure:"ldap"`
+	OIDC  OIDCProviderConfig  `mapstructure:"oidc"`
 }
 
 // LocalProviderConfig toggles the built-in password provider.
@@ -1038,12 +1140,117 @@ type LDAPProviderConfig struct {
 	Timeout              time.Duration `mapstructure:"timeout"`
 }
 
+// OIDCProviderConfig wires an OIDC/OAuth2 identity source.
+type OIDCProviderConfig struct {
+	Enabled          bool              `mapstructure:"enabled"`
+	Default          bool              `mapstructure:"default"`
+	Issuer           string            `mapstructure:"issuer"`
+	Audience         string            `mapstructure:"audience"`
+	JWKSURL          string            `mapstructure:"jwksURL"`
+	JWKSCacheTTL     time.Duration     `mapstructure:"jwksCacheTTL"`
+	HMACSecret       string            `mapstructure:"hmacSecret"`
+	RequiredScopes   []string          `mapstructure:"requiredScopes"`
+	ScopeRoles       map[string]string `mapstructure:"scopeRoles"`
+	DefaultRole      string            `mapstructure:"defaultRole"`
+	ClockSkew        time.Duration     `mapstructure:"clockSkew"`
+	UsernameClaim    string            `mapstructure:"usernameClaim"`
+	DisplayNameClaim string            `mapstructure:"displayNameClaim"`
+	EmailClaim       string            `mapstructure:"emailClaim"`
+	RoleClaim        string            `mapstructure:"roleClaim"`
+}
+
 // SuperAdminConfig seeds the built-in console administrator.
 type SuperAdminConfig struct {
 	Enabled   bool   `mapstructure:"enabled"`
 	Username  string `mapstructure:"username"`
 	APIKeyRef string `mapstructure:"apiKeyRef"`
 	StateFile string `mapstructure:"stateFile"`
+}
+
+// ValidateAuth validates auth schema fields and cross references.
+func (cfg *Config) ValidateAuth() error {
+	if cfg == nil {
+		return fmt.Errorf("config is nil")
+	}
+	return cfg.Auth.Validate()
+}
+
+// Validate checks auth-related configuration consistency.
+func (cfg AuthConfig) Validate() error {
+	errors := make([]string, 0)
+
+	validProviderCount := 0
+	defaultProviderCount := 0
+
+	if !cfg.Providers.Local.Disabled {
+		validProviderCount++
+		if cfg.Providers.Local.Default {
+			defaultProviderCount++
+		}
+	}
+
+	if cfg.Providers.LDAP.Enabled {
+		validProviderCount++
+		if cfg.Providers.LDAP.Default {
+			defaultProviderCount++
+		}
+		if strings.TrimSpace(cfg.Providers.LDAP.URL) == "" {
+			errors = append(errors, "auth.providers.ldap.url is required when ldap.enabled=true")
+		}
+		if strings.TrimSpace(cfg.Providers.LDAP.UserBaseDN) == "" {
+			errors = append(errors, "auth.providers.ldap.userBaseDN is required when ldap.enabled=true")
+		}
+	}
+
+	if cfg.Providers.OIDC.Enabled {
+		validProviderCount++
+		if cfg.Providers.OIDC.Default {
+			defaultProviderCount++
+		}
+		if strings.TrimSpace(cfg.Providers.OIDC.Issuer) == "" {
+			errors = append(errors, "auth.providers.oidc.issuer is required when oidc.enabled=true")
+		}
+		if strings.TrimSpace(cfg.Providers.OIDC.JWKSURL) == "" && strings.TrimSpace(cfg.Providers.OIDC.HMACSecret) == "" {
+			errors = append(errors, "auth.providers.oidc.jwksURL or auth.providers.oidc.hmacSecret is required when oidc.enabled=true")
+		}
+	}
+
+	if cfg.Enabled && validProviderCount == 0 {
+		errors = append(errors, "auth.enabled=true requires at least one enabled provider")
+	}
+	if defaultProviderCount > 1 {
+		errors = append(errors, "only one auth provider can be marked as default")
+	}
+
+	for token, keyCfg := range cfg.APIKeys {
+		if strings.TrimSpace(token) == "" {
+			errors = append(errors, "auth.apiKeys contains an empty token key")
+		}
+		role := strings.ToLower(strings.TrimSpace(keyCfg.Role))
+		if role != "reader" && role != "admin" {
+			errors = append(errors, fmt.Sprintf("auth.apiKeys.%s.role must be reader or admin", token))
+		}
+		if strings.TrimSpace(keyCfg.PrincipalID) == "" {
+			errors = append(errors, fmt.Sprintf("auth.apiKeys.%s.principalId is required", token))
+		}
+	}
+
+	if cfg.SuperAdmin.Enabled {
+		apiKeyRef := strings.TrimSpace(cfg.SuperAdmin.APIKeyRef)
+		if apiKeyRef == "" {
+			errors = append(errors, "auth.superAdmin.apiKeyRef is required when superAdmin.enabled=true")
+		} else if _, ok := cfg.APIKeys[apiKeyRef]; !ok {
+			errors = append(errors, "auth.superAdmin.apiKeyRef must reference an existing auth.apiKeys entry")
+		}
+		if strings.TrimSpace(cfg.SuperAdmin.StateFile) == "" {
+			errors = append(errors, "auth.superAdmin.stateFile is required when superAdmin.enabled=true")
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("invalid auth config: %s", strings.Join(errors, "; "))
+	}
+	return nil
 }
 
 // RBACConfig tunes capability enforcement strategy.
@@ -1087,8 +1294,10 @@ type PrometheusConfig struct {
 
 // TracingConfig chooses a tracing backend.
 type TracingConfig struct {
-	Exporter string `mapstructure:"exporter"`
-	Endpoint string `mapstructure:"endpoint"`
+	Exporter     string  `mapstructure:"exporter"`
+	Endpoint     string  `mapstructure:"endpoint"`
+	Insecure     bool    `mapstructure:"insecure"`
+	SamplerRatio float64 `mapstructure:"samplerRatio"`
 }
 
 // AlertingConfig powers the intelligent alert manager runtime.
@@ -1221,9 +1430,11 @@ type RateLimitAlertConfig struct {
 
 // AutomationConfig controls the background automation scheduler.
 type AutomationConfig struct {
-	Enabled   bool                      `mapstructure:"enabled"`
-	Scheduler AutomationSchedulerConfig `mapstructure:"scheduler"`
-	Jobs      AutomationJobsConfig      `mapstructure:"jobs"`
+	Enabled   bool                           `mapstructure:"enabled"`
+	Scheduler AutomationSchedulerConfig      `mapstructure:"scheduler"`
+	Jobs      AutomationJobsConfig           `mapstructure:"jobs"`
+	Schedules map[string]AutomationJobConfig `mapstructure:"schedules"`
+	Approvals AutomationApprovalConfig       `mapstructure:"approvals"`
 }
 
 // AutomationSchedulerConfig configures the base scheduler knobs.
@@ -1241,6 +1452,7 @@ type AutomationJobsConfig struct {
 	SecurityScan       AutomationJobConfig `mapstructure:"securityScan"`
 	Analytics          AutomationJobConfig `mapstructure:"analytics"`
 	NotificationFanout AutomationJobConfig `mapstructure:"notificationFanout"`
+	WorkflowExecution  AutomationJobConfig `mapstructure:"workflowExecution"`
 }
 
 // AutomationJobConfig describes a single recurring job schedule.
@@ -1252,6 +1464,13 @@ type AutomationJobConfig struct {
 	Labels       map[string]string      `mapstructure:"labels"`
 	Payload      map[string]interface{} `mapstructure:"payload"`
 	Channels     []string               `mapstructure:"channels"`
+}
+
+// AutomationApprovalConfig captures approval workflow settings for automation changes.
+type AutomationApprovalConfig struct {
+	Enabled            bool     `mapstructure:"enabled"`
+	RequireFor         []string `mapstructure:"requireFor"`
+	AutoApplyOnApprove bool     `mapstructure:"autoApplyOnApprove"`
 }
 
 // NotificationsConfig wires outbound notification channels.
@@ -1291,6 +1510,9 @@ type OpsSupportConfig struct {
 	HelpCenter   HelpCenterConfig      `mapstructure:"helpCenter"`
 	Support      ExternalSupportConfig `mapstructure:"support"`
 	Scripts      ScriptRunnerConfig    `mapstructure:"scripts"`
+	Maintenance  MaintenanceConfig     `mapstructure:"maintenance"`
+	Backups      OpsBackupConfig       `mapstructure:"backups"`
+	Performance  OpsPerformanceConfig  `mapstructure:"performance"`
 }
 
 // OpsSystemConfig governs core system management behaviors.
@@ -1354,6 +1576,136 @@ type ScriptDescriptorConfig struct {
 	Args             []string `mapstructure:"args"`
 	AllowedRoles     []string `mapstructure:"allowedRoles"`
 	RequiresApproval bool     `mapstructure:"requiresApproval"`
+}
+
+// MaintenanceConfig captures maintenance playbooks and upgrade plans.
+type MaintenanceConfig struct {
+	Enabled      bool                     `mapstructure:"enabled"`
+	Playbooks    []MaintenancePlaybook    `mapstructure:"playbooks"`
+	Windows      []MaintenanceWindow      `mapstructure:"windows"`
+	UpgradePlans []MaintenanceUpgradePlan `mapstructure:"upgradePlans"`
+}
+
+// MaintenancePlaybook enumerates wizard steps for maintenance flows.
+type MaintenancePlaybook struct {
+	ID          string            `mapstructure:"id"`
+	Title       string            `mapstructure:"title"`
+	Description string            `mapstructure:"description"`
+	Steps       []MaintenanceStep `mapstructure:"steps"`
+	Tags        []string          `mapstructure:"tags"`
+}
+
+// MaintenanceStep captures an individual maintenance action.
+type MaintenanceStep struct {
+	ID                string        `mapstructure:"id"`
+	Title             string        `mapstructure:"title"`
+	Summary           string        `mapstructure:"summary"`
+	Duration          time.Duration `mapstructure:"duration"`
+	Responsible       string        `mapstructure:"responsible"`
+	RequiresApproval  bool          `mapstructure:"requiresApproval"`
+	DependsOn         []string      `mapstructure:"dependsOn"`
+	AutomationJobType string        `mapstructure:"automationJobType"`
+}
+
+// MaintenanceWindow lists recurring maintenance schedules.
+type MaintenanceWindow struct {
+	ID       string        `mapstructure:"id"`
+	Name     string        `mapstructure:"name"`
+	Cron     string        `mapstructure:"cron"`
+	Duration time.Duration `mapstructure:"duration"`
+	Timezone string        `mapstructure:"timezone"`
+}
+
+// MaintenanceUpgradePlan articulates upgrade execution metadata.
+type MaintenanceUpgradePlan struct {
+	ID            string            `mapstructure:"id"`
+	Version       string            `mapstructure:"version"`
+	Summary       string            `mapstructure:"summary"`
+	ScheduledFor  string            `mapstructure:"scheduledFor"`
+	Steps         []MaintenanceStep `mapstructure:"steps"`
+	Prerequisites []string          `mapstructure:"prerequisites"`
+	RollbackPlan  []MaintenanceStep `mapstructure:"rollbackPlan"`
+	ReleaseNotes  string            `mapstructure:"releaseNotes"`
+}
+
+// OpsBackupConfig captures backup wizard definitions.
+type OpsBackupConfig struct {
+	Enabled      bool                `mapstructure:"enabled"`
+	Schedules    []BackupSchedule    `mapstructure:"schedules"`
+	Destinations []BackupDestination `mapstructure:"destinations"`
+	RestoreFlows []RestoreWorkflow   `mapstructure:"restoreWorkflows"`
+	Verification BackupVerification  `mapstructure:"verification"`
+}
+
+// BackupSchedule enumerates recurring backup jobs.
+type BackupSchedule struct {
+	ID           string        `mapstructure:"id"`
+	Name         string        `mapstructure:"name"`
+	Cron         string        `mapstructure:"cron"`
+	Retention    time.Duration `mapstructure:"retention"`
+	Window       time.Duration `mapstructure:"window"`
+	Type         string        `mapstructure:"type"`
+	Enabled      bool          `mapstructure:"enabled"`
+	Destinations []string      `mapstructure:"destinations"`
+}
+
+// BackupDestination documents a backup storage target.
+type BackupDestination struct {
+	ID          string            `mapstructure:"id"`
+	Name        string            `mapstructure:"name"`
+	Kind        string            `mapstructure:"kind"`
+	Endpoint    string            `mapstructure:"endpoint"`
+	Credentials string            `mapstructure:"credentials"`
+	Metadata    map[string]string `mapstructure:"metadata"`
+}
+
+// RestoreWorkflow captures guided restore steps.
+type RestoreWorkflow struct {
+	ID          string            `mapstructure:"id"`
+	Name        string            `mapstructure:"name"`
+	Description string            `mapstructure:"description"`
+	Steps       []MaintenanceStep `mapstructure:"steps"`
+	Checks      []string          `mapstructure:"checks"`
+	Approvals   []string          `mapstructure:"approvals"`
+}
+
+// OpsPerformanceConfig defines performance probes and KPIs.
+type OpsPerformanceConfig struct {
+	Enabled         bool                   `mapstructure:"enabled"`
+	Probes          []PerformanceProbe     `mapstructure:"probes"`
+	Indicators      []PerformanceIndicator `mapstructure:"indicators"`
+	Recommendations []PerformancePlaybook  `mapstructure:"recommendations"`
+}
+
+// PerformanceProbe describes a diagnostic probe.
+type PerformanceProbe struct {
+	ID          string             `mapstructure:"id"`
+	Name        string             `mapstructure:"name"`
+	Description string             `mapstructure:"description"`
+	Command     string             `mapstructure:"command"`
+	Interval    time.Duration      `mapstructure:"interval"`
+	SLO         float64            `mapstructure:"slo"`
+	Units       string             `mapstructure:"units"`
+	Thresholds  map[string]float64 `mapstructure:"thresholds"`
+}
+
+// PerformanceIndicator captures a KPI to visualize in diagnostics panel.
+type PerformanceIndicator struct {
+	ID          string  `mapstructure:"id"`
+	Name        string  `mapstructure:"name"`
+	Description string  `mapstructure:"description"`
+	Target      float64 `mapstructure:"target"`
+	Units       string  `mapstructure:"units"`
+}
+
+// PerformancePlaybook provides remediation actions for bottlenecks.
+type PerformancePlaybook struct {
+	ID      string            `mapstructure:"id"`
+	Title   string            `mapstructure:"title"`
+	Summary string            `mapstructure:"summary"`
+	Impact  string            `mapstructure:"impact"`
+	Steps   []MaintenanceStep `mapstructure:"steps"`
+	Signals []string          `mapstructure:"signals"`
 }
 
 // Load loads configuration from the provided file and environment overrides.

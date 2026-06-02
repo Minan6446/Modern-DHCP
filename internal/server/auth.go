@@ -21,6 +21,8 @@ const (
 	contextCapabilitiesKey     = "apiCapabilities"
 	contextCapabilityStrictKey = "apiCapabilityStrict"
 	contextResolutionKey       = "tenantResolution"
+	contextAccessScopeKey      = "apiAccessScope"
+	contextPrincipalContextKey = "apiPrincipalContext"
 )
 
 // Authenticator validates API keys and/or JWT bearer tokens.
@@ -62,6 +64,9 @@ func (a *Authenticator) Middleware() echo.MiddlewareFunc {
 	}
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
+			if isPublicAuthEndpoint(c.Request().Method, c.Request().URL.Path) {
+				return next(c)
+			}
 			ctx, ok := a.authenticate(c)
 			if !ok {
 				if a.requireAuth {
@@ -72,6 +77,38 @@ func (a *Authenticator) Middleware() echo.MiddlewareFunc {
 			applyAuthContext(c, ctx)
 			return next(c)
 		}
+	}
+}
+
+func isPublicAuthEndpoint(method, path string) bool {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	cleanPath := strings.TrimRight(strings.TrimSpace(path), "/")
+	if cleanPath == "" {
+		cleanPath = "/"
+	}
+	for _, prefix := range []string{"/api/v1", "/api/v2"} {
+		if strings.HasPrefix(cleanPath, prefix+"/") {
+			cleanPath = strings.TrimPrefix(cleanPath, prefix)
+			break
+		}
+	}
+	if method == http.MethodGet && cleanPath == "/auth/captcha" {
+		return true
+	}
+	if method != http.MethodPost {
+		return false
+	}
+	switch cleanPath {
+	case "/auth/login",
+		"/auth/session",
+		"/auth/session/refresh",
+		"/auth/api-keys/exchange",
+		"/auth/password/reset/start",
+		"/auth/password/reset/verify",
+		"/auth/password/reset/complete":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -93,6 +130,35 @@ func (a *Authenticator) authenticateAPIKey(ctx context.Context, r *http.Request)
 	if key == "" {
 		if token := bearerToken(r.Header.Get("Authorization")); token != "" {
 			key = token
+		}
+	}
+	if key == "" {
+		if cookie, err := r.Cookie("auth_token"); err == nil {
+			key = strings.TrimSpace(cookie.Value)
+		}
+	}
+	if key == "" {
+		if token := strings.TrimSpace(r.URL.Query().Get("access_token")); token != "" {
+			key = token
+		} else if token := strings.TrimSpace(r.URL.Query().Get("token")); token != "" {
+			key = token
+		}
+	}
+	if key == "" {
+		if raw := strings.TrimSpace(r.Header.Get("Sec-Websocket-Protocol")); raw != "" {
+			for _, candidate := range strings.Split(raw, ",") {
+				value := strings.TrimSpace(candidate)
+				if value == "" {
+					continue
+				}
+				if strings.HasPrefix(strings.ToLower(value), "bearer ") {
+					key = strings.TrimSpace(value[7:])
+					break
+				}
+				if key == "" {
+					key = value
+				}
+			}
 		}
 	}
 	if key == "" {
@@ -127,7 +193,7 @@ func (a *Authenticator) authenticateJWT(r *http.Request) (authContext, bool) {
 	if bearer == "" {
 		return authContext{}, false
 	}
-	identity, err := a.validator.Validate(r.Context(), bearer)
+	identity, _, err := a.validator.Validate(r.Context(), bearer)
 	if err != nil {
 		return authContext{}, false
 	}
@@ -165,6 +231,7 @@ func applyAuthContext(c echo.Context, ctx authContext) {
 	}
 	if ctx.PrincipalID != "" {
 		c.Set(contextPrincipalKey, ctx.PrincipalID)
+		setRequestContextValue(c, contextKeyUserID, ctx.PrincipalID)
 	}
 }
 

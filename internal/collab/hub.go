@@ -139,7 +139,6 @@ func (h *Hub) newClient(ctx context.Context, cancel context.CancelFunc, bootstra
 	expires := now.Add(h.sessionTTL())
 	record := &Session{
 		ID:           sessionID,
-		TenantID:     bootstrap.TenantID,
 		ResourceType: bootstrap.ResourceType,
 		ResourceID:   bootstrap.ResourceID,
 		UserID:       bootstrap.UserID,
@@ -267,7 +266,6 @@ func (c *client) handleLockAcquire() {
 	now := time.Now().UTC()
 	lock := &Lock{
 		ID:           uuid.NewString(),
-		TenantID:     c.bootstrap.TenantID,
 		ResourceType: c.bootstrap.ResourceType,
 		ResourceID:   c.bootstrap.ResourceID,
 		SessionID:    c.id,
@@ -381,7 +379,7 @@ func (h *Hub) snapshotSessions(ctx context.Context, bootstrap SessionBootstrap) 
 	if h.repo == nil {
 		return nil
 	}
-	sessions, err := h.repo.ListSessions(ctx, bootstrap.TenantID, bootstrap.ResourceType, bootstrap.ResourceID, 100)
+	sessions, err := h.repo.ListSessions(ctx, "", bootstrap.ResourceType, bootstrap.ResourceID, 100)
 	if err != nil {
 		h.logger.Warn("collab list sessions", zap.Error(err))
 		return nil
@@ -390,7 +388,7 @@ func (h *Hub) snapshotSessions(ctx context.Context, bootstrap SessionBootstrap) 
 }
 
 func (h *Hub) snapshotLocks(ctx context.Context, bootstrap SessionBootstrap) []Lock {
-	locks, err := h.repo.ListLocks(ctx, bootstrap.TenantID, bootstrap.ResourceType, bootstrap.ResourceID)
+	locks, err := h.repo.ListLocks(ctx, "", bootstrap.ResourceType, bootstrap.ResourceID)
 	if err != nil {
 		h.logger.Warn("collab list locks", zap.Error(err))
 		return nil
@@ -412,7 +410,6 @@ func (h *Hub) recordEvent(ctx context.Context, bootstrap SessionBootstrap, sessi
 	resourceID := bootstrap.ResourceID
 	sessionRef := optionalString(sessionID)
 	evt := &Event{
-		TenantID:     bootstrap.TenantID,
 		SessionID:    sessionRef,
 		ResourceType: &resourceType,
 		ResourceID:   &resourceID,
@@ -441,7 +438,7 @@ func normalizeStatus(status string) string {
 }
 
 func roomKey(bootstrap SessionBootstrap) string {
-	return bootstrap.TenantID + "|" + bootstrap.ResourceType + "|" + bootstrap.ResourceID
+	return bootstrap.ResourceType + "|" + bootstrap.ResourceID
 }
 
 func optionalString(value string) *string {

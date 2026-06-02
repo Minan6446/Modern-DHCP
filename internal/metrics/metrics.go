@@ -10,20 +10,34 @@ import (
 // Collector exposes Prometheus metrics used by Modern-DHCP runtime.
 type Collector struct {
 	HTTPRequests            *prometheus.CounterVec
+	HTTPRequestLatency      *prometheus.HistogramVec
+	HTTPErrors              *prometheus.CounterVec
 	LeaseEvents             *prometheus.CounterVec
 	LeaseConflicts          *prometheus.CounterVec
+	DHCPv4ACDConflicts      *prometheus.CounterVec
+	DHCPv6EUI64Binding      *prometheus.CounterVec
+	DHCPv6IPv6Conflicts     *prometheus.CounterVec
+	DHCPv4Packets           *prometheus.CounterVec
+	DHCPv4LeaseOpDuration   *prometheus.HistogramVec
 	PolicyHits              *prometheus.CounterVec
 	PoolSelectorResolutions *prometheus.CounterVec
 	PoolSelectorErrors      *prometheus.CounterVec
 	PoolSelectorLatency     *prometheus.HistogramVec
 	PoolMetadataSnapshot    *prometheus.GaugeVec
+	PoolServiceLatency      *prometheus.HistogramVec
 	SecurityEvents          *prometheus.CounterVec
 	SecurityGuardLatency    *prometheus.HistogramVec
 	SnoopingCache           *prometheus.CounterVec
 	DHCPRequestLifecycle    *prometheus.CounterVec
 	DHCPRequestLatency      *prometheus.HistogramVec
 	LeaseReplicationLag     *prometheus.HistogramVec
+	LeaseSyncAckFailures    *prometheus.CounterVec
+	SyncTxnReconcileRuns    *prometheus.CounterVec
+	LeaseAllocatorLatency   *prometheus.HistogramVec
+	LeaseAllocatorAttempts  *prometheus.CounterVec
 	PoolUtilization         *prometheus.GaugeVec
+	DBPoolStats             *prometheus.GaugeVec
+	CacheEvents             *prometheus.CounterVec
 	MobilityAffinityHits    *prometheus.CounterVec
 	HARole                  *prometheus.GaugeVec
 	HAState                 *prometheus.GaugeVec
@@ -43,6 +57,17 @@ func NewCollector(namespace string) *Collector {
 			Name:      "http_requests_total",
 			Help:      "Count of management API requests",
 		}, []string{"endpoint", "method", "status"}),
+		HTTPRequestLatency: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "http_request_duration_seconds",
+			Help:      "Latency of management API requests",
+			Buckets:   []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+		}, []string{"endpoint", "method", "status"}),
+		HTTPErrors: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "http_errors_total",
+			Help:      "Count of management API responses considered errors (>=500)",
+		}, []string{"endpoint", "method", "status"}),
 		LeaseEvents: promauto.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "lease_events_total",
@@ -53,6 +78,27 @@ func NewCollector(namespace string) *Collector {
 			Name:      "lease_conflicts_total",
 			Help:      "Count of lease conflict detections",
 		}, []string{"tenant", "signal"}),
+		DHCPv4ACDConflicts: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "dhcpv4_acd_conflict_total",
+			Help: "Count of DHCPv4 ACD conflicts detected during IP allocation",
+		}, []string{"pool"}),
+		DHCPv6EUI64Binding: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "dhcpv6_eui64_binding_total",
+			Help: "Count of DHCPv6 EUI-64 binding operations grouped by result",
+		}, []string{"result"}),
+		DHCPv6IPv6Conflicts: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "dhcpv6_ipv6_conflict_total",
+			Help: "Count of DHCPv6 IPv6 address conflicts detected by ICMPv6 probing",
+		}, []string{"result"}),
+		DHCPv4Packets: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "dhcpv4_packet_total",
+			Help: "Count of DHCPv4 packets by message type",
+		}, []string{"type"}),
+		DHCPv4LeaseOpDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "dhcpv4_lease_operation_duration_seconds",
+			Help:    "Duration of DHCPv4 lease operations",
+			Buckets: []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+		}, []string{"op"}),
 		PolicyHits: promauto.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "policy_evaluations_total",
@@ -79,6 +125,12 @@ func NewCollector(namespace string) *Collector {
 			Name:      "pool_metadata_snapshot",
 			Help:      "Latest metadata tuple for pools participating in selector resolutions",
 		}, []string{"tenant", "poolId", "scope", "vlan", "interface", "ssid", "location"}),
+		PoolServiceLatency: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "pool_service_operation_seconds",
+			Help:      "Latency of pool service operations grouped by tenant and operation",
+			Buckets:   []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+		}, []string{"tenant", "operation", "outcome"}),
 		SecurityEvents: promauto.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "security_events_total",
@@ -112,11 +164,42 @@ func NewCollector(namespace string) *Collector {
 			Help:      "Time between local lease persistence and CDC confirmation",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2},
 		}, []string{"tenant"}),
+		LeaseSyncAckFailures: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "lease_sync_ack_failures_total",
+			Help:      "Count of lease sync ACK gate failures before DHCP ACK response",
+		}, []string{"tenant", "policy", "reason"}),
+		SyncTxnReconcileRuns: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "sync_txn_reconcile_total",
+			Help:      "Count of cluster sync transaction snapshot reconcile runs",
+		}, []string{"result"}),
+		LeaseAllocatorLatency: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "lease_allocator_phase_seconds",
+			Help:      "Latency of lease allocator phases grouped by tenant and phase",
+			Buckets:   []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+		}, []string{"tenant", "phase", "outcome"}),
+		LeaseAllocatorAttempts: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "lease_allocator_phase_total",
+			Help:      "Count of lease allocator phase executions grouped by tenant and outcome",
+		}, []string{"tenant", "phase", "outcome"}),
 		PoolUtilization: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "pool_utilization_percent",
 			Help:      "Current utilization percentage per address pool",
 		}, []string{"tenant", "poolId", "scope"}),
+		DBPoolStats: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "db_pool_stats",
+			Help:      "Snapshot of database pool statistics grouped by role",
+		}, []string{"tenant", "role", "state"}),
+		CacheEvents: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "cache_events_total",
+			Help:      "Count of cache interactions grouped by layer and outcome",
+		}, []string{"resource", "operation", "layer", "result"}),
 		MobilityAffinityHits: promauto.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "dhcp_mobility_affinity_hit_total",

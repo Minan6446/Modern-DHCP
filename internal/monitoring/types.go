@@ -1,6 +1,10 @@
 package monitoring
 
-import "time"
+import (
+	"time"
+
+	"modern-dhcp/internal/security/snooping"
+)
 
 // PoolUsageSummary captures utilization stats for an address pool.
 type PoolUsageSummary struct {
@@ -46,20 +50,54 @@ type ClientDistributionSnapshot struct {
 
 // SystemHealthSnapshot contains runtime + OS level statistics.
 type SystemHealthSnapshot struct {
-	Timestamp       time.Time `json:"timestamp"`
-	CPUPercent      float64   `json:"cpuPercent"`
-	MemoryPercent   float64   `json:"memoryPercent"`
-	MemoryUsedBytes uint64    `json:"memoryUsedBytes"`
-	DiskPercent     float64   `json:"diskPercent"`
-	NetworkRxBytes  uint64    `json:"networkRxBytes"`
-	NetworkTxBytes  uint64    `json:"networkTxBytes"`
-	Goroutines      int       `json:"goroutines"`
+	Timestamp        time.Time `json:"timestamp"`
+	CPUPercent       float64   `json:"cpuPercent"`
+	MemoryPercent    float64   `json:"memoryPercent"`
+	MemoryUsedBytes  uint64    `json:"memoryUsedBytes"`
+	DiskPercent      float64   `json:"diskPercent"`
+	CPUCores         int       `json:"cpuCores"`
+	MemoryTotalBytes uint64    `json:"memoryTotalBytes"`
+	DiskUsedBytes    uint64    `json:"diskUsedBytes"`
+	DiskTotalBytes   uint64    `json:"diskTotalBytes"`
+	NetworkRxBytes   uint64    `json:"networkRxBytes"`
+	NetworkTxBytes   uint64    `json:"networkTxBytes"`
+	Goroutines       int       `json:"goroutines"`
 }
 
 // SecuritySnapshot exposes guard-level telemetry for dashboards.
 type SecuritySnapshot struct {
 	RateLimit RateLimitWindow `json:"rateLimit"`
 	Snooping  SnoopingWindow  `json:"snooping"`
+}
+
+// RateLimitEvent captures individual guard rejections for rate limiting.
+type RateLimitEvent struct {
+	TenantID   string        `json:"tenantId"`
+	OccurredAt time.Time     `json:"occurredAt"`
+	MAC        string        `json:"mac"`
+	PortID     string        `json:"portId"`
+	IP         string        `json:"ip"`
+	RetryAfter time.Duration `json:"retryAfter"`
+}
+
+// SnoopingEvent captures individual snooping observations.
+type SnoopingEvent struct {
+	TenantID   string                     `json:"tenantId"`
+	OccurredAt time.Time                  `json:"occurredAt"`
+	MAC        string                     `json:"mac"`
+	PortID     string                     `json:"portId"`
+	VLANID     int                        `json:"vlanId"`
+	Result     snooping.ObservationResult `json:"result"`
+	Reason     string                     `json:"reason,omitempty"`
+}
+
+// SecurityEventsSnapshot aggregates recent guard events for dashboards.
+type SecurityEventsSnapshot struct {
+	TenantID    string           `json:"tenantId"`
+	GeneratedAt time.Time        `json:"generatedAt"`
+	Window      time.Duration    `json:"window"`
+	RateLimit   []RateLimitEvent `json:"rateLimit"`
+	Snooping    []SnoopingEvent  `json:"snooping"`
 }
 
 // OverviewSnapshot collates the dashboard cards.

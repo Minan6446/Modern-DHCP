@@ -7,11 +7,14 @@ import (
 	"modern-dhcp/internal/alerting"
 	"modern-dhcp/internal/auth"
 	"modern-dhcp/internal/automation"
+	approvals "modern-dhcp/internal/automation/approvals"
 	workflowsvc "modern-dhcp/internal/automation/workflow"
+	"modern-dhcp/internal/config"
 	"modern-dhcp/internal/failover"
 	"modern-dhcp/internal/ha"
 	"modern-dhcp/internal/metrics"
 	"modern-dhcp/internal/monitoring"
+	"modern-dhcp/internal/notifications"
 	"modern-dhcp/internal/ops"
 	"modern-dhcp/internal/rbac"
 	"modern-dhcp/internal/superadmin"
@@ -26,28 +29,58 @@ type APIKeyMetadata struct {
 
 // Options configures HTTP server behavior.
 type Options struct {
-	RequireAuth        bool
-	APIKeys            map[string]APIKeyMetadata
-	OAuth              OAuthOptions
-	API                APIOptions
-	RBAC               RBACOptions
-	Metrics            *metrics.Collector
-	PrometheusEnabled  bool
-	PrometheusEndpoint string
-	CORS               CORSOptions
-	HealthHooks        []HealthHook
-	Coordinator        failover.StatusReporter
-	FailoverController FailoverController
-	HARunbooks         []string
-	Monitoring         MonitoringOptions
-	Dashboard          DashboardOptions
-	Automation         *automation.Service
-	Workflow           *workflowsvc.Service
-	OpsSupport         ops.Options
-	OpsSettingsStore   ops.SettingsStore
-	UI                 UIOptions
-	SuperAdmin         SuperAdminOptions
-	TokenProvider      auth.TokenProvider
+	RequireAuth              bool
+	APIKeys                  map[string]APIKeyMetadata
+	OAuth                    OAuthOptions
+	API                      APIOptions
+	APITLS                   APITLSOptions
+	Environment              string
+	RBAC                     RBACOptions
+	HAConfig                 config.HAConfig
+	Metrics                  *metrics.Collector
+	PrometheusEnabled        bool
+	PrometheusEndpoint       string
+	CORS                     CORSOptions
+	HealthHooks              []HealthHook
+	Coordinator              failover.StatusReporter
+	FailoverController       FailoverController
+	HARunbooks               []string
+	Monitoring               MonitoringOptions
+	Alerting                 AlertingOptions
+	Dashboard                DashboardOptions
+	Automation               *automation.Service
+	AutomationApprovals      *approvals.Service
+	AutomationApprovalPolicy map[approvals.RequestType]struct{}
+	Workflow                 *workflowsvc.Service
+	OpsSupport               ops.Options
+	OpsSettingsStore         ops.SettingsStore
+	OptionRepo               OptionRepository
+	TemplateRepo             TemplateRepository
+	ScopeRepo                ScopeRepository
+	TemplateApplyHistoryRepo TemplateApplyHistoryRepository
+	ClusterConfigStore       ClusterConfigStore
+	JoinJobExecutor          JoinJobExecutor
+	UI                       UIOptions
+	SuperAdmin               SuperAdminOptions
+	TokenProvider            auth.TokenProvider
+	Telemetry                TelemetryOptions
+}
+
+type APITLSOptions struct {
+	Enabled           bool
+	AutoSelfSigned    bool
+	CertFile          string
+	KeyFile           string
+	ClientCAFile      string
+	RequireClientCert bool
+	SelfSignedDir     string
+}
+
+// JoinJobExecutor provides integration hooks for node join phases.
+type JoinJobExecutor interface {
+	SnapshotNode(ctx context.Context, jobID, nodeID, peerAddress string) error
+	CatchUpNode(ctx context.Context, jobID, nodeID, peerAddress string) error
+	VerifyNode(ctx context.Context, jobID, nodeID, peerAddress string) error
 }
 
 // APIOptions configures versioning, docs, and usage controls.
@@ -110,6 +143,18 @@ type MonitoringOptions struct {
 	AlertFeed       *monitoring.AlertFeed
 	AlertManager    *alerting.Manager
 	AlertController *monitoring.AlertController
+}
+
+// AlertingOptions wires workflow stores and notification dispatcher.
+type AlertingOptions struct {
+	Routes        *alerting.RoutingStore
+	Schedule      *alerting.DutySchedule
+	Dispatcher    *notifications.Dispatcher
+	RuleStore     alerting.RuleStore
+	RouteStore    alerting.RouteStore
+	ConfigStore   alerting.ConfigStore
+	TemplateStore alerting.TemplateStore
+	ReceiverStore alerting.ReceiverStore
 }
 
 // DashboardOptions customizes control plane cache + stream settings.
@@ -183,6 +228,16 @@ type VisualizationOptions struct {
 	TopologyAutoDiscovery  bool   `json:"topologyAutoDiscovery"`
 	MaxCanvasNodes         int    `json:"maxCanvasNodes"`
 	SnapshotIntervalMillis int64  `json:"snapshotIntervalMillis"`
+}
+
+// TelemetryOptions configures telemetry settings.
+type TelemetryOptions struct {
+	Enabled      bool    `json:"enabled"`
+	Endpoint     string  `json:"endpoint"`
+	Insecure     bool    `json:"insecure"`
+	SamplerRatio float64 `json:"samplerRatio"`
+	ServiceName  string  `json:"serviceName"`
+	Environment  string  `json:"environment"`
 }
 
 // SuperAdminOptions wires the console super admin bootstrapper.

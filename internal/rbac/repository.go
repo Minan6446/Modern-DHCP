@@ -13,8 +13,10 @@ import (
 type Repository interface {
 	GetRole(ctx context.Context, name string) (Role, error)
 	ListRoles(ctx context.Context) ([]Role, error)
+	CreateRole(ctx context.Context, role Role) error
+	UpdateRole(ctx context.Context, originalName string, role Role) error
+	DeleteRole(ctx context.Context, name string) error
 	ListAssignments(ctx context.Context, principalID string) ([]Assignment, error)
-	ListAssignmentsByTenant(ctx context.Context, principalID, tenantID string) ([]Assignment, error)
 	CreateAssignment(ctx context.Context, assignment *Assignment) error
 	DeleteAssignment(ctx context.Context, assignmentID string) error
 	CreateTempGrant(ctx context.Context, grant *TempGrant) error
@@ -67,44 +69,105 @@ ORDER BY name`
 	return roles, nil
 }
 
+// CreateRole inserts a new role definition.
+func (r *MySQLRepository) CreateRole(ctx context.Context, role Role) error {
+	const statement = `
+INSERT INTO rbac_roles (name, inherits_from, description, capabilities, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)`
+	caps, err := json.Marshal(role.Capabilities)
+	if err != nil {
+		return err
+	}
+	createdAt := role.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	updatedAt := role.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+	_, err = r.db.ExecContext(ctx, statement, role.Name, role.InheritsFrom, role.Description, caps, createdAt, updatedAt)
+	return err
+}
+
+// UpdateRole replaces mutable attributes of an existing role identified by originalName.
+func (r *MySQLRepository) UpdateRole(ctx context.Context, originalName string, role Role) error {
+	const statement = `
+UPDATE rbac_roles
+SET name = ?, inherits_from = ?, description = ?, capabilities = ?, updated_at = ?
+WHERE name = ?`
+	caps, err := json.Marshal(role.Capabilities)
+	if err != nil {
+		return err
+	}
+	updatedAt := role.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	result, err := r.db.ExecContext(ctx, statement, role.Name, role.InheritsFrom, role.Description, caps, updatedAt, originalName)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrRoleNotFound
+	}
+	return nil
+}
+
+// DeleteRole removes a role definition.
+func (r *MySQLRepository) DeleteRole(ctx context.Context, name string) error {
+	const statement = `DELETE FROM rbac_roles WHERE name = ?`
+	result, err := r.db.ExecContext(ctx, statement, name)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrRoleNotFound
+	}
+	return nil
+}
+
 // ListAssignments fetches all assignments for the principal regardless of tenant.
 func (r *MySQLRepository) ListAssignments(ctx context.Context, principalID string) ([]Assignment, error) {
 	const query = `
-SELECT id, principal_id, role_name, tenant_id, org_unit_id, resource_type, resource_id,
-       created_by, created_at, expires_at, attributes
+SELECT id, principal_id, role_name,
+	   COALESCE(group_ids, '[]') AS group_ids,
+	   COALESCE(labels, '{}') AS labels,
+	   group_scope, label_scope,
+       org_unit_id, resource_type, resource_id,
+	   created_by, created_at, expires_at,
+	   COALESCE(attributes, '{}') AS attributes
 FROM rbac_assignments
 WHERE principal_id = ?`
 	var assignments []Assignment
 	if err := r.db.SelectContext(ctx, &assignments, query, principalID); err != nil {
 		return nil, err
 	}
-	return assignments, nil
-}
-
-// ListAssignmentsByTenant fetches assignments filtered by tenant scope.
-func (r *MySQLRepository) ListAssignmentsByTenant(ctx context.Context, principalID, tenantID string) ([]Assignment, error) {
-	const query = `
-SELECT id, principal_id, role_name, tenant_id, org_unit_id, resource_type, resource_id,
-       created_by, created_at, expires_at, attributes
-FROM rbac_assignments
-WHERE principal_id = ?
-  AND (tenant_id = ? OR tenant_id IS NULL)
-`
-	var assignments []Assignment
-	if err := r.db.SelectContext(ctx, &assignments, query, principalID, tenantID); err != nil {
-		return nil, err
+	for i := range assignments {
+		assignments[i].HydrateScope()
 	}
 	return assignments, nil
 }
 
 // CreateAssignment inserts a new permanent grant.
 func (r *MySQLRepository) CreateAssignment(ctx context.Context, assignment *Assignment) error {
+	assignment.PrepareScopeColumns()
 	const statement = `
 INSERT INTO rbac_assignments (
-    id, principal_id, role_name, tenant_id, org_unit_id, resource_type, resource_id,
+	id, principal_id, role_name, group_ids, labels, group_scope, label_scope,
+    org_unit_id, resource_type, resource_id,
     created_by, created_at, expires_at, attributes)
 VALUES (
-    :id, :principal_id, :role_name, :tenant_id, :org_unit_id, :resource_type, :resource_id,
+	:id, :principal_id, :role_name, :group_ids, :labels, :group_scope, :label_scope,
+    :org_unit_id, :resource_type, :resource_id,
     :created_by, :created_at, :expires_at, :attributes)`
 	_, err := r.db.NamedExecContext(ctx, statement, assignment)
 	return err

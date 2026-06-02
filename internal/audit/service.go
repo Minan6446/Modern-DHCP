@@ -26,12 +26,16 @@ const (
 
 // ListEventsFilter constrains queries across actors/actions/resources/correlation IDs.
 type ListEventsFilter struct {
-	Actor         string
-	Actions       []string
-	Resource      string
-	CorrelationID string
-	Limit         int
-	Offset        int
+	Actor          string
+	Actions        []string
+	ActionPrefixes []string
+	ExcludeActions []string
+	Resource       string
+	CorrelationID  string
+	StartAt        *time.Time
+	EndAt          *time.Time
+	Limit          int
+	Offset         int
 }
 
 // Service coordinates audit event capture and queries.
@@ -132,4 +136,12 @@ func (s *Service) ListEventsFiltered(ctx context.Context, tenantID string, filte
 		filter.Offset = 0
 	}
 	return s.repo.ListEventsFiltered(ctx, tenantID, filter)
+}
+
+// CountEventsFiltered returns the total number of audit entries for a filter.
+func (s *Service) CountEventsFiltered(ctx context.Context, tenantID string, filter ListEventsFilter) (int, error) {
+	if tenantID == "" {
+		return 0, ErrTenantRequired
+	}
+	return s.repo.CountEventsFiltered(ctx, tenantID, filter)
 }

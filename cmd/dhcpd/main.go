@@ -12,14 +12,17 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	redislib "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
+	"modern-dhcp/internal/alerting"
 	"modern-dhcp/internal/audit"
 	"modern-dhcp/internal/auth"
 	"modern-dhcp/internal/automation"
 	"modern-dhcp/internal/automation/workflow"
 	workflowactions "modern-dhcp/internal/automation/workflow/actions"
 	"modern-dhcp/internal/backup"
+	"modern-dhcp/internal/cache"
 	"modern-dhcp/internal/collab"
 	"modern-dhcp/internal/config"
 	"modern-dhcp/internal/db"
@@ -42,13 +45,16 @@ import (
 	"modern-dhcp/internal/replication"
 	"modern-dhcp/internal/reporting"
 	securityguard "modern-dhcp/internal/security/guard"
+	"modern-dhcp/internal/security/maclist"
 	securitypolicy "modern-dhcp/internal/security/policy"
 	securityquarantine "modern-dhcp/internal/security/quarantine"
 	"modern-dhcp/internal/server"
 	"modern-dhcp/internal/storage"
 	"modern-dhcp/internal/superadmin"
+	"modern-dhcp/internal/telemetry"
 	"modern-dhcp/internal/tenant"
 	"modern-dhcp/internal/visualization"
+	"modern-dhcp/pkg/models"
 )
 
 func main() {
@@ -66,6 +72,7 @@ func main() {
 		panic(err)
 	}
 	defer logger.Sync()
+	securityguard.RegisterMetrics()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -86,12 +93,36 @@ func main() {
 	if reusePortFlag.WasSet() {
 		cfg.Service.DHCPv4.ReusePort = boolPtr(reusePortFlag.Bool())
 	}
+	if err := cfg.ValidateAuth(); err != nil {
+		logger.Fatal("invalid auth config", zap.Error(err))
+	}
 
 	ctx := context.Background()
+	telemetryOpts := telemetry.Options{
+		Enabled:      strings.EqualFold(cfg.Monitoring.Tracing.Exporter, "otlp"),
+		ServiceName:  strings.TrimSpace(cfg.Service.Name),
+		Environment:  strings.TrimSpace(cfg.Service.Env),
+		OTLPEndpoint: strings.TrimSpace(cfg.Monitoring.Tracing.Endpoint),
+		Insecure:     cfg.Monitoring.Tracing.Insecure,
+		SamplerRatio: cfg.Monitoring.Tracing.SamplerRatio,
+	}
+	telemetryProvider, telemetryErr := telemetry.Setup(ctx, telemetryOpts)
+	if telemetryErr != nil {
+		logger.Warn("telemetry setup", zap.Error(telemetryErr))
+	} else if telemetryProvider != nil {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := telemetryProvider.Shutdown(shutdownCtx); err != nil {
+				logger.Warn("telemetry shutdown", zap.Error(err))
+			}
+		}()
+	}
 	mysqlConfig := cfg.MySQL
 	postgresConfig := cfg.Postgres
 	var (
 		sqlDB        *sqlx.DB
+		sqlReplica   *sqlx.DB
 		dbHealthName = "mysql"
 	)
 	plan, planErr := storage.DeriveRelationalPlan(cfg.Storage)
@@ -123,6 +154,12 @@ func main() {
 				logger.Fatal("connect mysql", zap.Error(err))
 			}
 			sqlDB = dbHandle
+			replicaHandle, rErr := db.NewMySQLReplica(ctx, mysqlConfig)
+			if rErr != nil {
+				logger.Warn("connect mysql replica", zap.Error(rErr))
+			} else {
+				sqlReplica = replicaHandle
+			}
 			dbHealthName = "mysql"
 		default:
 			logger.Warn("relational driver not supported, falling back to mysql", zap.String("driver", plan.Driver))
@@ -135,10 +172,19 @@ func main() {
 			logger.Fatal("connect mysql", zap.Error(err))
 		}
 		sqlDB = dbHandle
+		replicaHandle, rErr := db.NewMySQLReplica(ctx, mysqlConfig)
+		if rErr != nil {
+			logger.Warn("connect mysql replica", zap.Error(rErr))
+		} else {
+			sqlReplica = replicaHandle
+		}
 		dbHealthName = "mysql"
 	}
 	defer sqlDB.Close()
-	tenantRouter := storage.NewTenantRouter(sqlDB, cfg.Tenancy)
+	if sqlReplica != nil {
+		defer sqlReplica.Close()
+	}
+	tenantRouter := storage.NewTenantRouter(sqlDB, cfg.Tenancy).WithDefaultReplica(sqlReplica)
 	defer tenantRouter.Close()
 	metricCollector := metrics.NewCollector(cfg.Service.Name)
 	journal := replication.NewKafkaJournal(cfg.HA.Replication, logger)
@@ -147,16 +193,40 @@ func main() {
 	}
 	failoverManager := failover.NewManager(cfg.HA, logger).WithMetricsCollector(metricCollector)
 
+	redisClient, redisErr := cache.NewRedisClient(cfg.Redis, logger)
+	if redisErr != nil {
+		logger.Warn("redis not available", zap.Error(redisErr))
+	}
+	cacheStore := cache.NewLayeredCache(redisClient, cache.Options{
+		DefaultTTL: 30 * time.Second,
+		Prefix:     cfg.Service.Name,
+		MaxItems:   8192,
+		Logger:     logger,
+	})
+
 	healthHooks := []server.HealthHook{
 		server.NewHealthHook(dbHealthName, func(ctx context.Context) error { return sqlDB.PingContext(ctx) }),
+	}
+	if redisClient != nil {
+		healthHooks = append(healthHooks, server.NewHealthHook("redis", func(ctx context.Context) error { return redisClient.Ping(ctx).Err() }))
+		defer redisClient.Close()
 	}
 	backupManager := backup.NewManager(cfg.Backup, logger)
 	if backupManager != nil {
 		healthHooks = append(healthHooks, backupManager)
 	}
 
-	poolRepo := pool.NewRepository(sqlDB, pool.WithTenantRouter(tenantRouter))
-	leaseRepo := lease.NewRepository(sqlDB, lease.WithTenantRouter(tenantRouter))
+	poolRepo := pool.NewRepository(sqlDB,
+		pool.WithTenantRouter(tenantRouter),
+		pool.WithCache(cacheStore, 30*time.Second),
+		pool.WithMetrics(metricCollector),
+		pool.WithLogger(logger),
+	)
+	leaseRepo := lease.NewRepository(sqlDB,
+		lease.WithTenantRouter(tenantRouter),
+		lease.WithCache(cacheStore, 15*time.Second),
+		lease.WithMetrics(metricCollector),
+	)
 	quotaRepo := tenant.NewQuotaRepository(sqlDB)
 	quotaSvc := tenant.NewQuotaService(quotaRepo, poolRepo, leaseRepo, logger)
 	authRepo := auth.NewRepository(sqlDB)
@@ -173,7 +243,21 @@ func main() {
 	}
 	auditRepo := audit.NewRepository(sqlDB)
 	auditSvc := audit.NewService(auditRepo, logger)
+	poolSvc := pool.NewService(poolRepo, logger, pool.WithQuotaEnforcer(quotaSvc))
 	leaseOpts := []lease.ServiceOption{lease.WithNotificationScheduler(notificationScheduler)}
+	leaseOpts = append(leaseOpts, lease.WithFailoverStatusReporter(failoverManager))
+	if cfg.HA.Replication.EnforceAck {
+		if ackGate := replication.NewFailoverAckGate(cfg.HA, logger); ackGate != nil {
+			policy := strings.TrimSpace(cfg.HA.Replication.AckFailurePolicy)
+			if policy == "" {
+				policy = "strict"
+			}
+			leaseOpts = append(leaseOpts, lease.WithSyncAckGate(ackGate), lease.WithSyncAckPolicy(policy))
+		}
+	}
+	if redisClient != nil {
+		leaseOpts = append(leaseOpts, lease.WithRedisAllocator(redisClient))
+	}
 	if metricCollector != nil {
 		leaseOpts = append(leaseOpts, lease.WithMetricsCollector(metricCollector))
 	}
@@ -184,10 +268,19 @@ func main() {
 	leaseOpts = append(leaseOpts, lease.WithExhaustionConfig(cfg.Security.Exhaustion))
 	leaseOpts = append(leaseOpts, lease.WithQuotaEnforcer(quotaSvc))
 	if cfg.Security.ConflictPrevention.Enabled {
-		prober := netutil.NewICMPProber(cfg.Security.ConflictPrevention.ProbeTimeout)
+		prober := netutil.NewDHCPv4ACDProber(
+			cfg.Security.ConflictPrevention.ARPTimeout,
+			cfg.Security.ConflictPrevention.ProbeTimeout,
+		)
 		leaseOpts = append(leaseOpts, lease.WithConflictPrevention(cfg.Security.ConflictPrevention, prober))
 	}
-	leaseSvc := lease.NewService(leaseRepo, poolRepo, cfg.Policy, logger, leaseOpts...)
+	leaseSvc := lease.NewService(leaseRepo, poolSvc, cfg.Policy, logger, leaseOpts...)
+	leaseScope := lease.NewResourceScope("global", "global")
+	if repaired, recErr := leaseSvc.ReconcileDHCPv4LeaseFSMOnStartup(ctx, leaseScope, 200); recErr != nil {
+		logger.Warn("dhcpv4 lease fsm startup reconciliation failed", zap.Error(recErr))
+	} else if repaired > 0 {
+		logger.Info("dhcpv4 lease fsm startup reconciliation repaired records", zap.Int("count", repaired))
+	}
 	var reclaimer *lease.Reclaimer
 	if cfg.Policy.Lifecycle.AutoReclaim.Enabled {
 		reclaimer = lease.NewReclaimer(leaseRepo, logger, lease.ReclaimerOptions{
@@ -196,7 +289,10 @@ func main() {
 			BatchSize:   cfg.Policy.Lifecycle.AutoReclaim.BatchSize,
 		})
 	}
-	policyRepo := policy.NewRepository(sqlDB)
+	policyRepo := policy.NewRepository(sqlDB,
+		policy.WithCache(cacheStore, cfg.Policy.CacheTTL),
+		policy.WithMetrics(metricCollector),
+	)
 	policyEngine := policy.NewEngine(policyRepo, logger)
 	var policyPublishers []events.PolicyPublisher
 	if len(cfg.Kafka.Brokers) > 0 && cfg.Kafka.Topics.PolicyEvents != "" {
@@ -221,7 +317,14 @@ func main() {
 		Logger:   logger,
 	})
 	securityPolicySvc := securitypolicy.NewService(securityPolicyRepo, logger, securitypolicy.WithEvaluator(securityPolicyEvaluator))
-	poolSvc := pool.NewService(poolRepo, logger, pool.WithQuotaEnforcer(quotaSvc))
+	macListRepo := maclist.NewRepository(sqlDB)
+	var macListCacheClient *redislib.Client
+	if concrete, ok := redisClient.(*redislib.Client); ok {
+		macListCacheClient = concrete
+	} else if redisClient != nil {
+		logger.Warn("mac list cache disabled: redis client is not single-node client")
+	}
+	macListSvc := maclist.NewServiceWithCache(macListRepo, logger, macListCacheClient, cfg.Security.MACACL.CacheTTL)
 	var collabHub *collab.Hub
 	if cfg.UI.Collaboration.Enabled {
 		collabHub = collab.NewHub(logger, collab.HubOptions{
@@ -236,7 +339,7 @@ func main() {
 	snoopingTracker := monitoring.NewSnoopingTracker(512)
 	monitorAggregator := monitoring.NewAggregator(monitoring.Options{
 		PoolService:     poolSvc,
-		LeaseRepo:       leaseRepo,
+		LeaseRepo:       leaseSvc,
 		RequestTracker:  requestTracker,
 		RateTracker:     rateTracker,
 		SnoopingTracker: snoopingTracker,
@@ -255,23 +358,50 @@ func main() {
 	visualizationSvc := visualization.NewService(visualization.Options{
 		Logger:       logger,
 		PoolService:  poolSvc,
-		LeaseReader:  leaseRepo,
+		LeaseReader:  leaseSvc,
 		MaxNodes:     cfg.UI.Visualization.MaxCanvasNodes,
 		HeatmapLimit: cfg.UI.Visualization.MaxCanvasNodes,
 	})
 	var iotRegistrySvc *iotregistry.Service
 	if cfg.IoT.Registry.Enabled {
-		iotRepo := iot.NewRepository(sqlDB, iot.WithTenantRouter(tenantRouter))
+		iotRepo := iot.NewRepository(sqlDB)
 		defaults := iotregistry.Defaults{
 			SleepInterval: cfg.IoT.Registry.DefaultSleepInterval,
 			OfflineWindow: cfg.IoT.Registry.DefaultOfflineWindow,
 		}
 		iotRegistrySvc = iotregistry.NewService(iotRepo, logger, iotregistry.WithDefaults(defaults))
 	}
-	alertController, alertManager := setupAlerting(cfg.Monitoring.Alerting, monitorAggregator, rateTracker, alertFeed, logger)
+	alertStore := alerting.NewSQLStore(sqlDB)
+	routeSnapshot := []alerting.RoutingRule{}
+	if alertStore != nil {
+		if snapshot, err := alertStore.ListRoutes(ctx); err != nil {
+			logger.Warn("load alert routes from db", zap.Error(err))
+		} else {
+			routeSnapshot = snapshot
+		}
+	}
+	routingStore := alerting.NewRoutingStore(routeSnapshot, "bootstrap")
+	if len(routeSnapshot) == 0 && len(cfg.Monitoring.Alerting.Routes) > 0 {
+		routingStore = alerting.NewRoutingStore(convertRouteRules(cfg.Monitoring.Alerting.Routes), "bootstrap")
+	}
+	if len(routingStore.Snapshot().Rules) == 0 {
+		channels := notifierChannels(cfg.Monitoring.Alerting.Notifiers)
+		if defaults := defaultRoutesFromChannels(channels); len(defaults) > 0 {
+			routingStore = alerting.NewRoutingStore(convertRouteRules(defaults), "bootstrap")
+			if alertStore != nil {
+				if err := alertStore.ReplaceRoutes(ctx, routingStore.Snapshot().Rules, "system"); err != nil {
+					logger.Warn("persist default alert routes", zap.Error(err))
+				}
+			}
+		}
+	}
+	alertController, alertManager := setupAlerting(cfg.Monitoring.Alerting, monitorAggregator, rateTracker, alertFeed, alertStore, logger)
+	if alertManager != nil && routingStore != nil {
+		alertManager.ConfigureRoutes(alerting.BuildRoutes(routingRulesToConfigs(routingStore.Snapshot().Rules)))
+	}
 	notificationDispatcher := setupNotifications(cfg.Notifications, logger)
 	jobStore := automation.NewJobStore(sqlDB)
-	automationSvc := setupAutomation(cfg.Automation, cfg.Notifications, notificationDispatcher, monitorAggregator, jobStore, logger)
+	automationSvc, automationApprovals, automationApprovalPolicy := setupAutomation(cfg.Automation, cfg.Notifications, notificationDispatcher, monitorAggregator, jobStore, sqlDB, logger)
 	workflowRepo := workflow.NewRepository(sqlDB)
 	workflowSvc, err := workflow.NewService(workflow.ServiceOptions{
 		Repository: workflowRepo,
@@ -317,12 +447,6 @@ func main() {
 	opsSettingsStore := ops.NewSQLSettingsStore(sqlDB, opsSettingsDefaults)
 	superAdminOpts := server.SuperAdminOptions{}
 	if cfg.Auth.SuperAdmin.Enabled {
-		if cfg.Auth.SuperAdmin.APIKeyRef == "" {
-			logger.Fatal("super admin apiKeyRef required when enabled")
-		}
-		if _, ok := cfg.Auth.APIKeys[cfg.Auth.SuperAdmin.APIKeyRef]; !ok {
-			logger.Fatal("super admin apiKeyRef missing from auth.apiKeys", zap.String("apiKeyRef", cfg.Auth.SuperAdmin.APIKeyRef))
-		}
 		manager, err := superadmin.NewManager(cfg.Auth.SuperAdmin.StateFile)
 		if err != nil {
 			logger.Fatal("init super admin manager", zap.Error(err))
@@ -339,11 +463,30 @@ func main() {
 		}
 	}
 	serverOpts := server.Options{
-		RequireAuth:        cfg.Auth.Enabled,
-		APIKeys:            apiKeys,
+		RequireAuth: cfg.Auth.Enabled,
+		APIKeys:     apiKeys,
+		APITLS: server.APITLSOptions{
+			Enabled:           cfg.Service.TLS.Enabled,
+			AutoSelfSigned:    cfg.Service.TLS.AutoSelfSigned,
+			CertFile:          strings.TrimSpace(cfg.Service.TLS.CertFile),
+			KeyFile:           strings.TrimSpace(cfg.Service.TLS.KeyFile),
+			ClientCAFile:      strings.TrimSpace(cfg.Service.TLS.ClientCAFile),
+			RequireClientCert: cfg.Service.TLS.RequireClientCert,
+			SelfSignedDir:     strings.TrimSpace(cfg.Service.TLS.SelfSignedDir),
+		},
+		HAConfig:           cfg.HA,
 		Metrics:            metricCollector,
 		PrometheusEnabled:  cfg.Monitoring.Prometheus.Enabled,
 		PrometheusEndpoint: cfg.Monitoring.Prometheus.Endpoint,
+		Environment:        strings.TrimSpace(cfg.Service.Env),
+		Telemetry: server.TelemetryOptions{
+			Enabled:      telemetryOpts.Enabled,
+			Endpoint:     telemetryOpts.OTLPEndpoint,
+			Insecure:     telemetryOpts.Insecure,
+			SamplerRatio: telemetryOpts.SamplerRatio,
+			ServiceName:  telemetryOpts.ServiceName,
+			Environment:  telemetryOpts.Environment,
+		},
 		RBAC: server.RBACOptions{
 			Resolver:            rbacResolver,
 			EnforceCapabilities: cfg.RBAC.EnforceCapabilities,
@@ -363,15 +506,31 @@ func main() {
 			AlertManager:    alertManager,
 			AlertController: alertController,
 		},
-		Automation:       automationSvc,
-		Workflow:         workflowSvc,
-		OpsSupport:       opsSupportOpts,
-		OpsSettingsStore: opsSettingsStore,
-		UI:               uiOptions,
-		SuperAdmin:       superAdminOpts,
-		TokenProvider:    authSvc,
+		Alerting: server.AlertingOptions{
+			Routes:        routingStore,
+			Dispatcher:    notificationDispatcher,
+			RuleStore:     alertStore,
+			RouteStore:    alertStore,
+			ConfigStore:   alertStore,
+			TemplateStore: alertStore,
+			ReceiverStore: alertStore,
+		},
+		Automation:               automationSvc,
+		AutomationApprovals:      automationApprovals,
+		AutomationApprovalPolicy: automationApprovalPolicy,
+		Workflow:                 workflowSvc,
+		OpsSupport:               opsSupportOpts,
+		OpsSettingsStore:         opsSettingsStore,
+		OptionRepo:               server.NewSQLOptionRepository(sqlDB),
+		TemplateRepo:             server.NewSQLTemplateRepository(sqlDB),
+		ScopeRepo:                server.NewSQLScopeRepository(sqlDB),
+		TemplateApplyHistoryRepo: server.NewSQLTemplateApplyHistoryRepository(sqlDB),
+		ClusterConfigStore:       server.NewSQLClusterConfigStore(sqlDB, logger),
+		UI:                       uiOptions,
+		SuperAdmin:               superAdminOpts,
+		TokenProvider:            authSvc,
 	}
-	apiServer, err := server.NewHTTPServer(logger, serverOpts, leaseSvc, policyEngine, policySvc, securityPolicySvc, poolSvc, auditSvc, reportSvc, visualizationSvc, iotRegistrySvc, collabHub, quotaSvc, rbacRepo, authSvc)
+	apiServer, err := server.NewHTTPServer(logger, serverOpts, leaseSvc, policyEngine, policySvc, securityPolicySvc, poolSvc, auditSvc, reportSvc, visualizationSvc, iotRegistrySvc, collabHub, quotaSvc, rbacRepo, authSvc, macListSvc)
 	if err != nil {
 		logger.Fatal("init http server", zap.Error(err))
 	}
@@ -380,7 +539,7 @@ func main() {
 	if cfg.Security.Policy.Enabled {
 		guardPolicyEvaluator = securityPolicyEvaluator
 	}
-	dhcpGuard := securityguard.NewFromConfig(cfg.Security, metricCollector, logger, quarantineSink, auditSvc, guardPolicyEvaluator, rateTracker, snoopingTracker)
+	dhcpGuard := securityguard.NewFromConfig(cfg.Security, metricCollector, logger, quarantineSink, auditSvc, guardPolicyEvaluator, macListSvc, poolSvc, leaseSvc, rateTracker, snoopingTracker)
 	relayParser := relay.NewOption82Parser(cfg.Relay.Option82)
 	relaySelector := relay.NewSelector(cfg.Relay, logger)
 	relayAuth := relay.NewAuthenticator(cfg.Relay.Authentication, logger)
@@ -400,11 +559,20 @@ func main() {
 		reusePortEnabled = *dhcpv4Runtime.ReusePort
 	}
 	v4Server := dhcpv4.NewServer(dhcpv4.Options{
-		BindAddress:    cfg.Service.BindAddress,
-		Port:           cfg.Service.DHCPv4Port,
-		TenantID:       tenantID,
-		ServerIP:       serverIP,
-		RelayParser:    relayParser,
+		BindAddress: cfg.Service.BindAddress,
+		Port:        cfg.Service.DHCPv4Port,
+		TenantID:    tenantID,
+		ServerIP:    serverIP,
+		Security:    dhcpv4SecurityOptionsFromConfig(cfg),
+		Metrics:     metricCollector,
+		RelayParser: relayParser,
+		Option82Policy: dhcpv4.Option82Policy{
+			Enabled:        cfg.Relay.Option82.Whitelist.Enabled,
+			CircuitIDAllow: append([]string(nil), cfg.Relay.Option82.Whitelist.CircuitIDAllow...),
+			CircuitIDDeny:  append([]string(nil), cfg.Relay.Option82.Whitelist.CircuitIDDeny...),
+			RemoteIDAllow:  append([]string(nil), cfg.Relay.Option82.Whitelist.RemoteIDAllow...),
+			RemoteIDDeny:   append([]string(nil), cfg.Relay.Option82.Whitelist.RemoteIDDeny...),
+		},
 		Partitioner:    relayPartitioner,
 		WorkerCount:    dhcpv4Runtime.WorkerCount,
 		QueueDepth:     dhcpv4Runtime.QueueDepth,
@@ -426,6 +594,8 @@ func main() {
 	if mdmService != nil {
 		go mdmService.Run(runtimeCtx)
 	}
+	startPoolUsageSnapshotter(runtimeCtx, logger, poolSvc, leaseSvc)
+	startLeaseBitmapSync(runtimeCtx, logger, poolSvc, leaseSvc)
 	if automationSvc != nil {
 		if err := automationSvc.Start(runtimeCtx); err != nil {
 			logger.Fatal("start automation", zap.Error(err))
@@ -485,6 +655,124 @@ func main() {
 	}
 }
 
+func startPoolUsageSnapshotter(ctx context.Context, logger *zap.Logger, poolSvc *pool.Service, leaseSvc *lease.Service) {
+	if poolSvc == nil || leaseSvc == nil {
+		return
+	}
+	const tenantID = "global"
+	go func() {
+		snapshot := func() {
+			poolScope := pool.NewResourceScope("global", tenantID)
+			leaseScope := lease.NewResourceScope("global", tenantID)
+			pools, err := listAllPoolsForSnapshot(ctx, poolSvc, poolScope, 500)
+			if err != nil {
+				logger.Warn("pool usage snapshot failed", zap.Error(err))
+				return
+			}
+			if len(pools) == 0 {
+				return
+			}
+			poolIDs := make([]string, 0, len(pools))
+			for _, p := range pools {
+				poolIDs = append(poolIDs, p.ID)
+			}
+			counts, err := leaseSvc.CountActiveLeasesByPool(ctx, leaseScope, poolIDs)
+			if err != nil {
+				logger.Warn("pool usage snapshot leases failed", zap.Error(err))
+				return
+			}
+			day := time.Now().UTC()
+			day = time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC)
+			entries := make([]models.PoolUsageDaily, 0, len(pools))
+			for _, p := range pools {
+				capacity := monitoring.CalculatePoolCapacity(p)
+				entries = append(entries, models.PoolUsageDaily{
+					PoolID:   p.ID,
+					Day:      day,
+					Used:     counts[p.ID],
+					Capacity: capacity,
+				})
+			}
+			if err := poolSvc.UpsertUsageDaily(ctx, poolScope, entries); err != nil {
+				logger.Warn("pool usage snapshot upsert failed", zap.Error(err))
+			}
+		}
+
+		snapshot()
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				snapshot()
+			}
+		}
+	}()
+}
+
+func startLeaseBitmapSync(ctx context.Context, logger *zap.Logger, poolSvc *pool.Service, leaseSvc *lease.Service) {
+	if poolSvc == nil || leaseSvc == nil {
+		return
+	}
+	const tenantID = "global"
+	go func() {
+		syncOnce := func() {
+			poolScope := pool.NewResourceScope("global", tenantID)
+			leaseScope := lease.NewResourceScope("global", tenantID)
+			pools, err := listAllPoolsForSnapshot(ctx, poolSvc, poolScope, 500)
+			if err != nil {
+				logger.Warn("lease bitmap sync list pools failed", zap.Error(err))
+				return
+			}
+			for i := range pools {
+				if _, err := leaseSvc.SyncPoolBitmapFromMySQL(ctx, leaseScope, pools[i]); err != nil {
+					logger.Warn("lease bitmap sync pool failed", zap.String("poolId", pools[i].ID), zap.Error(err))
+				}
+			}
+		}
+
+		syncOnce()
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				syncOnce()
+			}
+		}
+	}()
+}
+
+func listAllPoolsForSnapshot(ctx context.Context, poolSvc *pool.Service, scopeRef pool.ResourceScope, pageSize int) ([]models.AddressPool, error) {
+	if poolSvc == nil {
+		return nil, nil
+	}
+	if pageSize <= 0 {
+		pageSize = 200
+	}
+	offset := 0
+	pools := make([]models.AddressPool, 0)
+	for {
+		batch, err := poolSvc.ListPools(ctx, scopeRef, pageSize, offset)
+		if err != nil {
+			return nil, err
+		}
+		pools = append(pools, batch...)
+		if len(batch) < pageSize {
+			break
+		}
+		offset += len(batch)
+		if offset >= 5000 {
+			break
+		}
+	}
+	return pools, nil
+}
+
 func configureAuthProviders(cfg config.AuthConfig, svc *auth.Service, repo auth.Repository, logger *zap.Logger) {
 	if svc == nil {
 		return
@@ -506,6 +794,38 @@ func configureAuthProviders(cfg config.AuthConfig, svc *auth.Service, repo auth.
 	} else if cfg.Providers.Local.Disabled {
 		logger.Warn("auth: no identity providers enabled; logins will fail")
 	}
+
+	oidcCfg := cfg.Providers.OIDC
+	if oidcCfg.Enabled {
+		provider, err := auth.NewOIDCProvider(repo, logger, buildOIDCProviderOptions(oidcCfg))
+		if err != nil {
+			logger.Fatal("init oidc provider", zap.Error(err))
+		}
+		var providerOpts []auth.ProviderOption
+		if oidcCfg.Default {
+			providerOpts = append(providerOpts, auth.WithProviderDefault())
+		}
+		svc.RegisterProvider(provider, providerOpts...)
+	}
+}
+
+func dhcpv4SecurityOptionsFromConfig(cfg *config.Config) dhcpv4.SecurityOptions {
+	if cfg == nil {
+		return dhcpv4.SecurityOptions{MACRateLimitPPS: 10}
+	}
+	pps := cfg.Security.DHCPv4.MACRateLimitPPS
+	if pps <= 0 {
+		pps = 10
+	}
+	return dhcpv4.SecurityOptions{
+		MACRateLimitPPS: pps,
+		RelayWhitelist:  append([]string(nil), cfg.Security.DHCPv4.RelayWhitelist...),
+		RogueDetector: dhcpv4.RogueDetectorConfig{
+			Enabled:      cfg.Security.DHCPv4.RogueDetector.Enabled,
+			Interface:    strings.TrimSpace(cfg.Security.DHCPv4.RogueDetector.Interface),
+			ClusterNodes: append([]string(nil), cfg.Security.DHCPv4.RogueDetector.ClusterNodes...),
+		},
+	}
 }
 
 func buildLDAPProviderOptions(cfg config.LDAPProviderConfig) auth.LDAPProviderOptions {
@@ -521,6 +841,24 @@ func buildLDAPProviderOptions(cfg config.LDAPProviderConfig) auth.LDAPProviderOp
 		UseStartTLS:          cfg.UseStartTLS,
 		SkipTLSVerify:        cfg.SkipTLSVerify,
 		Timeout:              cfg.Timeout,
+	}
+}
+
+func buildOIDCProviderOptions(cfg config.OIDCProviderConfig) auth.OIDCProviderOptions {
+	return auth.OIDCProviderOptions{
+		Issuer:           cfg.Issuer,
+		Audience:         cfg.Audience,
+		JWKSURL:          cfg.JWKSURL,
+		JWKSCacheTTL:     cfg.JWKSCacheTTL,
+		HMACSecret:       cfg.HMACSecret,
+		RequiredScopes:   append([]string(nil), cfg.RequiredScopes...),
+		ScopeRoles:       cfg.ScopeRoles,
+		DefaultRole:      cfg.DefaultRole,
+		ClockSkew:        cfg.ClockSkew,
+		UsernameClaim:    cfg.UsernameClaim,
+		DisplayNameClaim: cfg.DisplayNameClaim,
+		EmailClaim:       cfg.EmailClaim,
+		RoleClaim:        cfg.RoleClaim,
 	}
 }
 
@@ -574,6 +912,36 @@ func buildUIOptions(cfg config.UIConfig) server.UIOptions {
 }
 
 func buildOpsSupportOptions(cfg config.OpsSupportConfig) ops.Options {
+	cloneStrings := func(values []string) []string {
+		if len(values) == 0 {
+			return nil
+		}
+		out := make([]string, len(values))
+		copy(out, values)
+		return out
+	}
+	cloneStringMap := func(src map[string]string) map[string]string {
+		if len(src) == 0 {
+			return nil
+		}
+		out := make(map[string]string, len(src))
+		for k, v := range src {
+			out[k] = v
+		}
+		return out
+	}
+	toStep := func(step config.MaintenanceStep) ops.MaintenanceStepOption {
+		return ops.MaintenanceStepOption{
+			ID:                step.ID,
+			Title:             step.Title,
+			Summary:           step.Summary,
+			Duration:          step.Duration,
+			Responsible:       step.Responsible,
+			RequiresApproval:  step.RequiresApproval,
+			DependsOn:         cloneStrings(step.DependsOn),
+			AutomationJobType: step.AutomationJobType,
+		}
+	}
 	importExport := ops.ImportExportOptions{
 		Enabled:     cfg.ImportExport.Enabled,
 		StoragePath: cfg.ImportExport.StoragePath,
@@ -618,6 +986,160 @@ func buildOpsSupportOptions(cfg config.OpsSupportConfig) ops.Options {
 			}
 		}
 	}
+	maintenance := ops.MaintenanceOptions{Enabled: cfg.Maintenance.Enabled}
+	if len(cfg.Maintenance.Playbooks) > 0 {
+		maintenance.Playbooks = make([]ops.MaintenancePlaybookOption, len(cfg.Maintenance.Playbooks))
+		for i, playbook := range cfg.Maintenance.Playbooks {
+			steps := make([]ops.MaintenanceStepOption, len(playbook.Steps))
+			for j, step := range playbook.Steps {
+				steps[j] = toStep(step)
+			}
+			maintenance.Playbooks[i] = ops.MaintenancePlaybookOption{
+				ID:          playbook.ID,
+				Title:       playbook.Title,
+				Description: playbook.Description,
+				Tags:        cloneStrings(playbook.Tags),
+				Steps:       steps,
+			}
+		}
+	}
+	if len(cfg.Maintenance.Windows) > 0 {
+		maintenance.Windows = make([]ops.MaintenanceWindowOption, len(cfg.Maintenance.Windows))
+		for i, window := range cfg.Maintenance.Windows {
+			maintenance.Windows[i] = ops.MaintenanceWindowOption{
+				ID:       window.ID,
+				Name:     window.Name,
+				Cron:     window.Cron,
+				Duration: window.Duration,
+				Timezone: window.Timezone,
+			}
+		}
+	}
+	if len(cfg.Maintenance.UpgradePlans) > 0 {
+		maintenance.UpgradePlans = make([]ops.MaintenanceUpgradePlanOption, len(cfg.Maintenance.UpgradePlans))
+		for i, plan := range cfg.Maintenance.UpgradePlans {
+			steps := make([]ops.MaintenanceStepOption, len(plan.Steps))
+			for j, step := range plan.Steps {
+				steps[j] = toStep(step)
+			}
+			rollback := make([]ops.MaintenanceStepOption, len(plan.RollbackPlan))
+			for j, step := range plan.RollbackPlan {
+				rollback[j] = toStep(step)
+			}
+			maintenance.UpgradePlans[i] = ops.MaintenanceUpgradePlanOption{
+				ID:            plan.ID,
+				Version:       plan.Version,
+				Summary:       plan.Summary,
+				ScheduledFor:  plan.ScheduledFor,
+				Prerequisites: cloneStrings(plan.Prerequisites),
+				Steps:         steps,
+				RollbackPlan:  rollback,
+				ReleaseNotes:  plan.ReleaseNotes,
+			}
+		}
+	}
+	backups := ops.BackupOptions{Enabled: cfg.Backups.Enabled}
+	if len(cfg.Backups.Schedules) > 0 {
+		backups.Schedules = make([]ops.BackupScheduleOption, len(cfg.Backups.Schedules))
+		for i, schedule := range cfg.Backups.Schedules {
+			backups.Schedules[i] = ops.BackupScheduleOption{
+				ID:           schedule.ID,
+				Name:         schedule.Name,
+				Cron:         schedule.Cron,
+				Retention:    schedule.Retention,
+				Window:       schedule.Window,
+				Type:         schedule.Type,
+				Enabled:      schedule.Enabled,
+				Destinations: cloneStrings(schedule.Destinations),
+			}
+		}
+	}
+	if len(cfg.Backups.Destinations) > 0 {
+		backups.Destinations = make([]ops.BackupDestinationOption, len(cfg.Backups.Destinations))
+		for i, target := range cfg.Backups.Destinations {
+			backups.Destinations[i] = ops.BackupDestinationOption{
+				ID:          target.ID,
+				Name:        target.Name,
+				Kind:        target.Kind,
+				Endpoint:    target.Endpoint,
+				Credentials: target.Credentials,
+				Metadata:    cloneStringMap(target.Metadata),
+			}
+		}
+	}
+	if len(cfg.Backups.RestoreFlows) > 0 {
+		backups.RestoreFlows = make([]ops.RestoreWorkflowOption, len(cfg.Backups.RestoreFlows))
+		for i, flow := range cfg.Backups.RestoreFlows {
+			steps := make([]ops.MaintenanceStepOption, len(flow.Steps))
+			for j, step := range flow.Steps {
+				steps[j] = toStep(step)
+			}
+			backups.RestoreFlows[i] = ops.RestoreWorkflowOption{
+				ID:          flow.ID,
+				Name:        flow.Name,
+				Description: flow.Description,
+				Steps:       steps,
+				Checks:      cloneStrings(flow.Checks),
+				Approvals:   cloneStrings(flow.Approvals),
+			}
+		}
+	}
+	backups.Verification = ops.BackupVerificationOption{
+		Enabled:      cfg.Backups.Verification.Enabled,
+		Schedule:     cfg.Backups.Verification.Schedule,
+		Retention:    cfg.Backups.Verification.Retention,
+		Sandbox:      cfg.Backups.Verification.SandboxEnv,
+		AlertChannel: cfg.Backups.Verification.AlertChannel,
+	}
+	performance := ops.PerformanceOptions{Enabled: cfg.Performance.Enabled}
+	if len(cfg.Performance.Probes) > 0 {
+		performance.Probes = make([]ops.PerformanceProbeOption, len(cfg.Performance.Probes))
+		for i, probe := range cfg.Performance.Probes {
+			thresholds := make(map[string]float64, len(probe.Thresholds))
+			for k, v := range probe.Thresholds {
+				thresholds[k] = v
+			}
+			performance.Probes[i] = ops.PerformanceProbeOption{
+				ID:          probe.ID,
+				Name:        probe.Name,
+				Description: probe.Description,
+				Command:     probe.Command,
+				Interval:    probe.Interval,
+				SLO:         probe.SLO,
+				Units:       probe.Units,
+				Thresholds:  thresholds,
+			}
+		}
+	}
+	if len(cfg.Performance.Indicators) > 0 {
+		performance.Indicators = make([]ops.PerformanceIndicatorOption, len(cfg.Performance.Indicators))
+		for i, indicator := range cfg.Performance.Indicators {
+			performance.Indicators[i] = ops.PerformanceIndicatorOption{
+				ID:          indicator.ID,
+				Name:        indicator.Name,
+				Description: indicator.Description,
+				Target:      indicator.Target,
+				Units:       indicator.Units,
+			}
+		}
+	}
+	if len(cfg.Performance.Recommendations) > 0 {
+		performance.Recommendations = make([]ops.PerformancePlaybookOption, len(cfg.Performance.Recommendations))
+		for i, rec := range cfg.Performance.Recommendations {
+			steps := make([]ops.MaintenanceStepOption, len(rec.Steps))
+			for j, step := range rec.Steps {
+				steps[j] = toStep(step)
+			}
+			performance.Recommendations[i] = ops.PerformancePlaybookOption{
+				ID:      rec.ID,
+				Title:   rec.Title,
+				Summary: rec.Summary,
+				Impact:  rec.Impact,
+				Steps:   steps,
+				Signals: cloneStrings(rec.Signals),
+			}
+		}
+	}
 	return ops.Options{
 		System: ops.OpsSystemOptions{
 			Enabled:           cfg.System.Enabled,
@@ -634,6 +1156,9 @@ func buildOpsSupportOptions(cfg config.OpsSupportConfig) ops.Options {
 		HelpCenter:   helpCenter,
 		Support:      support,
 		Scripts:      scripts,
+		Maintenance:  maintenance,
+		Backups:      backups,
+		Performance:  performance,
 	}
 }
 

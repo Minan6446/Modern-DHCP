@@ -1,0 +1,9 @@
+[
+  {
+    "name": "邮件",
+    "type": "email",
+    "target": "365399524@qq.com",
+    "method": "POST",
+    "enabled": true
+  }
+]

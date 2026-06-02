@@ -46,6 +46,8 @@ type Scheduler struct {
 
 	recorder JobRecorder
 	logger   *zap.Logger
+
+	metrics schedulerMetrics
 }
 
 // NewScheduler constructs a scheduler with sane defaults.
@@ -82,7 +84,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 
 	for i := 0; i < s.opts.WorkerCount; i++ {
 		s.wg.Add(1)
-		go s.worker(i)
+		go s.worker(s.ctx, i)
 	}
 
 	s.logger.Info("automation scheduler started", zap.Int("workers", s.opts.WorkerCount))
@@ -170,27 +172,48 @@ func (s *Scheduler) Snapshot() Snapshot {
 	started := s.startedAt
 	s.mu.RUnlock()
 
+	waitTotal := atomic.LoadInt64(&s.metrics.waitTotal)
+	waitCount := atomic.LoadInt64(&s.metrics.waitCount)
+	runTotal := atomic.LoadInt64(&s.metrics.runTotal)
+	runCount := atomic.LoadInt64(&s.metrics.runCount)
+	completed := atomic.LoadInt64(&s.metrics.completed)
+	failed := atomic.LoadInt64(&s.metrics.failed)
+	retried := atomic.LoadInt64(&s.metrics.retried)
+
+	avgWait := 0.0
+	if waitCount > 0 {
+		avgWait = float64(waitTotal) / float64(waitCount) / 1e6
+	}
+	avgRun := 0.0
+	if runCount > 0 {
+		avgRun = float64(runTotal) / float64(runCount) / 1e6
+	}
+	uptime := int64(0)
+	if !started.IsZero() {
+		uptime = int64(time.Since(started).Seconds())
+		if uptime < 0 {
+			uptime = 0
+		}
+	}
+
 	return Snapshot{
 		PendingJobs:        len(s.queue),
 		ActiveWorkers:      int(atomic.LoadInt32(&s.activeWorkers)),
 		RegisteredHandlers: registered,
 		StartedAt:          started,
+		UptimeSeconds:      uptime,
+		AverageWaitMillis:  avgWait,
+		AverageRunMillis:   avgRun,
+		CompletedJobs:      completed,
+		FailedJobs:         failed,
+		RetryScheduled:     retried,
 	}
 }
 
-func (s *Scheduler) worker(id int) {
+func (s *Scheduler) worker(ctx context.Context, id int) {
 	defer s.wg.Done()
 
 	for {
-		s.mu.RLock()
-		ctx := s.ctx
-		s.mu.RUnlock()
-
-		if ctx == nil {
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-
 		select {
 		case <-ctx.Done():
 			return
@@ -214,11 +237,21 @@ func (s *Scheduler) processJob(parent context.Context, job Job) {
 		}
 	}
 
+	start := time.Now()
+	createdAt := job.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = start
+		job.CreatedAt = start
+	}
+
 	handler, ok := s.lookupHandler(job.Type)
 	if !ok {
 		s.logger.Warn("no automation handler registered", zap.String("jobType", string(job.Type)))
 		return
 	}
+
+	waitDuration := start.Sub(createdAt)
+	s.observeWait(waitDuration)
 
 	job.Attempts++
 	job.Status = JobStatusRunning
@@ -230,6 +263,7 @@ func (s *Scheduler) processJob(parent context.Context, job Job) {
 	defer cancel()
 
 	if err := handler.Handle(ctx, job); err != nil {
+		s.observeRun(time.Since(start))
 		s.logger.Warn("automation job failed",
 			zap.String("jobId", job.ID),
 			zap.String("jobType", string(job.Type)),
@@ -237,11 +271,13 @@ func (s *Scheduler) processJob(parent context.Context, job Job) {
 			zap.Int("attempt", job.Attempts))
 		job.Status = JobStatusFailed
 		s.recordFailed(parent, job, err)
+		s.observeFailed()
 
 		if job.Attempts < s.opts.MaxAttempts {
 			backoff := s.backoffDuration(job.Attempts)
 			job.NotBefore = time.Now().Add(backoff)
 			job.Status = JobStatusPending
+			s.observeRetry()
 			s.enqueueAfter(job, backoff)
 		}
 		return
@@ -249,6 +285,8 @@ func (s *Scheduler) processJob(parent context.Context, job Job) {
 
 	job.Status = JobStatusSucceeded
 	s.recordSucceeded(parent, job)
+	s.observeRun(time.Since(start))
+	s.observeCompleted()
 	s.logger.Info("automation job completed", zap.String("jobId", job.ID), zap.String("jobType", string(job.Type)))
 }
 
@@ -258,6 +296,7 @@ func (s *Scheduler) enqueueAfter(job Job, delay time.Duration) {
 		defer timer.Stop()
 		select {
 		case <-timer.C:
+			job.CreatedAt = time.Now()
 			if err := s.enqueueInternal(context.Background(), job); err != nil {
 				s.logger.Error("failed to requeue automation job", zap.String("jobId", job.ID), zap.Error(err))
 			}
@@ -380,4 +419,42 @@ func (s *Scheduler) recordFailed(ctx context.Context, job Job, runErr error) {
 			s.logger.Warn("automation job failure record failed", zap.String("jobId", job.ID), zap.String("jobType", string(job.Type)), zap.Error(err))
 		}
 	}
+}
+
+type schedulerMetrics struct {
+	waitTotal int64
+	waitCount int64
+	runTotal  int64
+	runCount  int64
+	completed int64
+	failed    int64
+	retried   int64
+}
+
+func (s *Scheduler) observeWait(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	atomic.AddInt64(&s.metrics.waitTotal, d.Nanoseconds())
+	atomic.AddInt64(&s.metrics.waitCount, 1)
+}
+
+func (s *Scheduler) observeRun(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	atomic.AddInt64(&s.metrics.runTotal, d.Nanoseconds())
+	atomic.AddInt64(&s.metrics.runCount, 1)
+}
+
+func (s *Scheduler) observeCompleted() {
+	atomic.AddInt64(&s.metrics.completed, 1)
+}
+
+func (s *Scheduler) observeFailed() {
+	atomic.AddInt64(&s.metrics.failed, 1)
+}
+
+func (s *Scheduler) observeRetry() {
+	atomic.AddInt64(&s.metrics.retried, 1)
 }

@@ -1,0 +1,1 @@
+import{B as a,C as n}from"./index-D2tte8pa.js";const c=async t=>{const s=Math.max(1,Number(t.page||1)),e=Math.max(1,Number(t.pageSize||20)),o=await a.get("/auth/sessions",{params:{limit:e,offset:(s-1)*e,q:t.keyword,status:t.status}});return{data:n(o.data,{page:s,pageSize:e})}},r=async t=>a.delete(`/auth/sessions/${encodeURIComponent(t)}`);export{r as f,c as l};
