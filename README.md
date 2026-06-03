@@ -1,79 +1,111 @@
 # Modern-DHCP
 
-Modern-DHCP 是一个以 Go 编写、面向多租户和 IPv4/IPv6 双栈的企业级 DHCP 控制平面。工程提供后端服务、数据库迁移、自动化/观测模块与 React 管理前端，可用于构建高可用、可审计、具备自动化能力的 DHCP 平台。
+Modern-DHCP 是一个以 Go 构建的企业级 DHCP 控制平面，面向多租户与 IPv4/IPv6 双栈场景。项目覆盖后端服务、数据库迁移、审计与观测、自动化编排以及 Vue 3 管理前端，适用于园区网络、数据中心和云边协同环境中的地址分配与治理。
 
-## 核心特性
-- 双栈引擎：RFC 2131/3315 基线，独立的 DHCPv4/v6 管线与可插拔策略钩子。
-- 多租户与 RBAC：租户上下文、最小权限控制、全链路审计。
-- 分层地址池：Global → Subnet → VLAN → Port/SSID → Location，支持权重/轮询与元数据解析。
-- 高可用与灾备：Failover 管理、角色/复制延迟可观测、支持手动/自动回切。
-- 观测与告警：Prometheus 指标、聚合快照、分级告警与通知路由。
-- 自动化与审批：任务调度、审批流、幂等重试，可触发外部集成。
-- 前端控制台：React Admin 实时监控与池/租约管理。
+## 核心能力
+- 双栈 DHCP 引擎：独立 DHCPv4/DHCPv6 管线，支持策略扩展与高并发处理。
+- 多租户与权限治理：租户隔离、RBAC、审计日志与敏感操作可追溯。
+- 分层地址池与策略：支持多维元数据匹配、池选择与冲突防护。
+- 高可用与复制：内置 HA/Failover、复制状态可观测与切换控制。
+- 运维可观测：Prometheus 指标、健康概览、告警路由与通知集成。
+- 自动化工作流：任务调度、审批、幂等执行与失败重试。
 
-## 代码结构速览
+## 目录结构
+```text
+cmd/              后端入口程序（dhcpd、modern-dhcp、dbinit、config-check、api-contract-check）
+internal/         业务模块与基础设施实现（pool/lease/auth/monitoring/security/...）
+pkg/              对外可复用的数据模型与遥测定义
+configs/          配置模板与本地运行配置
+migrations/       SQL 迁移脚本
+deploy/           Docker 与 Kubernetes 部署清单
+docs/             架构、接口、部署、安全、观测等设计文档
+web/              Vue 3 + Vite 前端控制台
+Modern-DNS_src/   附属前端源码目录（按需参考）
 ```
-cmd/              # 后端入口：dhcpd、modern-dhcp CLI、dbinit 迁移工具、config-check 校验工具
-internal/         # 业务与基础设施模块（pool/lease/automation/monitoring/security/...）
-pkg/              # 共享模型与遥测定义
-configs/          # 配置示例与运行配置
-deploy/           # Docker Compose 与 Helm values 模板
-docs/             # 架构、运维、观测、安全与 API 文档
-migrations/       # 数据库迁移脚本
-web/react-admin/  # 管理前端
+
+## 环境要求
+- Go 1.23+
+- MySQL 8.0+（可选 PostgreSQL，取决于配置）
+- Node.js 18+（前端开发）
+
+## 快速开始（本地开发）
+1. 准备配置文件
+
+```bash
+# Linux/macOS
+cp configs/config.example.yaml configs/config.yaml
+
+# Windows PowerShell
+Copy-Item configs/config.example.yaml configs/config.yaml
 ```
 
-## 快速开始（开发）
-1) 环境：Go 1.22+、MySQL 8.0+、Node 18+（如需前端）。
-2) 配置：复制 `configs/config.example.yaml` 为 `configs/config.yaml` 并填好 DSN/租户/HA/告警。
-3) 迁移：
-```
-go run ./cmd/dbinit --driver mysql --dsn "user:pass@tcp(127.0.0.1:3306)/modern_dhcp"
-```
-4) 启动后端：`go run ./cmd/dhcpd`
-5) CLI 验证：`go run ./cmd/modern-dhcp --help`
-6) 配置校验：`go run ./cmd/config-check --config configs/config.yaml --scope auth`
+2. 根据环境修改 `configs/config.yaml`（数据库 DSN、认证、租户、HA、告警等）。
 
-## 生产部署指引
-- Docker Compose：`deploy/docker/docker-compose.yaml` 适合 PoC 或单节点。
-- Kubernetes：使用 `deploy/kubernetes/values.yaml` 配置副本、资源与存储；建议以 Job/InitContainer 运行迁移。
-- 配置与机密：优先使用环境变量或外部 Secret；参见 docs/config_reference.md。
-- HA：通过 `/cluster/overview` 暴露角色与复制延迟；详细见 docs/ha_architecture.md。
+3. 初始化数据库迁移
 
-## 运行与运维
-- 健康检查：`/cluster/overview`（角色、延迟、抑制）、`/monitoring/overview`（池/租约/安全概览）。
-- 指标：默认暴露 Prometheus `/metrics`；仪表盘规划见 docs/observability_dashboard_plan.md。
-- 日志与审计：结构化输出；关键变更、HA 切换、审批与告警抑制写入审计。
-- 备份与恢复：MySQL 定期全量/增量备份并校验，配置文件版本化；细节见 docs/deployment_strategy.md。
+```bash
+go run ./cmd/dbinit --config configs/config.yaml --driver mysql
+```
+
+4. 启动后端服务
+
+```bash
+go run ./cmd/dhcpd --config configs/config.yaml
+```
+
+5. 校验配置与 CLI
+
+```bash
+go run ./cmd/config-check --config configs/config.yaml --scope all
+go run ./cmd/modern-dhcp help
+```
+
+## 前端开发（Vue 3）
+在 `web/` 目录执行：
+
+```bash
+npm install
+npm run dev
+```
+
+常用命令：
+- `npm run build`：构建生产包
+- `npm run test`：运行前端测试
+- `npm run lint`：代码规范检查
+
+## 常用后端命令
+- 运行全部测试：`go test ./...`
+- 执行基准测试：`go test -bench=. -benchmem ./internal/...`
+- API 契约检查：`go run ./cmd/api-contract-check --spec docs/api/openapi_v2.yaml --format markdown`
+
+## 部署说明
+- Docker：参见 `deploy/docker/`
+- Kubernetes：参见 `deploy/kubernetes/`
+- 生产部署与运维策略：参见 `docs/deployment_strategy.md`
+
+## 监控与运维
+- 健康与集群状态：`/cluster/overview`
+- 监控总览：`/monitoring/overview`
+- 指标端点：`/metrics`
+
+更多可观测设计请参考：
+- `docs/monitoring_plan.md`
+- `docs/observability_dashboard_plan.md`
+- `docs/metadata_observability.md`
 
 ## 安全与合规
-- 多租户隔离与 RBAC，敏感操作可绑定审批；参考 docs/section20_access_and_tenancy.md。
-- Rate Limit、Snooping、IPSG 等安全事件的路由与封禁策略见 docs/security_subsystem_plan.md。
-- 常见事件响应步骤见 docs/threat_response.md。
+- 访问控制与租户边界：`docs/section20_access_and_tenancy.md`
+- 安全子系统设计：`docs/security_subsystem_plan.md`
+- 威胁响应流程：`docs/threat_response.md`
 
-## 自动化与工作流
-- 调度、审批、通知与幂等策略描述见 docs/automation_workflows_plan.md。
-- CLI/任务示例可按租户发起池扩容、租约批量释放等操作。
+## 文档索引
+- 系统总览：`docs/system.md`
+- 系统规格：`docs/system_spec.md`
+- API 说明：`docs/api.md`
+- OpenAPI：`docs/api/openapi_v2.yaml`
+- 配置参考：`docs/config_reference.md`
+- 存储与模式：`docs/storage_and_schema.md`
+- 测试策略：`docs/testing_strategy.md`
 
-## API 与前端
-- API 概览与 OpenAPI 草稿：见 docs/api.md 与 docs/api/openapi_v2.yaml。
-- 前端：进入 `web/react-admin` 执行 `pnpm install && pnpm dev`（默认代理 8080）；生产构建 `pnpm build`。
-
-## 开发与测试
-- 运行测试：`go test ./...`
-- 基准测试：`go test -bench=. -benchmem ./internal/...`
-- 更详细的覆盖范围与建议见 docs/testing_strategy.md。
-
-## API 契约校验
-- 快速对照 OpenAPI 与运行时路由：`go run ./cmd/api-contract-check --spec docs/api/openapi_v2.yaml --format markdown`
-- 输出为 Markdown 表格（默认）或纯文本（`--format text`），任何缺失/多余的接口都会使命令以退出码 2 失败。
-- CI 中会自动执行同一命令，保持 docs/api/openapi_v2.yaml 与真实 API 同步。
-
-## 更多文档
-- 架构与系统规格：docs/system_spec.md
-- 部署与运维：docs/deployment_strategy.md
-- 观测与告警：docs/monitoring_plan.md、docs/metadata_observability.md
-- 存储与迁移：docs/storage_and_schema.md
-
-## 许可证
-本项目遵循仓库附带的 LICENSE。
+## License
+See `LICENSE`.
