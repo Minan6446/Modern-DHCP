@@ -74,7 +74,7 @@ const bootstrap = async () => {
       return;
     }
     console.error('[GlobalError]', e.error || e.message);
-    showError('Unexpected error occurred');
+    showError('发生了未预期的错误，请刷新页面重试');
   });
 
   window.addEventListener('unhandledrejection', (e) => {
@@ -84,7 +84,7 @@ const bootstrap = async () => {
       return;
     }
     console.error('[UnhandledRejection]', e.reason);
-    showError('Request failed, please retry');
+    showError('请求失败，请检查网络或稍后重试');
   });
 
   app.use(router);

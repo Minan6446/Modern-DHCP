@@ -34,5 +34,15 @@ export default {
       scope: '范围',
       description: '描述',
       username: '用户名',
-      displayName: '姓名'
+      displayName: '姓名',
+      labelIP: 'IP',
+      labelMAC: 'MAC',
+      labelClientId: 'Client ID',
+      unsavedConfirm: '当前有未保存配置，确认关闭吗？',
+      unsavedTitle: '未保存提醒',
+      confirmClose: '确认关闭',
+      continueEditing: '继续编辑',
+      previewFail: '请先修正错误项后再预览',
+      precheckPass: '预校验通过',
+      precheckFail: '预校验未通过，请先修正错误项'
     }

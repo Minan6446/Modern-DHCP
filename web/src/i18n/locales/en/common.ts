@@ -34,5 +34,15 @@ export default {
       scope: 'Scope',
       description: 'Description',
       username: 'Username',
-      displayName: 'Display name'
+      displayName: 'Display name',
+      labelIP: 'IP',
+      labelMAC: 'MAC',
+      labelClientId: 'Client ID',
+      unsavedConfirm: 'Unsaved changes will be lost. Close anyway?',
+      unsavedTitle: 'Unsaved Changes',
+      confirmClose: 'Close',
+      continueEditing: 'Continue Editing',
+      previewFail: 'Please fix errors before preview',
+      precheckPass: 'Validation passed',
+      precheckFail: 'Validation failed, please fix errors'
     }
