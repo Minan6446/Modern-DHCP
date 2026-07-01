@@ -438,10 +438,10 @@ const requestClose = async () => {
     return;
   }
   try {
-    await ElMessageBox.confirm('当前有未保存配置，确认关闭吗？', '未保存提醒', {
+    await ElMessageBox.confirm(t('common.unsavedConfirm'), t('common.unsavedTitle'), {
       type: 'warning',
-      confirmButtonText: '确认关闭',
-      cancelButtonText: '继续编辑'
+      confirmButtonText: t('common.confirmClose'),
+      cancelButtonText: t('common.continueEditing')
     });
     visible.value = false;
   } catch {
@@ -455,10 +455,10 @@ const handleBeforeClose = async (done: () => void) => {
     return;
   }
   try {
-    await ElMessageBox.confirm('当前有未保存配置，确认关闭吗？', '未保存提醒', {
+    await ElMessageBox.confirm(t('common.unsavedConfirm'), t('common.unsavedTitle'), {
       type: 'warning',
-      confirmButtonText: '确认关闭',
-      cancelButtonText: '继续编辑'
+      confirmButtonText: t('common.confirmClose'),
+      cancelButtonText: t('common.continueEditing')
     });
     done();
   } catch {
