@@ -12,28 +12,28 @@ let echartsLoader: Promise<typeof import('echarts/core')> | null = null;
 const loadEcharts = async () => {
   if (!echartsLoader) {
     echartsLoader = (async () => {
-      const core = await import('echarts/core');
-      const charts = await import('echarts/charts');
-      const components = await import('echarts/components');
-      const renderer = await import('echarts/renderers');
+      const echarts = await import('echarts/core');
+      const { BarChart, LineChart, PieChart, RadarChart, GaugeChart, GraphChart } = await import('echarts/charts');
+      const { GridComponent, TooltipComponent, LegendComponent, TitleComponent, DatasetComponent, VisualMapComponent } = await import('echarts/components');
+      const { CanvasRenderer } = await import('echarts/renderers');
 
-      core.use([
-        charts.BarChart,
-        charts.LineChart,
-        charts.PieChart,
-        charts.RadarChart,
-        charts.GaugeChart,
-        charts.GraphChart,
-        components.GridComponent,
-        components.TooltipComponent,
-        components.LegendComponent,
-        components.TitleComponent,
-        components.DatasetComponent,
-        components.VisualMapComponent,
-        renderer.CanvasRenderer
+      echarts.use([
+        BarChart,
+        LineChart,
+        PieChart,
+        RadarChart,
+        GaugeChart,
+        GraphChart,
+        GridComponent,
+        TooltipComponent,
+        LegendComponent,
+        TitleComponent,
+        DatasetComponent,
+        VisualMapComponent,
+        CanvasRenderer
       ]);
 
-      return core;
+      return echarts;
     })();
   }
   return echartsLoader;

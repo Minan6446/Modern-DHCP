@@ -9,6 +9,9 @@ declare module 'vue' {
   export interface GlobalComponents {
     AgreementDialog: typeof import('./../components/auth/AgreementDialog.vue')['default']
     AppErrorCallout: typeof import('./../components/common/AppErrorCallout.vue')['default']
+    AuditFilters: typeof import('./../components/audit/AuditFilters.vue')['default']
+    AuditStats: typeof import('./../components/audit/AuditStats.vue')['default']
+    AuditTable: typeof import('./../components/audit/AuditTable.vue')['default']
     BaseEChart: typeof import('./../components/echarts/BaseEChart.vue')['default']
     ElAlert: typeof import('element-plus/es')['ElAlert']
     ElAvatar: typeof import('element-plus/es')['ElAvatar']

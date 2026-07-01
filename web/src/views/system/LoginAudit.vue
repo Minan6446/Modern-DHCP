@@ -7,24 +7,7 @@
       </div>
     </div>
 
-    <section class="overview-grid">
-      <el-card shadow="never" class="overview-card">
-        <div class="overview-label">{{ t('system.audit.statTotal') }}</div>
-        <div class="overview-value">{{ statTotalToday }}</div>
-      </el-card>
-      <el-card shadow="never" class="overview-card">
-        <div class="overview-label">{{ t('system.audit.statSuccess') }}</div>
-        <div class="overview-value">{{ statSuccessToday }}</div>
-      </el-card>
-      <el-card shadow="never" class="overview-card">
-        <div class="overview-label">{{ t('system.audit.statFailed') }}</div>
-        <div class="overview-value">{{ statFailedToday }}</div>
-      </el-card>
-      <el-card shadow="never" class="overview-card">
-        <div class="overview-label">{{ t('system.audit.statRisk') }}</div>
-        <div class="overview-value">{{ statRiskToday }}</div>
-      </el-card>
-    </section>
+    <AuditStats :rows="rows" :is-risk-row="isRiskRow" />
 
     <div class="filter-bar">
       <div class="bar-left">
@@ -222,6 +205,7 @@ import { useSystemViewStore } from '@/store/systemView';
 import { usePermissionStore } from '@/store/permission';
 import { showHttpError } from '@/shared/errors/errorToast';
 import { showSuccess, showWarning } from '@/shared/errors/messageToast';
+import AuditStats from '@/components/audit/AuditStats.vue';
 
 type TimePreset = '24h' | '7d' | '30d' | 'custom';
 type AuditResultFilter = LoginAuditRecord['result'] | 'risk' | '';
@@ -685,16 +669,6 @@ const sortedRows = computed(() => {
 });
 
 const displayRows = computed(() => sortedRows.value.filter((row) => resultMatched(row) && opTypeMatched(row) && idMatched(row)));
-
-const todayRows = computed(() => {
-  const today = dayjs().format('YYYY-MM-DD');
-  return displayRows.value.filter((item) => dayjs(item.createdAt).format('YYYY-MM-DD') === today);
-});
-
-const statTotalToday = computed(() => todayRows.value.length);
-const statSuccessToday = computed(() => todayRows.value.filter((item) => item.result === 'success' && !isRiskRow(item)).length);
-const statFailedToday = computed(() => todayRows.value.filter((item) => item.result === 'failed').length);
-const statRiskToday = computed(() => todayRows.value.filter((item) => isRiskRow(item)).length);
 
 const detailJson = computed(() => JSON.stringify(detailRow.value?.rawPayload || detailRow.value || {}, null, 2));
 
