@@ -31,7 +31,7 @@ func (s *HTTPServer) primaryWriteGuardMiddleware() echo.MiddlewareFunc {
 			if !ok {
 				return next(c)
 			}
-			if snapshot.Role == failover.RolePrimary || snapshot.Role == failover.RoleUnknown {
+			if snapshot.Role == failover.RolePrimary {
 				expectedEpoch := strings.TrimSpace(snapshot.FencingEpoch)
 				if expectedEpoch == "" {
 					return next(c)
@@ -56,6 +56,9 @@ func (s *HTTPServer) primaryWriteGuardMiddleware() echo.MiddlewareFunc {
 						"providedEpoch": providedEpoch,
 					})
 				}
+				return next(c)
+			}
+			if snapshot.Role == failover.RoleUnknown {
 				return next(c)
 			}
 			s.auditWriteGuardReject(c, "standby_write_blocked", map[string]any{

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"strings"
 	"time"
@@ -31,20 +32,20 @@ func NewSQLOptionRepository(db *sqlx.DB) *SQLOptionRepository {
 }
 
 type optionRecord struct {
-	ID            string    `db:"id"`
-	Code          int       `db:"code"`
-	Name          string    `db:"name"`
-	Scope         string    `db:"scope"`
-	Format        string    `db:"format"`
-	DataType      string    `db:"data_type"`
-	Value         string    `db:"value"`
-	ValueExample  string    `db:"value_example"`
-	AllowedValues string    `db:"allowed_values"`
-	SampleValue   string    `db:"sample_value"`
-	Description   string    `db:"description"`
-	Tags          string    `db:"tags"`
-	CreatedAt     time.Time `db:"created_at"`
-	UpdatedAt     time.Time `db:"updated_at"`
+	ID            string         `db:"id"`
+	Code          int            `db:"code"`
+	Name          string         `db:"name"`
+	Scope         string         `db:"scope"`
+	Format        string         `db:"format"`
+	DataType      string         `db:"data_type"`
+	Value         string         `db:"value"`
+	ValueExample  sql.NullString `db:"value_example"`
+	AllowedValues sql.NullString `db:"allowed_values"`
+	SampleValue   sql.NullString `db:"sample_value"`
+	Description   sql.NullString `db:"description"`
+	Tags          sql.NullString `db:"tags"`
+	CreatedAt     time.Time      `db:"created_at"`
+	UpdatedAt     time.Time      `db:"updated_at"`
 }
 
 func encodeStrings(values []string) string {
@@ -56,6 +57,10 @@ func encodeStrings(values []string) string {
 		return ""
 	}
 	return string(b)
+}
+
+func toNullString(s string) sql.NullString {
+	return sql.NullString{String: s, Valid: s != ""}
 }
 
 func decodeStrings(raw string) []string {
@@ -89,11 +94,11 @@ func (r *SQLOptionRepository) List(ctx context.Context, tenantID string) ([]dhcp
 			Format:        rec.Format,
 			DataType:      rec.DataType,
 			Value:         rec.Value,
-			ValueExample:  rec.ValueExample,
-			AllowedValues: decodeStrings(rec.AllowedValues),
-			SampleValue:   rec.SampleValue,
-			Description:   rec.Description,
-			Tags:          decodeStrings(rec.Tags),
+			ValueExample:  rec.ValueExample.String,
+			AllowedValues: decodeStrings(rec.AllowedValues.String),
+			SampleValue:   rec.SampleValue.String,
+			Description:   rec.Description.String,
+			Tags:          decodeStrings(rec.Tags.String),
 			UpdatedAt:     rec.UpdatedAt,
 		})
 	}
@@ -116,11 +121,11 @@ func (r *SQLOptionRepository) Upsert(ctx context.Context, opt dhcpOptionTemplate
 		Format:        opt.Format,
 		DataType:      opt.DataType,
 		Value:         opt.Value,
-		ValueExample:  opt.ValueExample,
-		AllowedValues: encodeStrings(opt.AllowedValues),
-		SampleValue:   opt.SampleValue,
-		Description:   opt.Description,
-		Tags:          encodeStrings(opt.Tags),
+		ValueExample:  toNullString(opt.ValueExample),
+		AllowedValues: toNullString(encodeStrings(opt.AllowedValues)),
+		SampleValue:   toNullString(opt.SampleValue),
+		Description:   toNullString(opt.Description),
+		Tags:          toNullString(encodeStrings(opt.Tags)),
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}

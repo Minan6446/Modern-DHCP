@@ -30,19 +30,19 @@ func NewSQLScopeRepository(db *sqlx.DB) *SQLScopeRepository {
 }
 
 type scopeRecord struct {
-	ID          string    `db:"id"`
-	Name        string    `db:"name"`
-	Subnet      string    `db:"subnet"`
-	Range       string    `db:"range_value"`
-	Gateway     string    `db:"gateway"`
-	Status      string    `db:"status"`
-	ScopeType   string    `db:"scope_type"`
-	Target      string    `db:"target"`
-	TemplateID  string    `db:"template_id"`
-	OptionIDs   string    `db:"option_ids"`
-	Description string    `db:"description"`
-	CreatedAt   time.Time `db:"created_at"`
-	UpdatedAt   time.Time `db:"updated_at"`
+	ID          string         `db:"id"`
+	Name        string         `db:"name"`
+	Subnet      string         `db:"subnet"`
+	Range       string         `db:"range_value"`
+	Gateway     string         `db:"gateway"`
+	Status      string         `db:"status"`
+	ScopeType   string         `db:"scope_type"`
+	Target      string         `db:"target"`
+	TemplateID  sql.NullString `db:"template_id"`
+	OptionIDs   string         `db:"option_ids"`
+	Description sql.NullString `db:"description"`
+	CreatedAt   time.Time      `db:"created_at"`
+	UpdatedAt   time.Time      `db:"updated_at"`
 }
 
 func encodeScopeOptionIDs(values []string) string {
@@ -98,10 +98,10 @@ func (r *SQLScopeRepository) List(ctx context.Context, tenantID string) ([]dhcpO
 			Status:      rec.Status,
 			ScopeType:   rec.ScopeType,
 			Target:      rec.Target,
-			TemplateID:  strings.TrimSpace(rec.TemplateID),
+			TemplateID:  strings.TrimSpace(rec.TemplateID.String),
 			OptionIDs:   decodeScopeOptionIDs(rec.OptionIDs),
-			Description: rec.Description,
-			Notes:       firstNonEmpty(rec.Description),
+			Description: rec.Description.String,
+			Notes:       firstNonEmpty(rec.Description.String),
 			UpdatedAt:   rec.UpdatedAt,
 		})
 	}
@@ -148,9 +148,9 @@ func (r *SQLScopeRepository) Upsert(ctx context.Context, item dhcpOptionScope, t
 		Status:      item.Status,
 		ScopeType:   item.ScopeType,
 		Target:      item.Target,
-		TemplateID:  item.TemplateID,
+		TemplateID:  toNullString(item.TemplateID),
 		OptionIDs:   encodeScopeOptionIDs(item.OptionIDs),
-		Description: firstNonEmpty(item.Description, item.Notes),
+		Description: toNullString(firstNonEmpty(item.Description, item.Notes)),
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}

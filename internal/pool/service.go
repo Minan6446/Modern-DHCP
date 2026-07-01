@@ -16,6 +16,7 @@ import (
 
 	"modern-dhcp/internal/metrics"
 	"modern-dhcp/internal/netutil"
+	"modern-dhcp/internal/resource"
 	"modern-dhcp/internal/tenant"
 	"modern-dhcp/pkg/models"
 )
@@ -693,7 +694,80 @@ func (s *Service) CreateBinding(ctx context.Context, scope ResourceScope, req Bi
 	if err := s.repo.InsertBinding(ctx, binding); err != nil {
 		return nil, err
 	}
+	// Auto-exclude the bound IP from its pool to prevent address conflicts.
+	if err := s.autoExcludeBindingIP(ctx, scope.AccessScope(), binding.IPAddress, req.PoolID); err != nil && s.logger != nil {
+		s.logger.Warn("auto-exclude: failed to exclude binding IP from pool",
+			zap.String("poolId", req.PoolID), zap.String("ip", binding.IPAddress), zap.Error(err))
+	}
 	return binding, nil
+}
+
+// autoExcludeBindingIP adds the binding's IP address as a single-IP exclusion
+// to its parent pool so the DHCP allocator skips it. Returns nil on success.
+func (s *Service) autoExcludeBindingIP(ctx context.Context, accessScope resource.AccessScope, ip, poolID string) error {
+	ipAddr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return fmt.Errorf("parse ip: %w", err)
+	}
+	poolObj, err := s.repo.GetPool(ctx, accessScope, poolID)
+	if err != nil {
+		return fmt.Errorf("get pool: %w", err)
+	}
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(poolObj.CIDR))
+	if err != nil {
+		return fmt.Errorf("parse cidr: %w", err)
+	}
+	rangeStart, rangeEnd, err := netutil.DefaultHostRange(prefix)
+	if err != nil {
+		return fmt.Errorf("default host range: %w", err)
+	}
+	if strings.TrimSpace(poolObj.RangeStart) != "" {
+		if s, e := netip.ParseAddr(poolObj.RangeStart); e == nil && prefix.Contains(s) {
+			rangeStart = s
+		}
+	}
+	if strings.TrimSpace(poolObj.RangeEnd) != "" {
+		if e, e2 := netip.ParseAddr(poolObj.RangeEnd); e2 == nil && prefix.Contains(e) {
+			rangeEnd = e
+		}
+	}
+	if ipAddr.Compare(rangeStart) < 0 || ipAddr.Compare(rangeEnd) > 0 {
+		return fmt.Errorf("ip %s outside pool range [%s, %s]", ip, rangeStart, rangeEnd)
+	}
+	ipStr := ipAddr.String()
+	existing := poolObj.Exclusions
+	for _, r := range existing {
+		if r.Start == ipStr && r.End == ipStr {
+			return nil // already single-IP excluded
+		}
+		if r.Start != "" && r.End != "" {
+			rs, _ := netip.ParseAddr(r.Start)
+			re, _ := netip.ParseAddr(r.End)
+			if rs.IsValid() && re.IsValid() && ipAddr.Compare(rs) >= 0 && ipAddr.Compare(re) <= 0 {
+				return nil // already covered by a range
+			}
+		}
+	}
+	newExclusions := make(models.IPRangeList, len(existing), len(existing)+1)
+	copy(newExclusions, existing)
+	newExclusions = append(newExclusions, models.IPRange{Start: ipStr, End: ipStr})
+	normalized, normErr := normalizeExclusions(prefix, rangeStart, rangeEnd, newExclusions)
+	if normErr != nil {
+		return fmt.Errorf("normalize exclusions: %w", normErr)
+	}
+	if normalized == nil {
+		return nil
+	}
+	poolObj.Exclusions = normalized
+	poolObj.UpdatedAt = time.Now().UTC()
+	if err := s.repo.UpdatePool(ctx, poolObj); err != nil {
+		return fmt.Errorf("update pool: %w", err)
+	}
+	if s.logger != nil {
+		s.logger.Info("auto-excluded binding IP from pool",
+			zap.String("poolId", poolID), zap.String("ip", ip))
+	}
+	return nil
 }
 
 // UpdateBinding mutates metadata for an existing static binding.

@@ -64,7 +64,7 @@ func (s *sqlSettingsStore) Load(ctx context.Context) (SystemSettings, error) {
 		return SystemSettings{}, ErrSettingsStoreUnavailable
 	}
 	var settings SystemSettings
-	err := s.db.GetContext(ctx, &settings, `SELECT theme, locale, maintenance_mode, maintenance_window, announcement, admin_session_timeout_minutes, auto_logout_enabled, system_log_retention_days, audit_log_retention_days, log_push_enabled, log_push_endpoint, log_push_min_level, log_push_channels, log_push_phones, log_push_dingtalk_endpoint, log_push_feishu_endpoint, log_push_wecom_endpoint, log_push_slack_endpoint, ntp_enabled, ntp_servers, ntp_interval_minutes, ntp_timeout_seconds, timezone, ntp_sync_status, ntp_last_sync_at, updated_at, updated_by FROM ops_system_settings WHERE id = 1`)
+	err := s.db.GetContext(ctx, &settings, `SELECT theme, locale, maintenance_mode, COALESCE(maintenance_window, '') AS maintenance_window, COALESCE(announcement, '') AS announcement, admin_session_timeout_minutes, auto_logout_enabled, system_log_retention_days, audit_log_retention_days, log_push_enabled, COALESCE(log_push_endpoint, '') AS log_push_endpoint, COALESCE(log_push_min_level, 'warning') AS log_push_min_level, log_push_channels, log_push_phones, log_push_dingtalk_endpoint, log_push_feishu_endpoint, log_push_wecom_endpoint, log_push_slack_endpoint, ntp_enabled, COALESCE(ntp_servers, '') AS ntp_servers, ntp_interval_minutes, ntp_timeout_seconds, COALESCE(timezone, '') AS timezone, COALESCE(ntp_sync_status, '') AS ntp_sync_status, ntp_last_sync_at, updated_at, updated_by FROM ops_system_settings WHERE id = 1`)
 	if err == nil {
 		return settings, nil
 	}
