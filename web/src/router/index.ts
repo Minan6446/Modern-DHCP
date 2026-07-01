@@ -8,11 +8,36 @@ import {
 import Layout from '@/layout/Layout.vue';
 import { useAuthStore } from '@/modules/auth/store';
 import { usePermissionStore } from '@/store/permission';
+import { loadLocaleModule } from '@/i18n';
 import {
   ADMIN_ROLE_PERMISSION,
   ensureRoutePermission,
   hasPermission as hasPermissionHelper
 } from '@/shared/permission';
+
+/**
+ * Infer the i18n module name from a route path.
+ * Route /pool/ipv4 → map['pool'] = 'pool'
+ * Route /monitor/overview → map['monitor'] = 'monitoring'
+ */
+function inferI18nModule(path: string): string | null {
+  const seg = path.split('/')[1];
+  const map: Record<string, string> = {
+    dashboard:  'dashboard',
+    pool:       'pool',
+    lease:      'lease',
+    binding:    'binding',
+    option:     'option',
+    monitor:    'monitoring',
+    monitoring: 'monitoring',
+    cluster:    'cluster',
+    security:   'security',
+    system:     'system',
+    account:    'settings',
+    login:      'login',
+  };
+  return map[seg] || null;
+}
 
 const routes: RouteRecordRaw[] = [
   {
@@ -294,6 +319,13 @@ router.beforeEach(
 
     const redirect = steps.find(Boolean);
     if (redirect) return next(redirect as any);
+
+    // Lazy-load route-specific i18n module (e.g. pool/lease/cluster) if not yet loaded
+    const i18nModule = inferI18nModule(to.path);
+    if (i18nModule) {
+      await loadLocaleModule(i18nModule);
+    }
+
     next();
   }
 );

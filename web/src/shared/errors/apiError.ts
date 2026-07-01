@@ -28,6 +28,11 @@ const CODE_MESSAGES: Record<number, { key: string; fallback: string }> = {
   50000: { key: 'errors.catalog.systemError', fallback: 'Service error.' }
 };
 
+const CODE_STRINGS: Record<string, string> = {
+  stale_fencing_epoch: 'HA 防护拦截：Fencing Epoch 已过期，请刷新页面后重试',
+  standby_write_blocked: '当前节点为备用节点，写操作仅允许在主节点执行'
+};
+
 const TYPE_HINTS: Record<string, { key: string; fallback: string }> = {
   ValidationError: {
     key: 'errors.hints.validation',
@@ -67,10 +72,13 @@ interface DescriptorOptions {
   network?: boolean;
 }
 
-const resolveMessage = (code?: number, fallback?: string) => {
-  if (code && CODE_MESSAGES[code]) {
-    const meta = CODE_MESSAGES[code];
+const resolveMessage = (code?: number | string, fallback?: string) => {
+  if (code && CODE_MESSAGES[code as number]) {
+    const meta = CODE_MESSAGES[code as number];
     return t(meta.key, meta.fallback);
+  }
+  if (typeof code === 'string' && CODE_STRINGS[code]) {
+    return CODE_STRINGS[code];
   }
   if (fallback && fallback.trim().length > 0) {
     const trimmed = fallback.trim();

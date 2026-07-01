@@ -73,7 +73,7 @@
         <label class="field-label optional-label">{{ t('binding.formHostname') }} <span class="optional">可选</span></label>
         <div class="field-control">
           <el-input v-model="form.hostname" placeholder="示例：host-a01" @blur="validateHostname" />
-          <div class="field-hint">支持字母、数字与 ._-，最长 64 位。</div>
+          <div class="field-hint">支持中文、字母、数字与 ._-，最长 64 个字符。</div>
           <p v-if="errors.hostname" class="field-error">{{ errors.hostname }}</p>
         </div>
       </div>
@@ -363,8 +363,8 @@ const validateHostname = () => {
   delete errors.hostname;
   const value = String(form.hostname || '').trim();
   if (!value) return true;
-  if (!/^[a-zA-Z0-9._-]{1,64}$/.test(value)) {
-    errors.hostname = '主机名仅支持字母、数字和 ._-';
+  if (!/^[\u4e00-\u9fffa-zA-Z0-9._-]{1,64}$/.test(value)) {
+    errors.hostname = '主机名仅支持中文、字母、数字和 ._-';
     return false;
   }
   form.hostname = value;

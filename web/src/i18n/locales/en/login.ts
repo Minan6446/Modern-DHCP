@@ -15,7 +15,7 @@ export default {
       userAgreement: 'User Agreement',
       privacyPolicy: 'Privacy Policy',
       and: 'and',
-      support: 'Support: minan959@163.com',
+      support: "Support: minan959{'@'}163.com",
       copyright: '© 2026 Modern DHCP All rights reserved. | v2.2.0',
       mustAgree: 'Please read and accept the user agreement and privacy policy first.',
       formErrors: 'Please fix the highlighted fields before signing in.',

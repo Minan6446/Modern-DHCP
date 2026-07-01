@@ -110,7 +110,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, watch, onMounted } from 'vue';
+import { computed, ref, watch, onMounted } from 'vue';
 import logo from '@/assets/logo.svg';
 import { useRoute, useRouter } from 'vue-router';
 import type { Component } from 'vue';
@@ -122,6 +122,7 @@ import {
   ADMIN_ROLE_PERMISSION,
   hasPermission as hasPermissionHelper
 } from '@/shared/permission';
+import { loadLocaleModule } from '@/i18n';
 import NotificationBell from './NotificationBell.vue';
 import {
   Fold,
@@ -163,73 +164,21 @@ const footerSlogan = computed(() => String(t('layout.footerSlogan') || ''));
 const permissionStore = usePermissionStore();
 const authStore = useAuthStore();
 
-const createAvatar = (c1: string, c2: string, accent: string, seed: number) => {
-  const angle = (seed % 360).toFixed(0);
-  const offset = 10 + (seed % 20);
-  const stripe = 4 + (seed % 3);
-  const svg =
-    `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'>` +
-    `<defs>` +
-    `<linearGradient id='g' x1='0%' y1='0%' x2='100%' y2='100%'>` +
-    `<stop stop-color='${c1}' offset='0%'/>` +
-    `<stop stop-color='${c2}' offset='100%'/></linearGradient>` +
-    `<pattern id='p' width='12' height='12' patternTransform='rotate(${angle})' patternUnits='userSpaceOnUse'>` +
-    `<rect width='12' height='12' fill='none' />` +
-    `<line x1='0' y1='0' x2='0' y2='12' stroke='${accent}' stroke-width='${stripe}' opacity='0.15' />` +
-    `</pattern>` +
-    `</defs>` +
-    `<circle cx='60' cy='60' r='60' fill='url(#g)'/>` +
-    `<circle cx='60' cy='60' r='${60 - offset}' fill='url(#p)'/>` +
-    `<circle cx='60' cy='60' r='${32 + (seed % 8)}' fill='${accent}' opacity='0.12'/>` +
-    `</svg>`;
-  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
-};
-
-const avatarPalette = [
-  createAvatar('#4f46e5', '#22d3ee', '#ecfeff', 11),
-  createAvatar('#6366f1', '#f472b6', '#fff7ed', 17),
-  createAvatar('#2563eb', '#22c55e', '#f0f9ff', 23),
-  createAvatar('#0ea5e9', '#a855f7', '#fdf4ff', 31),
-  createAvatar('#0891b2', '#f59e0b', '#fff7ed', 37),
-  createAvatar('#10b981', '#14b8a6', '#ecfdf3', 41),
-  createAvatar('#0ea5e9', '#38bdf8', '#e0f2fe', 43),
-  createAvatar('#f97316', '#f43f5e', '#fff1f2', 47),
-  createAvatar('#ec4899', '#a855f7', '#fdf2f8', 53),
-  createAvatar('#6366f1', '#22c55e', '#eef2ff', 59),
-  createAvatar('#f59e0b', '#f97316', '#fff7ed', 61),
-  createAvatar('#84cc16', '#22c55e', '#f7fee7', 67),
-  createAvatar('#a855f7', '#22d3ee', '#f5f3ff', 71),
-  createAvatar('#14b8a6', '#6366f1', '#ecfeff', 73),
-  createAvatar('#8b5cf6', '#ec4899', '#fdf2f8', 79),
-  createAvatar('#eab308', '#10b981', '#fefce8', 83),
-  createAvatar('#f43f5e', '#8b5cf6', '#fff1f2', 89),
-  createAvatar('#0ea5e9', '#f472b6', '#e0f2fe', 97),
-  createAvatar('#1e293b', '#0ea5e9', '#e2e8f0', 101),
-  createAvatar('#0f172a', '#6366f1', '#e0e7ff', 107)
-];
-
-const pickAvatar = (seed: string) => {
-  const text = seed || 'user';
-  let hash = 0;
-  for (const ch of text) {
-    hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
-  }
-  return avatarPalette[hash % avatarPalette.length];
-};
+const diceBearAvatar = (seed: string) =>
+  `https://api.dicebear.com/9.x/thumbs/svg?seed=${encodeURIComponent(seed || 'user')}`;
 
 onMounted(async () => {
   await permissionStore.loadPermissions();
+  // Preload sidebar/global i18n modules so all nav items render in the active locale.
+  const sidebarModules = ['system', 'cluster', 'security', 'settings', 'login'];
+  await Promise.allSettled(sidebarModules.map((m) => loadLocaleModule(m)));
 });
 
 const isCollapse = ref(false);
-const user = reactive({
-  name: t('layout.defaultUserName'),
-  avatar: ''
-});
 
 const userAvatar = computed(() => {
-  const name = authStore.user?.username || user.name;
-  return pickAvatar(name || 'user');
+  const name = authStore.user?.username || t('layout.defaultUserName');
+  return diceBearAvatar(name || 'user');
 });
 
 const hasPermission = (key?: string | string[]) => {

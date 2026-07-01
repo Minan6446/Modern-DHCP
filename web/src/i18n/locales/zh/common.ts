@@ -13,6 +13,7 @@ export default {
       confirm: '确认',
       cancel: '取消',
       export: '导出',
+      import: '导入',
       refresh: '刷新',
       previous: '上一步',
       next: '下一步',

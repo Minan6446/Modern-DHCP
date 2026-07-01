@@ -13,6 +13,7 @@ export default {
       confirm: 'Confirm',
       cancel: 'Cancel',
       export: 'Export',
+      import: 'Import',
       refresh: 'Refresh',
       previous: 'Previous',
       next: 'Next',

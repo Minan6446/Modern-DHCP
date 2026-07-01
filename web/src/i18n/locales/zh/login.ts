@@ -15,7 +15,7 @@ export default {
       userAgreement: '《用户协议》',
       privacyPolicy: '《隐私政策》',
       and: '与',
-      support: '技术支持：minan959@163.com',
+      support: "技术支持：minan959{'@'}163.com",
       copyright: '© 2026 Modern DHCP All rights reserved. | 版本 v2.2.0',
       mustAgree: '请先阅读并同意用户协议与隐私政策',
       formErrors: '请先修正表单错误后再登录',

@@ -9,6 +9,10 @@ import navEn from './locales/en/nav';
 import navZh from './locales/zh/nav';
 import errorsEn from './locales/en/errors';
 import errorsZh from './locales/zh/errors';
+import layoutEn from './locales/en/layout';
+import layoutZh from './locales/zh/layout';
+import notificationsEn from './locales/en/notifications';
+import notificationsZh from './locales/zh/notifications';
 
 /**
  * Application-level supported locales.
@@ -34,10 +38,12 @@ export const SUPPORTED_LOCALES: AppLocale[] = [
 export const DEFAULT_LOCALE: AppLocale['code'] = 'zh';
 export const FALLBACK_LOCALE: AppLocale['code'] = 'zh';
 
-// Core messages loaded at boot time
+// Core messages loaded at boot time.
+// Each module exports a flat object; we wrap it under its namespace key
+// so that $t('common.name'), $t('app.title'), etc. resolve correctly.
 const bootMessages: Record<string, any> = {
-  en: { ...commonEn, ...appEn, ...navEn, ...errorsEn },
-  zh: { ...commonZh, ...appZh, ...navZh, ...errorsZh }
+  en: { common: commonEn, app: appEn, nav: navEn, errors: errorsEn, layout: layoutEn, notifications: notificationsEn },
+  zh: { common: commonZh, app: appZh, nav: navZh, errors: errorsZh, layout: layoutZh, notifications: notificationsZh }
 };
 
 export type MessageSchema = typeof bootMessages['zh'];
@@ -81,13 +87,13 @@ export async function loadLocaleModule(moduleName: string): Promise<void> {
       case 'settings': enMod = (await import('./locales/en/settings')).default; zhMod = (await import('./locales/zh/settings')).default; break;
       default: return; // unknown module
     }
-    const mergedEn = { ...i18n.global.getLocaleMessage('en'), ...enMod };
-    const mergedZh = { ...i18n.global.getLocaleMessage('zh'), ...zhMod };
+    const mergedEn = { ...i18n.global.getLocaleMessage('en'), [moduleName]: enMod };
+    const mergedZh = { ...i18n.global.getLocaleMessage('zh'), [moduleName]: zhMod };
     i18n.global.setLocaleMessage('en', mergedEn);
     i18n.global.setLocaleMessage('zh', mergedZh);
     localeModuleCache.add(moduleName);
-  } catch {
-    // Module not found or load failed — ignore gracefully
+  } catch (err) {
+    console.warn(`[i18n] failed to load module "${moduleName}"`, err);
   }
 }
 
