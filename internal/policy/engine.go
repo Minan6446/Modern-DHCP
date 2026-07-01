@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -61,16 +62,27 @@ type PoolSelector struct {
 	GeoZone       string `json:"geoZone"`
 }
 
+const defaultCacheTTL = 60 * time.Second
+
 // Engine evaluates policy rules stored in MySQL.
 type Engine struct {
-	repo   Repository
-	cache  map[string][]models.PolicyRule
-	logger *zap.Logger
+	repo      Repository
+	cache     map[string][]models.PolicyRule
+	cacheTime map[string]time.Time
+	cacheTTL  time.Duration
+	mu        sync.RWMutex
+	logger    *zap.Logger
 }
 
 // NewEngine creates a policy engine with naive in-memory cache.
 func NewEngine(repo Repository, logger *zap.Logger) *Engine {
-	return &Engine{repo: repo, cache: make(map[string][]models.PolicyRule), logger: logger}
+	return &Engine{
+		repo:      repo,
+		cache:     make(map[string][]models.PolicyRule),
+		cacheTime: make(map[string]time.Time),
+		cacheTTL:  defaultCacheTTL,
+		logger:    logger,
+	}
 }
 
 // Evaluate returns the highest-priority matching decision.
@@ -96,11 +108,28 @@ func (e *Engine) Evaluate(ctx context.Context, input Input) (*Decision, error) {
 }
 
 func (e *Engine) fetchRules(ctx context.Context, tenantID string) ([]models.PolicyRule, error) {
+	// Fast path: read-lock and check cache
+	e.mu.RLock()
 	if cached, ok := e.cache[tenantID]; ok {
-		return cached, nil
+		if time.Since(e.cacheTime[tenantID]) < e.cacheTTL {
+			e.mu.RUnlock()
+			return cached, nil
+		}
 	}
+	e.mu.RUnlock()
+
+	// Cache miss or expired: acquire write lock and double-check
+	e.mu.Lock()
+	if cached, ok := e.cache[tenantID]; ok {
+		if time.Since(e.cacheTime[tenantID]) < e.cacheTTL {
+			e.mu.Unlock()
+			return cached, nil
+		}
+	}
+
 	rules, err := e.repo.ListRules(ctx, tenantID, 500, 0)
 	if err != nil {
+		e.mu.Unlock()
 		return nil, err
 	}
 	filtered := make([]models.PolicyRule, 0, len(rules))
@@ -111,6 +140,8 @@ func (e *Engine) fetchRules(ctx context.Context, tenantID string) ([]models.Poli
 	}
 	sort.Slice(filtered, func(i, j int) bool { return filtered[i].Priority < filtered[j].Priority })
 	e.cache[tenantID] = filtered
+	e.cacheTime[tenantID] = time.Now()
+	e.mu.Unlock()
 	return filtered, nil
 }
 
@@ -438,9 +469,13 @@ func matchSliceCondition(values []string, cond any, ignoreCase bool) bool {
 
 // Invalidate clears cache entries for a tenant (or all when empty string).
 func (e *Engine) Invalidate(tenantID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if tenantID == "" {
 		e.cache = make(map[string][]models.PolicyRule)
+		e.cacheTime = make(map[string]time.Time)
 		return
 	}
 	delete(e.cache, tenantID)
+	delete(e.cacheTime, tenantID)
 }

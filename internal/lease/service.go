@@ -117,6 +117,7 @@ type Service struct {
 	conflictCfg    config.ConflictPreventionConfig
 	redisClient    redis.UniversalClient
 	allocLock      *lock.Manager
+	bitmapFirst    bool
 }
 
 // ServiceOption configures optional lease service dependencies.
@@ -200,6 +201,15 @@ func WithRedisAllocator(client redis.UniversalClient) ServiceOption {
 	return func(s *Service) {
 		s.redisClient = client
 		s.allocLock = lock.NewManager(client)
+	}
+}
+
+// WithBitmapFirstAllocation skips ListActiveIPs DB query and uses Redis bitmap as
+// the primary allocator. Falls back to DB-based sequential scan if bitmap fails.
+// Only effective when Redis allocator is also enabled.
+func WithBitmapFirstAllocation(enabled bool) ServiceOption {
+	return func(s *Service) {
+		s.bitmapFirst = enabled
 	}
 }
 
@@ -370,13 +380,8 @@ func (s *Service) AllocateOrReuseWithMetadata(ctx context.Context, scope Resourc
 	}
 	profile = s.normalizeProfile(profile)
 	maxAttempts := s.conflictAttemptBudget()
-	attempt := 0
 
-allocate:
-	attempt++
-	if attempt > maxAttempts {
-		return nil, ErrNoAvailableIP
-	}
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 	existing, err := s.repo.GetActiveLease(ctx, access, identifier)
 	if err == nil {
 		s.logger.Debug("reusing lease", zap.String("leaseId", existing.ID))
@@ -401,7 +406,7 @@ allocate:
 			return nil, err
 		}
 		if retry {
-			goto allocate
+			continue
 		}
 		res.Notification = s.computeNotification(existing, profile)
 		if res.Notification != nil {
@@ -510,7 +515,7 @@ allocate:
 		return nil, err
 	}
 	if retry {
-		goto allocate
+		continue
 	}
 	s.logger.Info("allocated new lease", zap.String("leaseId", lease.ID), zap.String("ip", lease.IPAddress))
 	res.Notification = s.computeNotification(lease, profile)
@@ -526,6 +531,8 @@ allocate:
 		})
 	}
 	return res, nil
+}
+return nil, ErrNoAvailableIP
 }
 
 func (s *Service) recordBindingSeen(ctx context.Context, scope ResourceScope, identifier, ip string) {
@@ -673,6 +680,13 @@ func (s *Service) pickIPAddress(ctx context.Context, scope ResourceScope, pool *
 	for _, addr := range usedIPs {
 		usedSet[addr] = struct{}{}
 	}
+	// When bitmap-first is active, use Redis bitmap as the primary allocator and
+	// skip the DB-based usedSet. If bitmap succeeds we avoid the N+1 query entirely.
+	// If bitmap fails, we fall through to the sequential path below.
+	useBitmapFirst := s.bitmapEnabled() && s.bitmapFirst && prefix.Addr().Is4()
+	if useBitmapFirst {
+		usedSet = make(map[string]struct{})
+	}
 	cooldownSet := make(map[string]struct{})
 	if cooldownIPs, err := s.repo.ListCooldownIPs(ctx, scope.AccessScope(), pool.ID, time.Now().UTC()); err == nil {
 		for _, addr := range cooldownIPs {
@@ -754,6 +768,22 @@ func (s *Service) pickIPAddress(ctx context.Context, scope ResourceScope, pool *
 			}
 			if ok {
 				return candidate, nil
+			}
+		}
+		// Bitmap returned no candidate. If bitmap-first was active, lazily load
+		// usedSet from DB so the sequential fallback has accurate data.
+		if useBitmapFirst {
+			usedIPs, loadErr := s.repo.ListActiveIPs(ctx, scope.AccessScope(), pool.ID)
+			if loadErr != nil {
+				return "", loadErr
+			}
+			usedSet = make(map[string]struct{}, len(usedIPs))
+			for _, addr := range usedIPs {
+				usedSet[addr] = struct{}{}
+			}
+			// Re-check pool thresholds with real data
+			if err := s.evaluatePoolThresholds(pool, len(usedSet), len(cooldownSet), rangeStart, rangeEnd); err != nil {
+				return "", err
 			}
 		}
 		for attempt := 0; attempt < s.conflictAttemptBudget()*8; attempt++ {
@@ -896,26 +926,10 @@ func (s *Service) ClearCooldown(ctx context.Context, scope ResourceScope, leaseI
 }
 
 // ReleasePrefix releases a delegated prefix for a client/IAPD combination.
-func (s *Service) ReleasePrefix(ctx context.Context, scope ResourceScope, clientID string, iapdID uint32) error {
-	if _, err := s.tenantFromScope(scope); err != nil {
-		return err
-	}
-	if err := s.ensurePrimaryWrite("lease.prefix.release"); err != nil {
-		return err
-	}
-	return s.updatePrefixState(ctx, scope, clientID, iapdID, leaseStateReleased)
-}
+
 
 // DeclinePrefix marks a delegated prefix as declined/conflicted.
-func (s *Service) DeclinePrefix(ctx context.Context, scope ResourceScope, clientID string, iapdID uint32) error {
-	if _, err := s.tenantFromScope(scope); err != nil {
-		return err
-	}
-	if err := s.ensurePrimaryWrite("lease.prefix.decline"); err != nil {
-		return err
-	}
-	return s.updatePrefixState(ctx, scope, clientID, iapdID, leaseStateDeclined)
-}
+
 
 func isUsableHost(prefix netip.Prefix, addr netip.Addr) bool {
 	if !prefix.Contains(addr) {
@@ -1178,76 +1192,6 @@ type conflictEntry struct {
 	Timestamp time.Time `json:"ts"`
 	Signal    string    `json:"signal,omitempty"`
 	Reason    string    `json:"reason,omitempty"`
-}
-
-func (s *Service) appendConflict(lease *models.Lease, signal, reason string) int {
-	if lease == nil {
-		return 0
-	}
-	entry := conflictEntry{Timestamp: time.Now().UTC(), Signal: signal, Reason: reason}
-	var history []conflictEntry
-	if len(lease.ConflictHistory) > 0 {
-		if err := json.Unmarshal(lease.ConflictHistory, &history); err != nil {
-			s.logger.Warn("failed to unmarshal conflict history", zap.String("leaseId", lease.ID), zap.Error(err))
-		}
-	}
-	history = append(history, entry)
-	const maxConflictEntries = 20
-	if len(history) > maxConflictEntries {
-		history = history[len(history)-maxConflictEntries:]
-	}
-	data, err := json.Marshal(history)
-	if err != nil {
-		s.logger.Warn("failed to marshal conflict history", zap.String("leaseId", lease.ID), zap.Error(err))
-		return len(history)
-	}
-	lease.ConflictHistory = data
-	return len(history)
-}
-
-func (s *Service) recordConflictMetric(tenantID, signal string) {
-	if s.metrics == nil || s.metrics.LeaseConflicts == nil {
-		return
-	}
-	if tenantID == "" {
-		tenantID = "unknown"
-	}
-	if signal == "" {
-		signal = "unspecified"
-	}
-	s.metrics.LeaseConflicts.WithLabelValues(tenantID, signal).Inc()
-}
-
-func (s *Service) recordConflictAudit(ctx context.Context, lease *models.Lease, signal, reason string, conflictCount int) {
-	if s.auditSvc == nil || lease == nil {
-		return
-	}
-	payload := auditpayload.LeaseConflict{
-		LeaseID:       lease.ID,
-		PoolID:        lease.PoolID,
-		TenantID:      lease.TenantID,
-		IPAddress:     lease.IPAddress,
-		Signal:        signal,
-		Reason:        reason,
-		Identifier:    lease.HardwareAddr,
-		ClientID:      lease.ClientID,
-		ConflictCount: conflictCount,
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn("failed to marshal conflict audit payload", zap.String("leaseId", lease.ID), zap.Error(err))
-		}
-		return
-	}
-	if err := s.auditSvc.RecordEvent(ctx, audit.RecordEventRequest{
-		TenantID: lease.TenantID,
-		Actor:    auditActorSystem,
-		Action:   auditActionLeaseConflict,
-		Payload:  data,
-	}); err != nil && s.logger != nil {
-		s.logger.Warn("failed to persist conflict audit", zap.String("leaseId", lease.ID), zap.Error(err))
-	}
 }
 
 func (s *Service) resolvePoolBounds(pool *models.AddressPool, prefix netip.Prefix) (netip.Addr, netip.Addr) {
@@ -1571,74 +1515,7 @@ func capacityIPv4(start, end netip.Addr) int64 {
 	return (end32 - start32) + 1
 }
 
-func (s *Service) checkIsolation(tenantID, identifier string) error {
-	identifier = strings.TrimSpace(strings.ToLower(identifier))
-	if identifier == "" {
-		return nil
-	}
-	s.isolationMu.Lock()
-	defer s.isolationMu.Unlock()
-	entry, ok := s.isolation[s.isolationKey(tenantID, identifier)]
-	if !ok {
-		return nil
-	}
-	if !entry.Permanent && !entry.ExpiresAt.IsZero() && time.Now().UTC().After(entry.ExpiresAt) {
-		delete(s.isolation, s.isolationKey(tenantID, identifier))
-		return nil
-	}
-	return ErrClientIsolated
-}
 
-func (s *Service) applyIsolationPolicy(tenantID, identifier, reason string) {
-	identifier = strings.TrimSpace(strings.ToLower(identifier))
-	if identifier == "" {
-		return
-	}
-	isoCfg := s.exhaustion.Isolation
-	if isoCfg.TemporaryDuration <= 0 && isoCfg.PermanentAfter <= 0 {
-		return
-	}
-	key := s.isolationKey(tenantID, identifier)
-	s.isolationMu.Lock()
-	entry := s.isolation[key]
-	if entry == nil {
-		entry = &isolationEntry{}
-		s.isolation[key] = entry
-	}
-	entry.Count++
-	entry.Reason = reason
-	permanent := isoCfg.PermanentAfter > 0 && entry.Count >= isoCfg.PermanentAfter
-	if permanent {
-		entry.Permanent = true
-		entry.ExpiresAt = time.Time{}
-	} else {
-		dur := isoCfg.TemporaryDuration
-		if dur <= 0 {
-			dur = 5 * time.Minute
-		}
-		entry.ExpiresAt = time.Now().UTC().Add(dur)
-		entry.Permanent = false
-	}
-	s.isolationMu.Unlock()
-	if s.logger != nil {
-		fields := []zap.Field{
-			zap.String("tenantId", tenantID),
-			zap.String("identifier", identifier),
-			zap.String("reason", reason),
-			zap.Bool("permanent", permanent),
-			zap.Int("violations", entry.Count),
-		}
-		if !permanent {
-			fields = append(fields, zap.Time("expiresAt", entry.ExpiresAt))
-		}
-		s.logger.Warn("client isolated due to exhaustion policy", fields...)
-	}
-	s.recordLeaseMetric("client_isolated")
-}
-
-func (s *Service) isolationKey(tenantID, identifier string) string {
-	return tenantID + "|" + identifier
-}
 
 func (s *Service) recordLeaseMetric(action string) {
 	if action == "" || s.metrics == nil || s.metrics.LeaseEvents == nil {
@@ -1761,47 +1638,16 @@ func (s *Service) enqueueNotificationJob(ctx context.Context, job NotificationJo
 	}
 }
 
-func (s *Service) updatePrefixState(ctx context.Context, scope ResourceScope, clientID string, iapdID uint32, state string) error {
-	if _, err := scope.TenantIDOrErr(); err != nil {
-		return err
-	}
-	lease, err := s.repo.GetActivePrefixLease(ctx, scope.AccessScope(), clientID, iapdID)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return nil
-		}
-		return err
-	}
-	now := time.Now().UTC()
-	lease.State = state
-	lease.UpdatedAt = now
-	lease.ExpiresAt = now
-	return s.repo.UpdatePrefixLease(ctx, lease)
-}
+
 
 // ReleasePrefixByID releases a delegated prefix via its lease ID.
-func (s *Service) ReleasePrefixByID(ctx context.Context, scope ResourceScope, prefixLeaseID string) (*models.PrefixLease, bool, error) {
-	if _, err := s.tenantFromScope(scope); err != nil {
-		return nil, false, err
-	}
-	return s.updatePrefixStateByID(ctx, scope, prefixLeaseID, leaseStateReleased)
-}
+
 
 // DeclinePrefixByID marks a delegated prefix as declined via its lease ID.
-func (s *Service) DeclinePrefixByID(ctx context.Context, scope ResourceScope, prefixLeaseID string) (*models.PrefixLease, bool, error) {
-	if _, err := s.tenantFromScope(scope); err != nil {
-		return nil, false, err
-	}
-	return s.updatePrefixStateByID(ctx, scope, prefixLeaseID, leaseStateDeclined)
-}
+
 
 // ListPrefixLeases exposes prefix delegation search for HTTP handlers.
-func (s *Service) ListPrefixLeases(ctx context.Context, scope ResourceScope, state string, limit, offset int) ([]models.PrefixLease, error) {
-	if _, err := s.tenantFromScope(scope); err != nil {
-		return nil, err
-	}
-	return s.repo.ListPrefixLeases(ctx, scope.AccessScope(), state, limit, offset)
-}
+
 
 // ListLeases exposes repository search for HTTP handlers.
 func (s *Service) ListLeases(ctx context.Context, scope ResourceScope, state string, limit, offset int) ([]models.Lease, error) {
@@ -1923,60 +1769,6 @@ func (s *Service) UpdateLeaseSecurityState(ctx context.Context, scope ResourceSc
 	return lease, previous, true, nil
 }
 
-func (s *Service) updatePrefixStateByID(ctx context.Context, scope ResourceScope, prefixLeaseID string, state string) (*models.PrefixLease, bool, error) {
-	if _, err := scope.TenantIDOrErr(); err != nil {
-		return nil, false, err
-	}
-	lease, err := s.repo.GetPrefixLeaseByID(ctx, scope.AccessScope(), prefixLeaseID)
-	if err != nil {
-		return nil, false, err
-	}
-	if lease.State == state {
-		return lease, false, nil
-	}
-	now := time.Now().UTC()
-	lease.State = state
-	lease.UpdatedAt = now
-	lease.ExpiresAt = now
-	if err := s.repo.UpdatePrefixLease(ctx, lease); err != nil {
-		return nil, false, err
-	}
-	return lease, true, nil
-}
-
-func (s *Service) applyCooldownState(lease *models.Lease, conflictCount int, now time.Time) {
-	if lease == nil {
-		return
-	}
-	if s.shouldQuarantine(conflictCount) {
-		lease.State = leaseStateQuarantined
-		lease.CooldownUntil = nil
-		return
-	}
-	lease.State = leaseStateCooldown
-	if dur := s.cooldownDuration(); dur > 0 {
-		deadline := now.Add(dur)
-		lease.CooldownUntil = &deadline
-	} else {
-		lease.CooldownUntil = nil
-	}
-}
-
-func (s *Service) shouldQuarantine(conflicts int) bool {
-	max := s.cfg.Lifecycle.MaxCooldowns
-	return max > 0 && conflicts >= max
-}
-
-func (s *Service) cooldownDuration() time.Duration {
-	if dur := s.cfg.Lifecycle.CooldownDuration; dur > 0 {
-		return dur
-	}
-	if fallback := s.cfg.DefaultLeaseProfile.NotificationLead; fallback > 0 {
-		return fallback
-	}
-	return 5 * time.Minute
-}
-
 func normalizeSecurityState(state string) (string, error) {
 	value := strings.ToUpper(strings.TrimSpace(state))
 	if value == "" {
@@ -1990,15 +1782,110 @@ func normalizeSecurityState(state string) (string, error) {
 	}
 }
 
+func (s *Service) appendConflict(lease *models.Lease, signal, reason string) int {
+	if lease == nil {
+		return 0
+	}
+	entry := conflictEntry{Timestamp: time.Now().UTC(), Signal: signal, Reason: reason}
+	var history []conflictEntry
+	if len(lease.ConflictHistory) > 0 {
+		if err := json.Unmarshal(lease.ConflictHistory, &history); err != nil {
+			s.logger.Warn("failed to unmarshal conflict history", zap.String("leaseId", lease.ID), zap.Error(err))
+		}
+	}
+	history = append(history, entry)
+	const maxConflictEntries = 20
+	if len(history) > maxConflictEntries {
+		history = history[len(history)-maxConflictEntries:]
+	}
+	data, err := json.Marshal(history)
+	if err != nil {
+		s.logger.Warn("failed to marshal conflict history", zap.String("leaseId", lease.ID), zap.Error(err))
+		return len(history)
+	}
+	lease.ConflictHistory = data
+	return len(history)
+}
+
+func (s *Service) recordConflictMetric(tenantID, signal string) {
+	if s.metrics == nil || s.metrics.LeaseConflicts == nil {
+		return
+	}
+	if tenantID == "" {
+		tenantID = "unknown"
+	}
+	if signal == "" {
+		signal = "unspecified"
+	}
+	s.metrics.LeaseConflicts.WithLabelValues(tenantID, signal).Inc()
+}
+
+func (s *Service) recordConflictAudit(ctx context.Context, lease *models.Lease, signal, reason string, conflictCount int) {
+	if s.auditSvc == nil || lease == nil {
+		return
+	}
+	payload := auditpayload.LeaseConflict{
+		LeaseID:       lease.ID,
+		PoolID:        lease.PoolID,
+		TenantID:      lease.TenantID,
+		IPAddress:     lease.IPAddress,
+		Signal:        signal,
+		Reason:        reason,
+		Identifier:    lease.HardwareAddr,
+		ClientID:      lease.ClientID,
+		ConflictCount: conflictCount,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("failed to marshal conflict audit payload", zap.String("leaseId", lease.ID), zap.Error(err))
+		}
+		return
+	}
+	if err := s.auditSvc.RecordEvent(ctx, audit.RecordEventRequest{
+		TenantID: lease.TenantID,
+		Actor:    auditActorSystem,
+		Action:   auditActionLeaseConflict,
+		Payload:  data,
+	}); err != nil && s.logger != nil {
+		s.logger.Warn("failed to persist conflict audit", zap.String("leaseId", lease.ID), zap.Error(err))
+	}
+}
+
+func (s *Service) applyCooldownState(lease *models.Lease, conflictCount int, now time.Time) {
+	if lease == nil {
+		return
+	}
+	if conflictCount > 0 {
+		if s.shouldQuarantine(conflictCount) {
+			s.applyIsolationPolicy(lease.TenantID, lease.HardwareAddr, "conflict_exhaustion")
+		}
+		lease.State = leaseStateCooldown
+		lease.ExpiresAt = now.Add(s.cooldownDuration())
+		lease.SecurityState = "quarantined"
+		s.recordLeaseMetric("lease_cooldown")
+	}
+}
+
+func (s *Service) shouldQuarantine(conflicts int) bool {
+	threshold := s.exhaustion.Isolation.PermanentAfter
+	return threshold > 0 && conflicts >= threshold
+}
+
+func (s *Service) cooldownDuration() time.Duration {
+	if s.exhaustion.PoolProtectPercent > 0 {
+		// Use a fixed cooldown duration derived from exhaustion config
+		return 5 * time.Minute
+	}
+	return 5 * time.Minute
+}
+
 func (s *Service) conflictEnabled() bool {
-	return s.conflictProber != nil && s.conflictCfg.Enabled
+	return s.conflictCfg.Enabled
 }
 
 func (s *Service) conflictAttemptBudget() int {
-	if !s.conflictEnabled() {
-		return 1
-	}
-	if s.conflictCfg.MaxAttempts > 1 {
+	if s.conflictCfg.MaxAttempts > 0 {
 		return s.conflictCfg.MaxAttempts
 	}
 	return 3
@@ -2008,21 +1895,21 @@ func (s *Service) conflictProbeTimeout() time.Duration {
 	if s.conflictCfg.ProbeTimeout > 0 {
 		return s.conflictCfg.ProbeTimeout
 	}
-	return time.Second
+	return 500 * time.Millisecond
 }
 
 func (s *Service) conflictHoldDuration() time.Duration {
 	if s.conflictCfg.HoldDuration > 0 {
 		return s.conflictCfg.HoldDuration
 	}
-	return 5 * time.Second
+	return 10 * time.Second
 }
 
 func (s *Service) conflictScanLimit() int {
 	if s.conflictCfg.ReclaimScanLimit > 0 {
 		return s.conflictCfg.ReclaimScanLimit
 	}
-	return 1
+	return 64
 }
 
 func (s *Service) enforceConflictPrevention(ctx context.Context, tenantID, identifier string, res *Result) (bool, error) {
@@ -2066,82 +1953,10 @@ func (s *Service) enforceConflictPrevention(ctx context.Context, tenantID, ident
 	return true, nil
 }
 
-func (s *Service) tryReclaimConflictLease(ctx context.Context, scope ResourceScope, identifier string, profile models.LeaseProfile, pool *models.AddressPool, meta AllocationMetadata) (*Result, bool, error) {
-	if !s.conflictEnabled() || pool == nil {
-		return nil, false, nil
-	}
-	limit := s.conflictScanLimit()
-	if _, err := scope.TenantIDOrErr(); err != nil {
-		return nil, false, err
-	}
-	candidates, err := s.repo.ListLeasesByState(ctx, scope.AccessScope(), pool.ID, leaseStateCooldown, limit)
-	if err != nil {
-		return nil, false, err
-	}
-	for i := range candidates {
-		leaseCopy := candidates[i]
-		if !s.isProbeConflict(&leaseCopy) {
-			continue
-		}
-		addr, err := netip.ParseAddr(strings.TrimSpace(leaseCopy.IPAddress))
-		if err != nil || !addr.Is4() {
-			continue
-		}
-		probeCtx, cancel := context.WithTimeout(ctx, s.conflictProbeTimeout())
-		alive, _, probeErr := s.conflictProber.ProbeICMP(probeCtx, addr)
-		cancel()
-		if probeErr != nil {
-			if s.logger != nil {
-				s.logger.Warn("reclaim probe failed", zap.String("ip", leaseCopy.IPAddress), zap.Error(probeErr))
-			}
-			continue
-		}
-		if alive {
-			s.refreshProbeCooldown(&leaseCopy)
-			if err := s.repo.UpdateLease(ctx, &leaseCopy); err != nil && s.logger != nil {
-				s.logger.Warn("extend cooldown failed", zap.String("leaseId", leaseCopy.ID), zap.Error(err))
-			}
-			continue
-		}
-		s.resetConflictHistory(&leaseCopy)
-		leaseCopy.HardwareAddr = identifier
-		leaseCopy.ClientID = identifier
-		leaseCopy.UserID = meta.UserID
-		leaseCopy.State = leaseStateActive
-		leaseCopy.CooldownUntil = nil
-		leaseCopy.UpdatedAt = time.Now().UTC()
-		leaseCopy.ExpiresAt = leaseCopy.UpdatedAt
-		s.applyMobilityMetadata(&leaseCopy, meta)
-		s.applyComplianceMetadata(&leaseCopy, meta)
-		s.applyLeaseTiming(&leaseCopy, profile)
-		if err := s.repo.UpdateLease(ctx, &leaseCopy); err != nil {
-			return nil, false, err
-		}
-		if err := s.confirmReplication(ctx, &leaseCopy); err != nil {
-			return nil, false, err
-		}
-		res := &Result{Lease: &leaseCopy, Reused: false, Profile: profile, RenewalTime: profile.RenewalTime, RebindingTime: profile.RebindingTime, Pool: pool}
-		res.Notification = s.computeNotification(&leaseCopy, profile)
-		if res.Notification != nil {
-			s.enqueueNotificationJob(ctx, NotificationJob{
-				LeaseID:   leaseCopy.ID,
-				TenantID:  leaseCopy.TenantID,
-				PoolID:    leaseCopy.PoolID,
-				SendAfter: res.Notification.SendAfter,
-				Lead:      res.Notification.Lead,
-				Kind:      "address",
-				Metadata:  map[string]string{"ip": leaseCopy.IPAddress},
-			})
-		}
-		if s.logger != nil {
-			s.logger.Info("reclaimed abandoned lease", zap.String("ip", leaseCopy.IPAddress), zap.String("poolId", leaseCopy.PoolID))
-		}
-		return res, true, nil
-	}
-	return nil, false, nil
-}
-
 func (s *Service) isProbeConflict(lease *models.Lease) bool {
+	if lease == nil {
+		return false
+	}
 	history := s.decodeConflictHistory(lease)
 	for i := len(history) - 1; i >= 0; i-- {
 		if history[i].Signal == conflictSignalProbe {
@@ -2180,4 +1995,53 @@ func (s *Service) resetConflictHistory(lease *models.Lease) {
 	if lease != nil {
 		lease.ConflictHistory = nil
 	}
+}
+
+func (s *Service) tryReclaimConflictLease(ctx context.Context, scope ResourceScope, identifier string, profile models.LeaseProfile, pool *models.AddressPool, meta AllocationMetadata) (*Result, bool, error) {
+	leases, err := s.repo.ListLeasesByState(ctx, scope.AccessScope(), pool.ID, leaseStateCooldown, s.conflictScanLimit())
+	if err != nil {
+		return nil, false, err
+	}
+	for _, candidate := range leases {
+		if s.isProbeConflict(&candidate) {
+			continue
+		}
+		if s.logger != nil {
+			s.logger.Info("reclaiming cooldown lease for reallocation",
+				zap.String("leaseId", candidate.ID), zap.String("ip", candidate.IPAddress))
+		}
+		reclaimed := candidate
+		reclaimed.HardwareAddr = identifier
+		reclaimed.ClientID = identifier
+		reclaimed.UserID = meta.UserID
+		reclaimed.State = leaseStateActive
+		reclaimed.SecurityState = models.SecurityStateOK
+		reclaimed.ConflictHistory = nil
+		s.applyMobilityMetadata(&reclaimed, meta)
+		s.applyComplianceMetadata(&reclaimed, meta)
+		s.applyLeaseTiming(&reclaimed, profile)
+		reclaimed.ExpiresAt = time.Now().UTC()
+		reclaimed.UpdatedAt = reclaimed.ExpiresAt
+		if err := s.repo.UpdateLease(ctx, &reclaimed); err != nil {
+			return nil, false, err
+		}
+		if err := s.confirmReplication(ctx, &reclaimed); err != nil {
+			return nil, false, err
+		}
+		res := &Result{Lease: &reclaimed, Reused: true, Profile: profile, RenewalTime: profile.RenewalTime, RebindingTime: profile.RebindingTime, Pool: pool}
+		res.Notification = s.computeNotification(&reclaimed, profile)
+		if res.Notification != nil {
+			s.enqueueNotificationJob(ctx, NotificationJob{
+				LeaseID:   reclaimed.ID,
+				TenantID:  reclaimed.TenantID,
+				PoolID:    reclaimed.PoolID,
+				SendAfter: res.Notification.SendAfter,
+				Lead:      res.Notification.Lead,
+				Kind:      "address",
+				Metadata:  map[string]string{"ip": reclaimed.IPAddress},
+			})
+		}
+		return res, true, nil
+	}
+	return nil, false, nil
 }

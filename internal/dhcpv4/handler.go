@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -56,6 +57,13 @@ const (
 	dhcpv4RequestPhaseRebind  = "rebind"
 )
 
+// cachedPoolTimes caches MinLeaseTime/MaxLeaseTime for a pool to avoid DB lookups.
+type cachedPoolTimes struct {
+	minLeaseTime int
+	maxLeaseTime int
+	fetchedAt    time.Time
+}
+
 // Handler processes DHCPv4 messages.
 type Handler struct {
 	leaseSvc      *lease.Service
@@ -71,6 +79,9 @@ type Handler struct {
 	affinity      mobility.Cache
 	fingerprinter *mobility.Detector
 	mdmService    *mdm.Service
+
+	poolTimesCache   sync.Map
+	poolTimesCacheTTL time.Duration
 }
 
 // NewHandler creates a v4 handler.
@@ -78,7 +89,7 @@ func NewHandler(leaseSvc *lease.Service, policyEngine *policy.Engine, poolSvc *p
 	if guard == nil {
 		guard = securityguard.NewNoop()
 	}
-	return &Handler{leaseSvc: leaseSvc, policy: policyEngine, poolSvc: poolSvc, metrics: metricsCollector, dhcpMetrics: dhcpv4metrics.NewObserver(metricsCollector), recorder: recorder, guard: guard, relayAuth: authenticator, relaySel: selector, logger: logger, affinity: mobilityCache, fingerprinter: fingerprinter, mdmService: mdmSvc}
+	return &Handler{leaseSvc: leaseSvc, policy: policyEngine, poolSvc: poolSvc, metrics: metricsCollector, dhcpMetrics: dhcpv4metrics.NewObserver(metricsCollector), recorder: recorder, guard: guard, relayAuth: authenticator, relaySel: selector, logger: logger, affinity: mobilityCache, fingerprinter: fingerprinter, mdmService: mdmSvc, poolTimesCacheTTL: 30 * time.Second}
 }
 
 // HandleDiscover performs policy evaluation and pre-allocates state.
@@ -332,10 +343,34 @@ func (h *Handler) applyPoolLeaseTimes(ctx context.Context, tenantID, poolID stri
 	if tenantID == "" || poolID == "" {
 		return profile
 	}
+
+	// Fast path: check local cache first (pool times change very rarely)
+	cacheKey := tenantID + ":" + poolID
+	if cached, ok := h.poolTimesCache.Load(cacheKey); ok {
+		if entry, ok2 := cached.(*cachedPoolTimes); ok2 && time.Since(entry.fetchedAt) < h.poolTimesCacheTTL {
+			if entry.minLeaseTime > 0 {
+				profile.DefaultDuration = time.Duration(entry.minLeaseTime) * time.Second
+			}
+			if entry.maxLeaseTime > 0 {
+				profile.MaxDuration = time.Duration(entry.maxLeaseTime) * time.Second
+			}
+			if profile.MaxDuration > 0 && profile.DefaultDuration > profile.MaxDuration {
+				profile.DefaultDuration = profile.MaxDuration
+			}
+			return profile
+		}
+	}
+
 	poolObj, err := h.poolSvc.GetPool(ctx, pool.NewResourceScope(tenantID, tenantID), poolID)
 	if err != nil || poolObj == nil {
 		return profile
 	}
+	// Cache the result
+	h.poolTimesCache.Store(cacheKey, &cachedPoolTimes{
+		minLeaseTime: poolObj.MinLeaseTime,
+		maxLeaseTime: poolObj.MaxLeaseTime,
+		fetchedAt:    time.Now(),
+	})
 	if poolObj.MinLeaseTime > 0 {
 		profile.DefaultDuration = time.Duration(poolObj.MinLeaseTime) * time.Second
 	}
