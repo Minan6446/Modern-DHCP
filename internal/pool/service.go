@@ -770,6 +770,58 @@ func (s *Service) autoExcludeBindingIP(ctx context.Context, accessScope resource
 	return nil
 }
 
+// autoUnexcludeBindingIP removes a single-IP exclusion from the pool when the last
+// binding that references it is deleted. Keeps the exclusion if other bindings still
+// use the same IP.
+func (s *Service) autoUnexcludeBindingIP(ctx context.Context, accessScope resource.AccessScope, tenantID, ip, poolID string) {
+	ip = strings.TrimSpace(ip)
+	poolID = strings.TrimSpace(poolID)
+	if ip == "" || poolID == "" {
+		return
+	}
+	// Check if any other binding still references this IP in the same pool.
+	bindings, err := s.repo.ListBindingsByPool(ctx, accessScope, poolID)
+	if err != nil {
+		return
+	}
+	for _, b := range bindings {
+		if strings.TrimSpace(b.IPAddress) == ip {
+			return // still referenced, keep the exclusion
+		}
+	}
+	// No other binding uses this IP — remove the single-IP exclusion from the pool.
+	poolObj, err := s.repo.GetPool(ctx, accessScope, poolID)
+	if err != nil {
+		return
+	}
+	existing := poolObj.Exclusions
+	found := false
+	newExclusions := make(models.IPRangeList, 0, len(existing))
+	for _, r := range existing {
+		if r.Start == ip && r.End == ip {
+			found = true
+			continue // remove this single-IP exclusion
+		}
+		newExclusions = append(newExclusions, r)
+	}
+	if !found {
+		return // exclusion wasn't there, nothing to do
+	}
+	poolObj.Exclusions = newExclusions
+	poolObj.UpdatedAt = time.Now().UTC()
+	if err := s.repo.UpdatePool(ctx, poolObj); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("auto-unexclude: failed to update pool exclusions",
+				zap.String("poolId", poolID), zap.String("ip", ip), zap.Error(err))
+		}
+		return
+	}
+	if s.logger != nil {
+		s.logger.Info("auto-removed binding IP exclusion from pool",
+			zap.String("poolId", poolID), zap.String("ip", ip))
+	}
+}
+
 // UpdateBinding mutates metadata for an existing static binding.
 func (s *Service) UpdateBinding(ctx context.Context, scope ResourceScope, bindingID string, req BindingCreateRequest) (_ *models.StaticBinding, err error) {
 	done := s.trackPoolOperation(scope, "update_binding")
@@ -936,10 +988,24 @@ func (s *Service) RecordBindingSeen(ctx context.Context, scope ResourceScope, id
 func (s *Service) DeleteBinding(ctx context.Context, scope ResourceScope, bindingID string) (err error) {
 	done := s.trackPoolOperation(scope, "delete_binding")
 	defer func() { done(err) }()
-	if _, err := scope.TenantIDOrErr(); err != nil {
+	tenantID, err := scope.TenantIDOrErr()
+	if err != nil {
 		return err
 	}
-	return s.repo.DeleteBinding(ctx, scope.AccessScope(), bindingID)
+	// Fetch binding before deletion so we know which IP to un-exclude.
+	binding, getErr := s.repo.GetBinding(ctx, scope.AccessScope(), bindingID)
+	if getErr != nil {
+		return getErr
+	}
+	bindingIP := binding.IPAddress
+	bindingPoolID := binding.PoolID
+
+	if err := s.repo.DeleteBinding(ctx, scope.AccessScope(), bindingID); err != nil {
+		return err
+	}
+	// Remove the auto-exclusion if no other binding references this IP.
+	s.autoUnexcludeBindingIP(ctx, scope.AccessScope(), tenantID, bindingIP, bindingPoolID)
+	return nil
 }
 
 func (s *Service) InvalidateTenantCache(ctx context.Context, tenantID string) {

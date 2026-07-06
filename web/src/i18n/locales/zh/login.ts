@@ -16,7 +16,7 @@ export default {
       privacyPolicy: '《隐私政策》',
       and: '与',
       support: "技术支持：minan959{'@'}163.com",
-      copyright: '© 2026 Modern DHCP All rights reserved. | 版本 v2.2.0',
+      copyright: '© 2026 Modern DHCP 保留所有权利 | 版本 v2.2.0',
       mustAgree: '请先阅读并同意用户协议与隐私政策',
       formErrors: '请先修正表单错误后再登录',
       success: '登录成功',

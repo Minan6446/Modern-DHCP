@@ -31,6 +31,7 @@ export default {
       codeRule: '仅小写字母数字和短横线，2-32位',
       gtZero: '需大于0',
       actionFailed: '操作失败',
+      actionSuccess: '操作成功',
       scope: '范围',
       description: '描述',
       username: '用户名',

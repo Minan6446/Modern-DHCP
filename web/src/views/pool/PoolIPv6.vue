@@ -36,7 +36,7 @@
                 <el-option label="80% - 100%" value="80-100" />
               </el-select>
             </el-form-item>
-            <el-form-item>
+            <el-form-item class="action-btns">
               <el-button size="small" type="primary" @click="handleSearch">{{ t('common.search') }}</el-button>
               <el-button size="small" @click="handleReset">{{ t('common.reset') }}</el-button>
             </el-form-item>
@@ -1951,6 +1951,12 @@ onBeforeUnmount(() => {
 
 .filters :deep(.el-form-item) {
   margin-bottom: 0;
+}
+
+.action-btns :deep(.el-form-item__content) {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
 }
 
 .filter-bar :deep(.el-input__wrapper),
